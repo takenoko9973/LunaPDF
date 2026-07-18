@@ -48,21 +48,25 @@ where
     }
 
     /// Returns the maximum number of bytes retained by this cache.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn budget(&self) -> usize {
         self.budget
     }
 
     /// Returns the sum of weights of all retained entries.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn current_bytes(&self) -> usize {
         self.current_bytes
     }
 
     /// Returns the number of retained entries.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Returns whether the cache has no retained entries.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

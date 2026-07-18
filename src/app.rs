@@ -113,6 +113,7 @@ struct DocumentTab {
     thumbnail_generation: u64,
     search: SearchState,
     page_input: String,
+    page_input_error: Option<String>,
     view: ViewState,
     restoring_from_session: bool,
     select_after_restore: bool,
@@ -848,7 +849,13 @@ impl PrototypeApp {
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
         let open_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::O));
-        if open_pressed {
+        // Native dialogs must not start underneath an unresolved close flow;
+        // that flow owns the document set until the user makes a decision.
+        if open_pressed
+            && !self.window_close_pending
+            && !self.close_all_pending
+            && self.close_confirmation.is_none()
+        {
             self.pick_pdf_and_open();
         }
         let find_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F));
@@ -873,6 +880,7 @@ impl PrototypeApp {
             if context.memory(|memory| memory.has_focus(page_id)) {
                 self.documents[index].page_input =
                     (self.documents[index].view.current_page + 1).to_string();
+                self.documents[index].page_input_error = None;
                 context.memory_mut(|memory| memory.surrender_focus(page_id));
             } else if context.memory(|memory| memory.has_focus(query_id)) {
                 context.memory_mut(|memory| memory.surrender_focus(query_id));
@@ -916,7 +924,7 @@ impl PrototypeApp {
             self.save();
         }
         let print_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::P));
-        if print_pressed && !close_flow_active {
+        if print_pressed && !close_flow_active && cfg!(windows) && self.can_print() {
             self.print();
         }
         let undo_pressed = !text_input_has_focus
@@ -1577,9 +1585,10 @@ impl PrototypeApp {
             .current_page
             .saturating_add_signed(delta)
             .min(last_page);
-        tab.view.current_page = target;
-        tab.view.scroll_to_page = Some(target);
-        tab.view.restore_anchor = None;
+        if target == tab.view.current_page {
+            return;
+        }
+        tab.jump_to_page(target);
     }
 
     fn zoom_by(&mut self, factor: f32) {
@@ -2142,17 +2151,16 @@ impl PrototypeApp {
             .info
             .as_ref()
             .map_or(0, |info| info.page_bounds.len());
-        let parsed = input.trim().parse::<usize>();
-        if let Ok(page_number) = parsed
-            && (1..=page_count).contains(&page_number)
-        {
-            self.documents[index].jump_to_page(page_number - 1);
+        if let Some(page_index) = page_index_from_input(input, page_count) {
+            let page_number = page_index + 1;
+            self.documents[index].jump_to_page(page_index);
             self.documents[index].page_input = page_number.to_string();
+            self.documents[index].page_input_error = None;
             return;
         }
         self.documents[index].page_input =
             (self.documents[index].view.current_page + 1).to_string();
-        self.error = Some(format!(
+        self.documents[index].page_input_error = Some(format!(
             "ページ番号は 1 から {page_count} の範囲で入力してください"
         ));
     }
@@ -2301,7 +2309,10 @@ impl PrototypeApp {
         let document_error = self
             .active_index()
             .and_then(|index| self.documents[index].error.as_deref());
-        if app_error.is_none() && document_error.is_none() {
+        let page_input_error = self
+            .active_index()
+            .and_then(|index| self.documents[index].page_input_error.as_deref());
+        if app_error.is_none() && document_error.is_none() && page_input_error.is_none() {
             return;
         }
         egui::Panel::top("persistent-error-banner").show(root_ui, |ui| {
@@ -2309,6 +2320,9 @@ impl PrototypeApp {
                 ui.colored_label(Color32::LIGHT_RED, error);
             }
             if let Some(error) = document_error {
+                ui.colored_label(Color32::LIGHT_RED, error);
+            }
+            if let Some(error) = page_input_error {
                 ui.colored_label(Color32::LIGHT_RED, error);
             }
         });
@@ -3138,6 +3152,7 @@ impl DocumentTab {
             thumbnail_generation: 1,
             search: SearchState::default(),
             page_input: "1".to_owned(),
+            page_input_error: None,
             view: restored_view.map_or_else(ViewState::new, ViewState::from_session),
             restoring_from_session,
             select_after_restore,
@@ -3174,7 +3189,11 @@ impl DocumentTab {
     }
 
     fn is_suspendable(&self) -> bool {
-        self.state == DocumentState::ReadyClean && !self.has_unsaved_changes()
+        // Dropping a printing tab would also drop its completion receiver and
+        // leave the UI permanently believing the print job is still active.
+        self.state == DocumentState::ReadyClean
+            && !self.has_unsaved_changes()
+            && !self.is_printing()
     }
 
     fn suspend(&mut self) {
@@ -3226,6 +3245,7 @@ impl DocumentTab {
         if page_index >= page_count {
             return;
         }
+        self.page_input_error = None;
         self.view.current_page = page_index;
         match self.view.display_mode {
             DisplayMode::Continuous => {
@@ -3833,6 +3853,15 @@ fn search_query_id(document_id: u64) -> Id {
     Id::new(("pdf-search-query", document_id))
 }
 
+/// Converts a one-based user page number to the existing zero-based page index.
+fn page_index_from_input(input: &str, page_count: usize) -> Option<usize> {
+    let page_number = input.trim().parse::<usize>().ok()?;
+    if page_number > page_count {
+        return None;
+    }
+    page_number.checked_sub(1)
+}
+
 fn page_number_id(document_id: u64) -> Id {
     Id::new(("pdf-page-number", document_id))
 }
@@ -3854,10 +3883,12 @@ fn is_pdf_path(path: &Path) -> bool {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
 }
 
+#[cfg(debug_assertions)]
 fn milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+#[cfg(debug_assertions)]
 fn format_memory(bytes: usize) -> String {
     format!("resident memory: {:.1} MiB", bytes as f64 / 1_048_576.0)
 }
@@ -4109,6 +4140,16 @@ mod tests {
         );
         assert_eq!(accumulator, 0.0);
         assert!(!latched);
+    }
+
+    #[test]
+    fn page_input_accepts_only_one_based_in_range_numbers() {
+        assert_eq!(page_index_from_input(" 4 ", 5), Some(3));
+        assert_eq!(page_index_from_input("", 5), None);
+        assert_eq!(page_index_from_input("0", 5), None);
+        assert_eq!(page_index_from_input("-1", 5), None);
+        assert_eq!(page_index_from_input("abc", 5), None);
+        assert_eq!(page_index_from_input("6", 5), None);
     }
 
     #[test]
