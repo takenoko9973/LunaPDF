@@ -26,6 +26,7 @@ use crate::persistence::session_store::SessionStore;
 use crate::render::cache::WeightedLruCache;
 use crate::render::layout::{ContinuousLayout, PAGE_GAP, PageAnchor};
 use crate::render::tiles::TileGrid;
+use crate::ui::fonts::install_cjk_fallback;
 use crate::ui::sidebar::{SidebarTab, show_outline};
 use crate::ui::viewport::PageViewport;
 
@@ -247,10 +248,11 @@ struct ViewState {
 impl PrototypeApp {
     /// Creates the application and opens each command-line PDF.
     pub(crate) fn new(
-        _creation_context: &eframe::CreationContext<'_>,
+        creation_context: &eframe::CreationContext<'_>,
         paths: Vec<PathBuf>,
         session_store: SessionStore,
     ) -> Self {
+        install_cjk_fallback(&creation_context.egui_ctx);
         Self::from_startup(paths, session_store)
     }
 
