@@ -1,6 +1,6 @@
 # 性能測定手順
 
-設計書15.4の性能目標を、同じ入力と操作列で再現して記録する。ここには実測値を記入せず、測定時に結果欄を埋める。
+設計書15.4の性能目標を、同じ入力と操作列で再現して記録する。測定時に環境、方法、結果、判定対象を追記する。
 
 ## 固定fixtureと操作列
 
@@ -49,6 +49,31 @@
 
 20タブのRSSは3回とも暫定目標512 MiB以内だった。ただし、各タブのスクロール後、GPUアクセラレーション環境、cache plateau、起動時間、フレーム時間、検索入力遅延は未測定である。
 
+## warm起動測定（2026-07-19、3回）
+
+固定fixtureをコマンドライン引数に指定し、Dev ContainerのWSLg環境でwarm起動時間を3回測定した。この結果はN-04のwarm起動だけを判定し、cold起動、初回ページ表示、UI応答性には使用しない。
+
+| 項目 | 値 |
+| --- | --- |
+| commit | `e6c3be9` |
+| OS / version | Debian GNU/Linux 13.6（Docker Desktop / WSLg） |
+| CPU / RAM | AMD Ryzen 7 9700X / コンテナ認識15.6 GiB |
+| GPU / driver | Mesa 25.0.7、llvmpipe LLVM 19.1.7（ソフトウェア描画） |
+| display scale (DPI) | X11論理解像度96×96 DPI（5120×1440 px） |
+| build profile | `release` |
+| fixture | qpdf 11.9.1 manualの先頭100ページ、592,972 bytes |
+| fixture SHA-256 | `EE33A0DBB46B609A36C8AC6E93BA38CD684F5A240E8582A85B010974308D85DB` |
+
+releaseビルド後に1回起動してOSのファイルキャッシュをwarmにし、その試行は集計から除外した。各測定では前のプロセスが終了したことを確認してから同じPDFを引数に再起動した。Wayland経路との差を混ぜないため、`WAYLAND_DISPLAY`を外して`WINIT_UNIX_BACKEND=x11`を指定した。
+
+測定開始点はプロセス起動直前、終了点は`xprop -name LunaPDF WM_STATE`が最初に`Normal`を返した時点とした。状態は2 ms間隔で確認した。除外したwarm-upは53 msだった。
+
+| run 1 | run 2 | run 3 | 中央値 | 最大値 | 判定 |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 54 ms | 57 ms | 51 ms | 54 ms | 57 ms | pass |
+
+3回ともN-04の暫定目標1秒以内だった。ただし、`WM_STATE=Normal`はウィンドウが表示可能になったことだけを示し、PDFの最初のページが描画済みであることは示さない。
+
 ## 記録する値
 
 status表示で直接読める値はアプリの表示値を使い、RSS・フレーム時間・入力遅延は外部計測器で測る。各値はcold/warmを分け、単位を固定する。
@@ -74,7 +99,7 @@ status表示で直接読める値はアプリの表示値を使い、RSS・フ�
 | 測定 | 回数 | 中央値 | 最大値 | pass/fail | 備考 |
 | --- | ---: | ---: | ---: | --- | --- |
 | cold起動 |  |  |  |  |  |
-| warm起動 |  |  |  |  |  |
+| warm起動 | 3回 | 54 ms | 57 ms | pass | X11の`WM_STATE=Normal`まで。PDF引数あり、release、warm-up除外 |
 | 初回ページ表示 |  |  |  |  |  |
 | 可視タイル完成 |  |  |  |  |  |
 | RSS 1/10/20 tab | 各3回 | 154.6 / 160.1 / 172.6 MiB | 159.5 / 164.3 / 173.0 MiB | pass | 100ページ技術資料、release、非アクティブタブ未操作 |
