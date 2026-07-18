@@ -40,7 +40,7 @@ const MAX_ZOOM: f32 = 4.0;
 const ZOOM_CHANGE_EPSILON: f32 = 0.001;
 
 // The design budget is shared across all tabs so the active document can use
-// available GPU memory instead of receiving one twentieth of a fixed split.
+// available GPU memory instead of dividing a fixed allocation per tab.
 const GPU_TILE_BUDGET_BYTES: usize = 192 * 1_024 * 1_024;
 
 // Thumbnails have their own budget so a long sidebar cannot evict the active
@@ -50,8 +50,8 @@ const THUMBNAIL_MAX_WIDTH: u32 = 160;
 const THUMBNAIL_MAX_HEIGHT: u32 = 220;
 const THUMBNAIL_ROW_HEIGHT: f32 = 248.0;
 
-// N-05 sets 512 MiB as the stable 20-tab process target. Suspension is only
-// allowed after crossing that limit; ordinary tab switches retain documents.
+// N-05 sets 512 MiB as the stable process target. Suspension is only allowed
+// after crossing that limit; ordinary tab switches retain documents.
 const RESIDENT_MEMORY_SUSPEND_THRESHOLD_BYTES: usize = 512 * 1_024 * 1_024;
 
 pub(crate) struct PrototypeApp {
@@ -245,7 +245,7 @@ struct ViewState {
 }
 
 impl PrototypeApp {
-    /// Creates the application and opens each command-line PDF up to the cap.
+    /// Creates the application and opens each command-line PDF.
     pub(crate) fn new(
         _creation_context: &eframe::CreationContext<'_>,
         paths: Vec<PathBuf>,
@@ -289,8 +289,7 @@ impl PrototypeApp {
                 app.restore_session(session);
             }
         } else {
-            // Explicit command-line files take precedence so a full saved
-            // session cannot consume the tab cap before the requested PDFs.
+            // Explicit command-line files take precedence over session restore.
             for path in paths {
                 app.open_document(path);
             }
@@ -378,7 +377,7 @@ impl PrototypeApp {
                 self.next_document_id = self
                     .next_document_id
                     .checked_add(1)
-                    .expect("twenty-tab document IDs cannot exhaust u64");
+                    .expect("document IDs cannot exhaust u64");
                 let activity_sequence = self.next_activity_sequence();
                 self.documents.push(DocumentTab::new(
                     document_id,
@@ -401,13 +400,6 @@ impl PrototypeApp {
                     self.error = None;
                 }
                 Some(OpenDocumentResult::Existing(index))
-            }
-            Ok(OpenTabResult::LimitReached) => {
-                if report_to_user {
-                    self.error =
-                        Some("tab limit reached (20); no existing tab was closed".to_owned());
-                }
-                None
             }
             Err(error) => {
                 if report_to_user {
@@ -1554,7 +1546,7 @@ impl PrototypeApp {
                 .on_hover_text("Restore tabs only when LunaPDF starts without PDF arguments");
             ui.separator();
             let Some(index) = self.active_index() else {
-                ui.label("Drop PDF files here (maximum 20 tabs)");
+                ui.label("Drop PDF files here");
                 return;
             };
             let page_count = self.documents[index]
@@ -3678,9 +3670,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_restores_twenty_tabs_in_order_and_selects_saved_tab() {
+    fn startup_restores_fifty_one_tabs_in_order_and_selects_saved_tab() {
         let directory = tempfile::tempdir().unwrap();
-        let paths = (0..20)
+        let paths = (0..51)
             .map(|index| {
                 let path = directory.path().join(format!("{index:02}.pdf"));
                 write_blank_pdf(&path);

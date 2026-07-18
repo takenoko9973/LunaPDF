@@ -1,8 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(crate) const MAX_TABS: usize = 20;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Tab {
     path: PathBuf,
@@ -25,7 +23,6 @@ pub(crate) struct TabState {
 pub(crate) enum OpenTabResult {
     Opened(usize),
     SelectedExisting(usize),
-    LimitReached,
 }
 
 impl TabState {
@@ -54,10 +51,6 @@ impl TabState {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == canonical_path) {
             self.selected = Some(index);
             return Ok(OpenTabResult::SelectedExisting(index));
-        }
-
-        if self.tabs.len() >= MAX_TABS {
-            return Ok(OpenTabResult::LimitReached);
         }
 
         self.tabs.push(Tab {
@@ -133,10 +126,10 @@ mod tests {
     }
 
     #[test]
-    fn reaching_limit_reports_without_closing_existing_tabs() {
+    fn opening_more_than_fifty_tabs_keeps_all_existing_tabs() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = TabState::new();
-        let paths: Vec<_> = (0..=MAX_TABS)
+        let paths: Vec<_> = (0..=50)
             .map(|index| {
                 let path = directory.path().join(format!("{index}.pdf"));
                 File::create(&path).unwrap();
@@ -144,14 +137,10 @@ mod tests {
             })
             .collect();
 
-        for path in &paths[..MAX_TABS] {
+        for path in &paths {
             assert!(matches!(state.open(path), Ok(OpenTabResult::Opened(_))));
         }
-        assert_eq!(
-            state.open(&paths[MAX_TABS]).unwrap(),
-            OpenTabResult::LimitReached
-        );
-        assert_eq!(state.tabs().len(), MAX_TABS);
+        assert_eq!(state.tabs().len(), 51);
     }
 
     #[test]

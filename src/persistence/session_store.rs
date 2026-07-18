@@ -130,7 +130,6 @@ fn linux_config_path(xdg: Option<&Path>, home: Option<&Path>) -> Result<PathBuf>
 mod tests {
     use super::*;
     use crate::domain::session::{DisplayMode, SessionTab, SessionView, SidebarTab, ZoomMode};
-    use crate::domain::tabs::MAX_TABS;
 
     fn valid_state(directory: &Path) -> SessionState {
         SessionState {
@@ -187,27 +186,25 @@ mod tests {
     }
 
     #[test]
-    fn maximum_tab_count_is_accepted_and_one_more_is_rejected() {
+    fn sessions_with_more_than_fifty_tabs_are_accepted() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = valid_state(directory.path());
-        state.tabs = (0..MAX_TABS)
+        state.tabs = (0..51)
             .map(|index| {
                 let mut tab = state.tabs[0].clone();
                 tab.path = directory.path().join(format!("{index}.pdf"));
                 tab
             })
             .collect();
-        state.selected_tab = Some(MAX_TABS - 1);
+        state.selected_tab = Some(50);
         assert!(state.validate().is_ok());
-        state.tabs.push(state.tabs[0].clone());
-        assert!(state.validate().is_err());
     }
 
     #[test]
-    fn twenty_tab_session_roundtrip_preserves_order_and_selection() {
+    fn fifty_one_tab_session_roundtrip_preserves_order_and_selection() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = valid_state(directory.path());
-        state.tabs = (0..MAX_TABS)
+        state.tabs = (0..51)
             .map(|index| {
                 let mut tab = state.tabs[0].clone();
                 tab.path = directory.path().join(format!("{index:02}.pdf"));

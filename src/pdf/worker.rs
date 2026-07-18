@@ -127,7 +127,8 @@ impl WorkerTileKey {
 
 // Each 512 px RGBA result is at most 1 MiB. Seven queued results plus the
 // transient Pixmap/RGBA pair, or eight blocked results without a new raster,
-// cap a worker at 9 MiB; 20 workers therefore stay below the 192 MiB budget.
+// cap one worker's transfer memory at 9 MiB. The application separately
+// suspends inactive clean documents after crossing its process-memory limit.
 const BUFFERED_EVENT_CAPACITY: usize = 8;
 
 impl DocumentService {

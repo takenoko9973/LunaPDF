@@ -4,8 +4,6 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::tabs::MAX_TABS;
-
 const SCHEMA_VERSION: u32 = 1;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 4.0;
@@ -83,13 +81,6 @@ impl SessionState {
                 "unsupported session schema version {} (expected {})",
                 self.schema_version,
                 SCHEMA_VERSION
-            );
-        }
-        if self.tabs.len() > MAX_TABS {
-            bail!(
-                "session contains {} tabs (maximum is {})",
-                self.tabs.len(),
-                MAX_TABS
             );
         }
         if self.tabs.is_empty() {
