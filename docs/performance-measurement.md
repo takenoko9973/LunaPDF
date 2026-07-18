@@ -24,6 +24,31 @@
 | build profile | `release` / `debug` |
 | fixture manifest checksum | |
 
+## RSS測定（2026-07-18、3回）
+
+20タブ時のメモリ使用量をDev ContainerのWSLg環境で3回測定した。この結果はN-05のRSSだけを判定し、起動時間、UI応答性、GPUアクセラレーション環境、cache plateauなど未測定の要件には使用しない。
+
+| 項目 | 値 |
+| --- | --- |
+| commit | `82619f9` |
+| OS / version | Debian GNU/Linux 13.6（Docker Desktop / WSLg） |
+| CPU / RAM | AMD Ryzen 7 9700X / コンテナ認識15.6 GiB |
+| GPU / driver | Mesa 25.0.7、llvmpipe LLVM 19.1.7（ソフトウェア描画） |
+| display scale (DPI) | X11論理解像度96×96 DPI（5120×1440 px） |
+| build profile | `release` |
+| fixture | qpdf 11.9.1 manualの先頭100ページ、592,972 bytes |
+| fixture SHA-256 | `EE33A0DBB46B609A36C8AC6E93BA38CD684F5A240E8582A85B010974308D85DB` |
+
+同一内容を別パスへ複製し、コマンドラインから1、10、20ファイルを開いた。非アクティブタブは操作せず、すべての文書ワーカーが起動した安定状態でLinuxの`/proc/<pid>/status`からRSSを取得した。
+
+| タブ数 | 安定待機 | run 1 | run 2 | run 3 | 中央値 | 最大値 | threads |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 10 s | 152.7 MiB | 159.5 MiB | 154.6 MiB | 154.6 MiB | 159.5 MiB | 21 |
+| 10 | 15 s | 158.4 MiB | 160.1 MiB | 164.3 MiB | 160.1 MiB | 164.3 MiB | 30 |
+| 20 | 20 s | 172.0 MiB | 173.0 MiB | 172.6 MiB | 172.6 MiB | 173.0 MiB | 40 |
+
+20タブのRSSは3回とも暫定目標512 MiB以内だった。ただし、各タブのスクロール後、GPUアクセラレーション環境、cache plateau、起動時間、フレーム時間、検索入力遅延は未測定である。
+
 ## 記録する値
 
 status表示で直接読める値はアプリの表示値を使い、RSS・フレーム時間・入力遅延は外部計測器で測る。各値はcold/warmを分け、単位を固定する。
@@ -52,7 +77,7 @@ status表示で直接読める値はアプリの表示値を使い、RSS・フ�
 | warm起動 |  |  |  |  |  |
 | 初回ページ表示 |  |  |  |  |  |
 | 可視タイル完成 |  |  |  |  |  |
-| RSS 1/10/20 tab |  |  |  |  |  |
+| RSS 1/10/20 tab | 各3回 | 154.6 / 160.1 / 172.6 MiB | 159.5 / 164.3 / 173.0 MiB | pass | 100ページ技術資料、release、非アクティブタブ未操作 |
 | 最大フレーム時間 |  |  |  |  |  |
 | 検索入力遅延 |  |  |  |  |  |
 | cache plateau |  |  |  |  |  |
