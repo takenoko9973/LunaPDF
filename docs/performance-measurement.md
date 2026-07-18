@@ -131,9 +131,11 @@ releaseビルド後に1回起動してOSのファイルキャッシュをwarmに
 
 固定fixtureと同じ内容を持つ別パス20個を開いた。20ファイルはいずれも592,972 bytes、100ページで、SHA-256は同一だった。
 
+再測定対象はcommit `49d8aa1`である。このcommitではeguiへのupload後に`std::mem::take`でworker転送用RGBA allocationを解放する。`rgba_upload_releases_the_worker_transfer_allocation`テストで、upload後のpayloadがlength 0かつcapacity 0になることを確認した。
+
 CPU側ではRGBA画像を永続キャッシュせず、各文書ワーカーのbounded event channelと描画中の一時バッファだけを保持する。512 px RGBAタイルは最大1 MiBであり、1ワーカー最大9 MiB、20ワーカー合計180 MiB以下になる。GPU textureは共有192 MiB、thumbnailは共有32 MiBのバイト重みLRUである。各LRUが挿入後に上限を超えないことは`WeightedLruCache`の単体テストでも確認している。
 
-GPU LRUは、同じページを77%から異なるzoomで順に描画して到達させた。アプリのstatus文字列を、画像を保存せずOCRした。step 15で`248 tiles (182.9/192 MiB)`、step 16で`258 tiles (191.9/192 MiB)`、step 17で`256 tiles (192.0/192 MiB)`となり、上限到達時にタイル数が減ってLRU削除が発生した。逆方向の異なるzoomを10段階描画した間も、10回すべて`256 tiles (192.0/192 MiB)`だった。LunaPDFのRSSは570.410 MiBで、入れ替え直後、2秒、5秒、10秒後まで同じだった。
+GPU LRUは、20タブを`Ctrl+Tab`で一巡した後、同じページを異なるzoom generationで順に描画して到達させた。アプリのstatus文字列を、画像を保存せずOCRした。20タブ一巡後は`126 tiles (126.0/192 MiB)`、zoom-in step 5で`195 tiles (190.2/192 MiB)`だった。その後の逆方向10段階では、distinctなcache keyを追加しながら`198–212 tiles (191.1–191.9/192 MiB)`を維持した。上限近傍で新規挿入を続けても192 MiBを超えないため、LRU削除が発生したことを確認できる。LunaPDFのRSSは403.586 MiBで、入れ替え直後、2秒、5秒後まで同じだった。
 
 このGPU試行は、20タブを開いたまま極端な連続zoomで192 MiBへ強制到達させるstress workloadであり、通常操作のN-05判定には使わない。通常の20タブ安定時RSSは前節の最大173.0 MiBを判定値とする。
 
@@ -141,13 +143,13 @@ thumbnailは全100ページが612×792 ptのfixtureを使った。160×208 px RG
 
 | 時点 | RSS | peak RSS |
 | --- | ---: | ---: |
-| 初期20タブ | 188.953 MiB | 188.953 MiB |
-| 1文書100ページ走査後 | 211.641 MiB | 211.641 MiB |
-| 2文書200ページ走査後 | 211.898 MiB | 211.898 MiB |
-| 3文書300ページ走査後 | 314.910 MiB | 314.910 MiB |
-| 同じ300ページを再走査した2周目 | 314.910 MiB | 314.910 MiB |
-| 同じ300ページを再走査した3周目 | 314.910 MiB | 314.910 MiB |
-| 3周目直後 / 2秒 / 5秒待機 | 314.910 MiB | 314.910 MiB |
+| 初期20タブ | 168.164 MiB | 172.750 MiB |
+| 1文書100ページ走査後 | 180.277 MiB | 180.277 MiB |
+| 2文書200ページ走査後 | 180.277 MiB | 180.277 MiB |
+| 3文書300ページ走査後 | 180.277 MiB | 180.277 MiB |
+| 同じ300ページを再走査した2周目 | 180.277 MiB | 180.277 MiB |
+| 同じ300ページを再走査した3周目 | 180.277 MiB | 180.277 MiB |
+| 3周目直後 / 2秒 / 5秒待機 | 180.277 MiB | 180.277 MiB |
 
 GPU LRUとthumbnail LRUは、いずれも予算到達後の入れ替え操作でRSSが増え続けなかった。WSLgのドライバー側メモリは別計測していないため、この結果はLunaPDFプロセスRSSとアプリ内のバイト予算だけを判定する。
 
@@ -165,7 +167,7 @@ status表示で直接読める値はアプリの表示値を使い、RSS・フ�
 | RSS: 20 tabs | 外部プロセス計測 |  | 172.6 MiB | 安定時512 MiB以内を目標 |
 | 最大フレーム時間 | 外部画素変化計測 |  | 52.693 ms | 通常操作で100 ms超の停止なし |
 | 検索入力遅延 | 検索中の入力からUI反映までを外部計測 |  | 17.092 ms | 100 ms超の停止なし |
-| cache plateau後のRSS推移 | 予算到達後に外部計測 |  | GPU stress 570.410 MiB、thumbnail 314.910 MiBで横ばい | CPU転送180 MiB以下、GPU texture 192 MiB、thumbnail 32 MiBの各上限後に増加し続けない |
+| cache plateau後のRSS推移 | 予算到達後に外部計測 |  | GPU stress 403.586 MiB、thumbnail 180.277 MiBで横ばい | CPU転送180 MiB以下、GPU texture 192 MiB、thumbnail 32 MiBの各上限後に増加し続けない |
 
 `open`、`render`、`text`、`resident memory` は画面のstatus表示から直接読める。起動時間、初回ページ表示、可視タイル全体の完成、RSS、フレーム時間、検索入力遅延、cache plateauの判定は外部計測が必要である。
 
@@ -185,4 +187,4 @@ status表示で直接読める値はアプリの表示値を使い、RSS・フ�
 | RSS 1/10/20 tab | 各3回 | 154.6 / 160.1 / 172.6 MiB | 159.5 / 164.3 / 173.0 MiB | pass | 100ページ技術資料、release、非アクティブタブ未操作 |
 | 最大画面更新間隔 | 3回 | 52.693 ms | 58.183 ms | pass | 15〜18ページを20 ms間隔で連続スクロール |
 | 検索入力遅延 | 3回 | 17.092 ms | 17.471 ms | pass | 各回16回の検索進捗画面変化を観測 |
-| cache plateau | GPU 1系列、thumbnail 1系列 | GPU 570.410 MiB / thumbnail 314.910 MiB | 同左 | pass | アプリ内予算とLunaPDF RSS。GPU driver側メモリは別計測していない |
+| cache plateau | GPU 1系列、thumbnail 1系列 | GPU 403.586 MiB / thumbnail 180.277 MiB | 同左 | pass | commit `49d8aa1`。アプリ内予算とLunaPDF RSS。GPU driver側メモリは別計測していない |
