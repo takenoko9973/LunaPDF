@@ -523,12 +523,12 @@ impl PrototypeApp {
                             continue;
                         }
 
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                        let image = take_rgba_image(
+                            &mut tile.pixels_rgba,
                             [
                                 tile.spec.pixel_width as usize,
                                 tile.spec.pixel_height as usize,
                             ],
-                            &tile.pixels_rgba,
                         );
                         let texture = context.load_texture(
                             format!(
@@ -542,9 +542,6 @@ impl PrototypeApp {
                             image,
                             TextureOptions::LINEAR,
                         );
-                        // Texture storage owns the upload copy; retaining the
-                        // transfer buffer would double-count the page cache.
-                        tile.pixels_rgba.clear();
                         let weight = tile
                             .spec
                             .rgba_bytes()
@@ -639,12 +636,12 @@ impl PrototypeApp {
                             continue;
                         }
 
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                        let image = take_rgba_image(
+                            &mut thumbnail.pixels_rgba,
                             [
                                 thumbnail.pixel_width as usize,
                                 thumbnail.pixel_height as usize,
                             ],
-                            &thumbnail.pixels_rgba,
                         );
                         let texture = context.load_texture(
                             format!(
@@ -654,7 +651,6 @@ impl PrototypeApp {
                             image,
                             TextureOptions::LINEAR,
                         );
-                        thumbnail.pixels_rgba.clear();
                         let weight = expected_bytes.expect("validated thumbnail byte count");
                         tab.thumbnails
                             .insert(key, CachedThumbnail { thumbnail, texture });
@@ -789,7 +785,7 @@ impl PrototypeApp {
             self.documents[index].search.open = true;
             let document_id = self.documents[index].document_id;
             context.memory_mut(|memory| {
-                memory.request_focus(Id::new(("pdf-search-query", document_id)));
+                memory.request_focus(search_query_id(document_id));
             });
             if !self.documents[index].search.query.trim().is_empty()
                 && !self.documents[index].search.in_progress
@@ -829,8 +825,10 @@ impl PrototypeApp {
         if save_pressed && !close_flow_active {
             self.save();
         }
-        let highlight_pressed =
-            context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::H));
+        let search_query_id = self
+            .active_index()
+            .map(|index| search_query_id(self.documents[index].document_id));
+        let highlight_pressed = consume_highlight_shortcut(context, search_query_id);
         if highlight_pressed && !close_flow_active {
             self.create_highlight();
         }
@@ -1631,7 +1629,7 @@ impl PrototypeApp {
                     self.documents[index].search.open = true;
                     let document_id = self.documents[index].document_id;
                     ui.memory_mut(|memory| {
-                        memory.request_focus(Id::new(("pdf-search-query", document_id)));
+                        memory.request_focus(search_query_id(document_id));
                     });
                 }
                 if self.documents[index].search.open {
@@ -1639,7 +1637,7 @@ impl PrototypeApp {
                     let search = &mut self.documents[index].search;
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut search.query)
-                            .id(Id::new(("pdf-search-query", document_id)))
+                            .id(search_query_id(document_id))
                             .desired_width(180.0)
                             .hint_text("Search this PDF"),
                     );
@@ -3145,6 +3143,27 @@ fn tile_result_is_current(
         && wanted_tiles.contains(&key)
 }
 
+/// Copies validated RGBA pixels into egui and releases the worker transfer allocation.
+fn take_rgba_image(pixels_rgba: &mut Vec<u8>, size: [usize; 2]) -> egui::ColorImage {
+    // `Vec::clear` would retain up to the complete GPU/thumbnail cache budget
+    // on the CPU. Moving the allocation out makes it drop after egui copies it.
+    let transferred_pixels = std::mem::take(pixels_rgba);
+    egui::ColorImage::from_rgba_unmultiplied(size, &transferred_pixels)
+}
+
+fn search_query_id(document_id: u64) -> Id {
+    Id::new(("pdf-search-query", document_id))
+}
+
+fn consume_highlight_shortcut(context: &egui::Context, search_query: Option<Id>) -> bool {
+    if search_query.is_some_and(|id| context.memory(|memory| memory.has_focus(id))) {
+        // A bare `h` belongs to the focused search editor. Consuming it here
+        // would both drop the character and create an unrelated annotation.
+        return false;
+    }
+    context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::H))
+}
+
 fn is_pdf_path(path: &Path) -> bool {
     path.is_file()
         && path
@@ -3202,6 +3221,53 @@ mod tests {
             app.session_restore_progress.is_none(),
             "document workers did not finish session restoration before the test deadline"
         );
+    }
+
+    #[test]
+    fn rgba_upload_releases_the_worker_transfer_allocation() {
+        let mut pixels_rgba = Vec::with_capacity(64);
+        pixels_rgba.extend_from_slice(&[255, 0, 0, 255, 0, 255, 0, 255]);
+
+        let image = take_rgba_image(&mut pixels_rgba, [2, 1]);
+
+        assert_eq!(image.pixels.len(), 2);
+        assert!(pixels_rgba.is_empty());
+        assert_eq!(pixels_rgba.capacity(), 0);
+    }
+
+    #[test]
+    fn focused_search_editor_keeps_h_for_text_input() {
+        let focused_context = egui::Context::default();
+        let query_id = search_query_id(7);
+        focused_context.memory_mut(|memory| memory.request_focus(query_id));
+        let mut consumed_by_shortcut = true;
+        let mut remained_for_editor = false;
+        let _output = focused_context.run_ui(h_key_input(), |ui| {
+            consumed_by_shortcut = consume_highlight_shortcut(ui.ctx(), Some(query_id));
+            remained_for_editor = ui.input(|input| input.key_pressed(Key::H));
+        });
+        assert!(!consumed_by_shortcut);
+        assert!(remained_for_editor);
+
+        let unfocused_context = egui::Context::default();
+        let mut ordinary_shortcut = false;
+        let _output = unfocused_context.run_ui(h_key_input(), |ui| {
+            ordinary_shortcut = consume_highlight_shortcut(ui.ctx(), None);
+        });
+        assert!(ordinary_shortcut);
+    }
+
+    fn h_key_input() -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::H,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        }
     }
 
     #[test]
