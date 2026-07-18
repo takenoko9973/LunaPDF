@@ -135,6 +135,20 @@ pub(crate) struct HighlightRequest {
     pub(crate) quads: Vec<PageQuad>,
 }
 
+/// Identifies one application-created document edit for the tab-local undo log.
+///
+/// The enum is intentionally broader than Highlight today so future edit kinds
+/// can carry their own stable backend identity without turning the UI contract
+/// into a highlight-specific API. MuPDF xrefs are document-local, therefore the
+/// page index travels with the xref and is validated again by the backend.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EditAction {
+    CreateHighlight {
+        page_index: usize,
+        annotation_xref: i32,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OutlineItem {
     pub(crate) title: String,

@@ -8,7 +8,7 @@ use crossbeam_channel::{
 };
 
 use crate::domain::document::{
-    DocumentInfo, DocumentVersion, HighlightRequest, OutlineItem, RenderPriority,
+    DocumentInfo, DocumentVersion, EditAction, HighlightRequest, OutlineItem, RenderPriority,
     RenderedThumbnail, RenderedTile, SearchPageResult, ThumbnailRequest, TileRequest,
 };
 use crate::domain::selection::{
@@ -27,6 +27,8 @@ pub(crate) enum DocumentCommand {
     },
     LoadTextSnapshot(TextSnapshotRequest),
     CreateHighlight(HighlightRequest),
+    /// Removes the exact application-owned edit identified by the backend.
+    Undo(EditAction),
     LoadOutline,
     SetSearchGeneration(u64),
     SearchPage {
@@ -51,6 +53,10 @@ pub(crate) enum DocumentEvent {
         request: TextSnapshotRequest,
         message: String,
     },
+    /// Returns the stable identity produced when a document edit is created.
+    EditActionCreated(EditAction),
+    /// Confirms that the requested edit was removed from the in-memory PDF.
+    EditActionUndone(EditAction),
     OutlineReady(Vec<OutlineItem>),
     SearchPageReady(SearchPageResult),
     ThumbnailReady(RenderedThumbnail),
@@ -351,7 +357,8 @@ fn run_worker(
             },
             DocumentCommand::CreateHighlight(request) => {
                 match backend.create_highlight(request.page_index, &request.quads) {
-                    Ok(()) => {
+                    Ok(action) => {
+                        let _ = event_sender.send(DocumentEvent::EditActionCreated(action));
                         let _ = event_sender.send(DocumentEvent::Status(
                             "Highlight annotation created in memory".to_owned(),
                         ));
@@ -360,6 +367,13 @@ fn run_worker(
                     Err(error) => send_failure(&event_sender, "highlight", error),
                 }
             }
+            DocumentCommand::Undo(action) => match backend.undo(action.clone()) {
+                Ok(()) => {
+                    let _ = event_sender.send(DocumentEvent::EditActionUndone(action));
+                    send_info(&backend, &event_sender, "undo-state");
+                }
+                Err(error) => send_failure(&event_sender, "undo", error),
+            },
             DocumentCommand::LoadOutline => match backend.load_outline() {
                 Ok(outline) => {
                     let _ = event_sender.send(DocumentEvent::OutlineReady(outline));

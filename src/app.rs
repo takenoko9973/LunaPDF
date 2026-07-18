@@ -10,8 +10,8 @@ use eframe::egui::{
 };
 
 use crate::domain::document::{
-    DocumentInfo, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail, RenderedTile,
-    SearchMatch, SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
+    DocumentInfo, EditAction, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail,
+    RenderedTile, SearchMatch, SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
 };
 use crate::domain::selection::{
     PagePoint, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
@@ -27,6 +27,7 @@ use crate::render::cache::WeightedLruCache;
 use crate::render::layout::{ContinuousLayout, PAGE_GAP, PageAnchor};
 use crate::render::tiles::TileGrid;
 use crate::ui::fonts::install_cjk_fallback;
+use crate::ui::icons::{ToolbarIcon, icon_button};
 use crate::ui::sidebar::{SidebarTab, show_outline};
 use crate::ui::viewport::PageViewport;
 
@@ -51,6 +52,10 @@ const THUMBNAIL_MAX_WIDTH: u32 = 160;
 const THUMBNAIL_MAX_HEIGHT: u32 = 220;
 const THUMBNAIL_ROW_HEIGHT: f32 = 248.0;
 
+// Trackpads emit several small deltas for one gesture. Requiring 32 points of
+// unconsumed vertical motion prevents a page flip from an incidental edge touch.
+const SINGLE_PAGE_WHEEL_THRESHOLD: f32 = 32.0;
+
 // N-05 sets 512 MiB as the stable process target. Suspension is only allowed
 // after crossing that limit; ordinary tab switches retain documents.
 const RESIDENT_MEMORY_SUSPEND_THRESHOLD_BYTES: usize = 512 * 1_024 * 1_024;
@@ -65,6 +70,7 @@ pub(crate) struct PrototypeApp {
     approved_window_documents: HashSet<PathBuf>,
     allow_window_close: bool,
     window_close_pending: bool,
+    close_all_pending: bool,
     session_close_failure: Option<String>,
     saved_tab_to_close: Option<PathBuf>,
     session_store: SessionStore,
@@ -97,12 +103,15 @@ struct DocumentTab {
     selection: Option<SelectionSnapshot>,
     selection_generation: u64,
     pending_highlights: usize,
+    edit_history: Vec<EditAction>,
+    undo_in_flight: bool,
     save_in_flight: bool,
     thumbnails: HashMap<ThumbnailCacheKey, CachedThumbnail>,
     pending_thumbnails: HashSet<ThumbnailCacheKey>,
     failed_thumbnails: HashSet<ThumbnailCacheKey>,
     thumbnail_generation: u64,
     search: SearchState,
+    page_input: String,
     view: ViewState,
     restoring_from_session: bool,
     select_after_restore: bool,
@@ -145,7 +154,6 @@ struct TextSnapshotKey {
 
 #[derive(Default)]
 struct SearchState {
-    open: bool,
     query: String,
     generation: u64,
     pages: BTreeMap<usize, Vec<SearchMatch>>,
@@ -175,6 +183,7 @@ struct TileCacheKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CloseScope {
     Tab,
+    AllTabs,
     Window,
 }
 
@@ -242,6 +251,8 @@ struct ViewState {
     restore_anchor: Option<PageAnchor>,
     single_center_anchor: Option<Vec2>,
     restore_single_anchor: Option<Vec2>,
+    single_wheel_accumulator: f32,
+    single_wheel_latched: bool,
     generation: u64,
 }
 
@@ -274,6 +285,7 @@ impl PrototypeApp {
             approved_window_documents: HashSet::new(),
             allow_window_close: false,
             window_close_pending: false,
+            close_all_pending: false,
             session_close_failure: None,
             saved_tab_to_close: None,
             session_store,
@@ -301,6 +313,16 @@ impl PrototypeApp {
 
     fn open_document(&mut self, path: PathBuf) {
         let _opened_index = self.open_document_with_intent(path, OpenIntent::User);
+    }
+
+    /// Opens the native picker and forwards only an explicitly chosen PDF.
+    fn pick_pdf_and_open(&mut self) {
+        let selected = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .pick_file();
+        if let Some(path) = selected {
+            self.open_document(path);
+        }
     }
 
     fn restore_session(&mut self, session: SessionState) {
@@ -443,7 +465,6 @@ impl PrototypeApp {
                             self.documents[index].outline_requested = true;
                         }
                         if self.active_index() == Some(index)
-                            && self.documents[index].search.open
                             && !self.documents[index].search.query.trim().is_empty()
                         {
                             self.begin_search(index);
@@ -460,19 +481,23 @@ impl PrototypeApp {
                         let restart_search = self.active_index() == Some(index)
                             && self.close_confirmation.is_none()
                             && !self.window_close_pending
-                            && self.documents[index].search.open
+                            && !self.close_all_pending
                             && !self.documents[index].search.query.trim().is_empty();
                         let tab = &mut self.documents[index];
                         if info.dirty {
-                            tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
                             tab.state = state_after_document_info(tab.state, true);
                         } else {
                             tab.save_in_flight = false;
+                            tab.edit_history.clear();
                             tab.state = state_after_document_info(tab.state, false);
                         }
                         tab.info = Some(info);
                         tab.invalidate_rendering();
                         tab.invalidate_text_snapshots();
+                        let thumbnail_keys = tab.invalidate_thumbnails();
+                        for key in thumbnail_keys {
+                            self.thumbnail_lru.remove(&key);
+                        }
                         if let Some(path) = saved_path {
                             self.finish_save_for_close(&path, context);
                         }
@@ -552,6 +577,25 @@ impl PrototypeApp {
                         if selection.generation == tab.selection_generation {
                             tab.selection = Some(selection);
                             self.status = "Selection Quad baseline updated".to_owned();
+                        }
+                    }
+                    Ok(DocumentEvent::EditActionCreated(action)) => {
+                        let tab = &mut self.documents[index];
+                        tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
+                        tab.edit_history.push(action);
+                        tab.state = DocumentState::ReadyDirty;
+                    }
+                    Ok(DocumentEvent::EditActionUndone(action)) => {
+                        let tab = &mut self.documents[index];
+                        tab.undo_in_flight = false;
+                        if tab.edit_history.last() == Some(&action) {
+                            tab.edit_history.pop();
+                            self.status = "編集を元に戻しました".to_owned();
+                        } else {
+                            // A worker response must correspond to the action at the
+                            // top of this tab's history; silently reordering would let
+                            // a later undo target the wrong annotation identity.
+                            tab.error = Some("undo: 編集履歴の応答順序が一致しません".to_owned());
                         }
                     }
                     Ok(DocumentEvent::TextSnapshotReady(snapshot)) => {
@@ -703,7 +747,10 @@ impl PrototypeApp {
                             // A page error normally repeats for every queued page.
                             // Advancing the generation stops the remaining work instead
                             // of flooding the UI with identical failures.
-                            self.cancel_search(index, false);
+                            self.cancel_search(index);
+                        }
+                        if operation == "undo" {
+                            self.documents[index].undo_in_flight = false;
                         }
                         if operation == "save" {
                             self.documents[index].save_in_flight = false;
@@ -762,6 +809,12 @@ impl PrototypeApp {
         {
             self.prompt_next_window_document(context);
         }
+        if self.close_all_pending
+            && self.close_confirmation.is_none()
+            && !self.documents.iter().any(DocumentTab::is_saving)
+        {
+            self.prompt_next_close_all_document();
+        }
     }
 
     fn handle_dropped_files(&mut self, context: &egui::Context) {
@@ -774,9 +827,12 @@ impl PrototypeApp {
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
+        let open_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::O));
+        if open_pressed {
+            self.pick_pdf_and_open();
+        }
         let find_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F));
         if find_pressed && let Some(index) = self.active_index() {
-            self.documents[index].search.open = true;
             let document_id = self.documents[index].document_id;
             context.memory_mut(|memory| {
                 memory.request_focus(search_query_id(document_id));
@@ -791,7 +847,21 @@ impl PrototypeApp {
         let escape_pressed =
             context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
         if escape_pressed && let Some(index) = self.active_index() {
-            self.cancel_search(index, true);
+            let document_id = self.documents[index].document_id;
+            let query_id = search_query_id(document_id);
+            let page_id = page_number_id(document_id);
+            if context.memory(|memory| memory.has_focus(page_id)) {
+                self.documents[index].page_input =
+                    (self.documents[index].view.current_page + 1).to_string();
+                context.memory_mut(|memory| memory.surrender_focus(page_id));
+            } else if context.memory(|memory| memory.has_focus(query_id)) {
+                context.memory_mut(|memory| memory.surrender_focus(query_id));
+            } else if !self.documents[index].search.query.is_empty()
+                || !self.documents[index].search.pages.is_empty()
+            {
+                self.documents[index].search.query.clear();
+                self.cancel_search(index);
+            }
         }
 
         let next_tab = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Tab));
@@ -799,14 +869,18 @@ impl PrototypeApp {
             self.select_next_tab();
         }
 
-        let page_up = context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::PageUp));
-        if page_up {
-            self.move_page(-1);
-        }
-        let page_down =
-            context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::PageDown));
-        if page_down {
-            self.move_page(1);
+        let text_input_has_focus = self.active_text_input_has_focus(context);
+        if !text_input_has_focus {
+            let page_up =
+                context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::PageUp));
+            if page_up {
+                self.move_page(-1);
+            }
+            let page_down =
+                context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::PageDown));
+            if page_down {
+                self.move_page(1);
+            }
         }
 
         let zoom_delta = context.input(|input| input.zoom_delta());
@@ -814,22 +888,44 @@ impl PrototypeApp {
             self.zoom_by(zoom_delta);
         }
 
-        let close_flow_active = self.window_close_pending || self.close_confirmation.is_some();
+        let close_flow_active = self.window_close_pending
+            || self.close_all_pending
+            || self.close_confirmation.is_some();
         let save_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::S));
         if save_pressed && !close_flow_active {
             self.save();
         }
-        let search_query_id = self
-            .active_index()
-            .map(|index| search_query_id(self.documents[index].document_id));
-        let highlight_pressed = consume_highlight_shortcut(context, search_query_id);
+        let print_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::P));
+        if print_pressed && !close_flow_active {
+            self.print();
+        }
+        let undo_pressed = !text_input_has_focus
+            && context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Z));
+        if undo_pressed && !close_flow_active {
+            self.undo();
+        }
+        let active_text_input = self.active_text_input_id(context);
+        let highlight_pressed = consume_highlight_shortcut(context, active_text_input);
         if highlight_pressed && !close_flow_active {
             self.create_highlight();
         }
-        let copy_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::C));
+        let copy_pressed = !text_input_has_focus
+            && context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::C));
         if copy_pressed {
             self.copy_selection(context);
         }
+    }
+
+    fn active_text_input_id(&self, context: &egui::Context) -> Option<Id> {
+        let index = self.active_index()?;
+        let document_id = self.documents[index].document_id;
+        [search_query_id(document_id), page_number_id(document_id)]
+            .into_iter()
+            .find(|id| context.memory(|memory| memory.has_focus(*id)))
+    }
+
+    fn active_text_input_has_focus(&self, context: &egui::Context) -> bool {
+        self.active_text_input_id(context).is_some()
     }
 
     fn active_index(&self) -> Option<usize> {
@@ -844,7 +940,7 @@ impl PrototypeApp {
     fn begin_search(&mut self, index: usize) {
         let query = self.documents[index].search.query.trim().to_owned();
         if query.is_empty() {
-            self.cancel_search(index, false);
+            self.cancel_search(index);
             return;
         }
         let Some(page_count) = self.documents[index]
@@ -879,7 +975,7 @@ impl PrototypeApp {
         self.status = format!("Searching {page_count} pages…");
     }
 
-    fn cancel_search(&mut self, index: usize, close_bar: bool) {
+    fn cancel_search(&mut self, index: usize) {
         let tab = &mut self.documents[index];
         tab.search.generation = tab.search.generation.wrapping_add(1);
         let _queued = tab.send(DocumentCommand::SetSearchGeneration(tab.search.generation));
@@ -888,9 +984,6 @@ impl PrototypeApp {
         tab.search.completed_pages = 0;
         tab.search.truncated = false;
         tab.search.in_progress = false;
-        if close_bar {
-            tab.search.open = false;
-        }
     }
 
     fn navigate_search(&mut self, index: usize, forward: bool) {
@@ -938,8 +1031,7 @@ impl PrototypeApp {
             let path = self.tabs.tabs()[index].path().to_path_buf();
             self.documents[index].resume(path);
             self.status = "Reopening suspended PDF after external-change check…".to_owned();
-        } else if self.documents[index].search.open
-            && !self.documents[index].search.query.trim().is_empty()
+        } else if !self.documents[index].search.query.trim().is_empty()
             && !self.documents[index].search.in_progress
         {
             self.begin_search(index);
@@ -1027,6 +1119,46 @@ impl PrototypeApp {
             return;
         }
         self.close_tab_now(index);
+    }
+
+    fn request_close_all(&mut self) {
+        if self.window_close_pending || self.close_confirmation.is_some() {
+            return;
+        }
+        self.close_all_pending = true;
+        self.prompt_next_close_all_document();
+    }
+
+    fn prompt_next_close_all_document(&mut self) {
+        if self.documents.iter().any(DocumentTab::is_saving) {
+            self.status = "保存の完了を待ってからすべて閉じます…".to_owned();
+            return;
+        }
+        let next_path = self
+            .documents
+            .iter()
+            .enumerate()
+            .find(|(index, document)| {
+                let path = self.tabs.tabs()[*index].path();
+                document.has_unsaved_changes() && !self.approved_window_documents.contains(path)
+            })
+            .map(|(index, _)| self.tabs.tabs()[index].path().to_path_buf());
+
+        if let Some(path) = next_path {
+            self.close_confirmation = Some(CloseConfirmation {
+                scope: CloseScope::AllTabs,
+                path,
+                save_in_flight: false,
+            });
+            return;
+        }
+
+        while !self.documents.is_empty() {
+            self.remove_tab_now(self.documents.len() - 1);
+        }
+        self.approved_window_documents.clear();
+        self.close_all_pending = false;
+        self.status = "すべてのタブを閉じました".to_owned();
     }
 
     fn close_tab_now(&mut self, index: usize) {
@@ -1225,6 +1357,10 @@ impl PrototypeApp {
         self.close_confirmation = None;
         match scope {
             CloseScope::Tab => self.saved_tab_to_close = Some(path.to_path_buf()),
+            CloseScope::AllTabs => {
+                self.approved_window_documents.insert(path.to_path_buf());
+                self.prompt_next_close_all_document();
+            }
             CloseScope::Window => {
                 self.approved_window_documents.insert(path.to_path_buf());
                 self.prompt_next_window_document(context);
@@ -1270,6 +1406,10 @@ impl PrototypeApp {
                 self.close_confirmation = None;
                 match scope {
                     CloseScope::Tab => self.close_tab_by_path(&path),
+                    CloseScope::AllTabs => {
+                        self.approved_window_documents.insert(path);
+                        self.prompt_next_close_all_document();
+                    }
                     CloseScope::Window => {
                         self.approved_window_documents.insert(path);
                         self.prompt_next_window_document(context);
@@ -1281,7 +1421,8 @@ impl PrototypeApp {
                 self.approved_window_documents.clear();
                 self.allow_window_close = false;
                 self.window_close_pending = false;
-                self.status = "Close canceled".to_owned();
+                self.close_all_pending = false;
+                self.status = "閉じる操作をキャンセルしました".to_owned();
             }
         }
     }
@@ -1426,7 +1567,8 @@ impl PrototypeApp {
     }
 
     fn create_highlight(&mut self) {
-        if self.window_close_pending || self.close_confirmation.is_some() {
+        if self.window_close_pending || self.close_all_pending || self.close_confirmation.is_some()
+        {
             return;
         }
         let Some(tab) = self.active_tab_mut() else {
@@ -1463,6 +1605,28 @@ impl PrototypeApp {
             self.status = "Creating PDF Highlight annotation…".to_owned();
         } else {
             self.error = Some("highlight: document worker is unavailable".to_owned());
+        }
+    }
+
+    fn undo(&mut self) {
+        if !self.can_undo() {
+            return;
+        }
+        let tab = self
+            .active_tab_mut()
+            .expect("can_undo requires an active tab");
+        let action = tab
+            .edit_history
+            .last()
+            .expect("can_undo requires a history entry")
+            .clone();
+        if tab.send(DocumentCommand::Undo(action)) {
+            // Keep the action in history until the backend confirms the exact
+            // stable ID was removed; a failure must remain retryable.
+            tab.undo_in_flight = true;
+            self.status = "編集を元に戻しています…".to_owned();
+        } else {
+            self.error = Some("undo: document worker is unavailable".to_owned());
         }
     }
 
@@ -1539,133 +1703,386 @@ impl PrototypeApp {
         }
     }
 
+    fn menu_bar(&mut self, root_ui: &mut egui::Ui) {
+        let mut open_requested = false;
+        let mut print_requested = false;
+        let mut close_current_requested = false;
+        let mut close_all_requested = false;
+        let mut exit_requested = false;
+        let mut copy_requested = false;
+        let mut highlight_requested = false;
+        let mut undo_requested = false;
+
+        egui::Panel::top("menu-bar").show(root_ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("ファイル", |ui| {
+                    if ui.button("PDFを開く…").clicked() {
+                        open_requested = true;
+                        ui.close();
+                    }
+                    let print_label = if cfg!(windows) {
+                        "印刷…    Ctrl+P"
+                    } else {
+                        "印刷…（このOSでは非対応）"
+                    };
+                    if ui
+                        .add_enabled(
+                            cfg!(windows) && self.can_print(),
+                            egui::Button::new(print_label),
+                        )
+                        .clicked()
+                    {
+                        print_requested = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.active_index().is_some(),
+                            egui::Button::new("現在のタブを閉じる"),
+                        )
+                        .clicked()
+                    {
+                        close_current_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.documents.is_empty(),
+                            egui::Button::new("すべてのタブを閉じる"),
+                        )
+                        .clicked()
+                    {
+                        close_all_requested = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.restore_enabled, "前回のセッションを復元");
+                    ui.separator();
+                    if ui.button("終了").clicked() {
+                        exit_requested = true;
+                        ui.close();
+                    }
+                });
+                ui.menu_button("編集", |ui| {
+                    if ui
+                        .add_enabled(self.can_undo(), egui::Button::new("元に戻す    Ctrl+Z"))
+                        .clicked()
+                    {
+                        undo_requested = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.can_copy_selection(),
+                            egui::Button::new("コピー    Ctrl+C"),
+                        )
+                        .clicked()
+                    {
+                        copy_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.can_create_highlight(),
+                            egui::Button::new("ハイライト    H"),
+                        )
+                        .clicked()
+                    {
+                        highlight_requested = true;
+                        ui.close();
+                    }
+                });
+                ui.menu_button("表示", |ui| {
+                    ui.checkbox(&mut self.sidebar_open, "サイドバー");
+                    ui.separator();
+                    if let Some(index) = self.active_index() {
+                        if ui.button("目次").clicked() {
+                            self.sidebar_open = true;
+                            self.sidebar_tab = SidebarTab::Outline;
+                            ui.close();
+                        }
+                        if ui.button("サムネイル").clicked() {
+                            self.sidebar_open = true;
+                            self.sidebar_tab = SidebarTab::Thumbnails;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("幅に合わせる").clicked() {
+                            self.documents[index].view.zoom_mode = ZoomMode::FitWidth;
+                            ui.close();
+                        }
+                        if ui.button("ページ全体").clicked() {
+                            self.documents[index].view.zoom_mode = ZoomMode::FitPage;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("連続表示").clicked() {
+                            self.documents[index].set_display_mode(DisplayMode::Continuous);
+                            ui.close();
+                        }
+                        if ui.button("単一ページ表示").clicked() {
+                            self.documents[index].set_display_mode(DisplayMode::SinglePage);
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        });
+
+        if open_requested {
+            self.pick_pdf_and_open();
+        }
+        if print_requested {
+            self.print();
+        }
+        if close_current_requested && let Some(index) = self.active_index() {
+            self.close_tab(index);
+        }
+        if close_all_requested {
+            self.request_close_all();
+        }
+        if exit_requested {
+            root_ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+        }
+        if copy_requested {
+            self.copy_selection(root_ui.ctx());
+        }
+        if highlight_requested {
+            self.create_highlight();
+        }
+        if undo_requested {
+            self.undo();
+        }
+    }
+
     fn toolbar(&mut self, root_ui: &mut egui::Ui) {
         let mut search_changed = false;
         let mut search_navigation = None;
-        let mut close_search = false;
-        egui::Panel::top("toolbar").show(root_ui, |ui| {
-            ui.checkbox(&mut self.restore_enabled, "Restore previous session")
-                .on_hover_text("Restore tabs only when LunaPDF starts without PDF arguments");
-            ui.separator();
-            let Some(index) = self.active_index() else {
-                ui.label("Drop PDF files here");
-                return;
-            };
-            let page_count = self.documents[index]
-                .info
-                .as_ref()
-                .map(|info| info.page_bounds.len())
-                .unwrap_or(0);
-            let current_page = self.documents[index].view.current_page;
-            let highlight_restriction = self.documents[index]
-                .info
-                .as_ref()
-                .and_then(|info| info.highlight_capability.restriction());
-            let can_highlight = self.documents[index]
-                .info
-                .as_ref()
-                .is_some_and(|info| info.highlight_capability.is_allowed())
-                && self.documents[index]
-                    .selection
-                    .as_ref()
-                    .is_some_and(|selection| !selection.quads.is_empty());
+        let mut submitted_page = None;
+        let mut page_delta_requested = None;
+        let mut open_requested = false;
+        let mut print_requested = false;
 
+        egui::Panel::top("toolbar").show(root_ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.selectable_label(self.sidebar_open, "Sidebar").clicked() {
-                    self.sidebar_open = !self.sidebar_open;
+                open_requested =
+                    icon_button(ui, ToolbarIcon::Open, true, false, "PDFを開く (Ctrl+O)").clicked();
+                let print_enabled = cfg!(windows) && self.can_print();
+                let print_tooltip = if cfg!(windows) {
+                    "印刷 (Ctrl+P)"
+                } else {
+                    "このOSでは印刷に対応していません"
+                };
+                print_requested =
+                    icon_button(ui, ToolbarIcon::Print, print_enabled, false, print_tooltip)
+                        .clicked();
+                ui.separator();
+
+                let Some(index) = self.active_index() else {
+                    ui.label("PDFをドロップするか、開くボタンから選択してください");
+                    return;
+                };
+                let document_id = self.documents[index].document_id;
+                let page_count = self.documents[index]
+                    .info
+                    .as_ref()
+                    .map(|info| info.page_bounds.len())
+                    .unwrap_or(0);
+                let current_page = self.documents[index].view.current_page;
+
+                ui.label("ページ:");
+                let page_id = page_number_id(document_id);
+                if !ui.memory(|memory| memory.has_focus(page_id)) {
+                    self.documents[index].page_input = (current_page + 1).to_string();
                 }
-                if ui.button("◀").clicked() {
-                    self.move_page(-1);
+                let page_response = ui.add(
+                    egui::TextEdit::singleline(&mut self.documents[index].page_input)
+                        .id(page_id)
+                        .desired_width(46.0)
+                        .horizontal_align(egui::Align::Center),
+                );
+                let enter_pressed =
+                    page_response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                if enter_pressed || page_response.lost_focus() {
+                    submitted_page = Some(self.documents[index].page_input.clone());
                 }
-                ui.label(format!("{} / {}", current_page + 1, page_count));
-                if ui.button("▶").clicked() {
-                    self.move_page(1);
+                ui.label(format!("/ {page_count}"));
+                if icon_button(
+                    ui,
+                    ToolbarIcon::Previous,
+                    current_page > 0,
+                    false,
+                    "前のページ (PageUp)",
+                )
+                .clicked()
+                {
+                    page_delta_requested = Some(-1);
+                }
+                if icon_button(
+                    ui,
+                    ToolbarIcon::Next,
+                    current_page + 1 < page_count,
+                    false,
+                    "次のページ (PageDown)",
+                )
+                .clicked()
+                {
+                    page_delta_requested = Some(1);
                 }
                 ui.separator();
-                if ui.button("−").clicked() {
+                if icon_button(
+                    ui,
+                    ToolbarIcon::Sidebar,
+                    true,
+                    self.sidebar_open,
+                    "サイドバーを表示/非表示",
+                )
+                .clicked()
+                {
+                    self.sidebar_open = !self.sidebar_open;
+                }
+                if icon_button(ui, ToolbarIcon::ZoomOut, true, false, "縮小").clicked() {
                     self.zoom_by(1.0 / 1.1);
                 }
                 ui.label(format!("{:.0}%", self.documents[index].view.zoom * 100.0));
-                if ui.button("+").clicked() {
+                if icon_button(ui, ToolbarIcon::ZoomIn, true, false, "拡大").clicked() {
                     self.zoom_by(1.1);
                 }
-                if ui.button("Fit width").clicked() {
+                if icon_button(
+                    ui,
+                    ToolbarIcon::FitWidth,
+                    true,
+                    self.documents[index].view.zoom_mode == ZoomMode::FitWidth,
+                    "幅に合わせる",
+                )
+                .clicked()
+                {
                     self.documents[index].view.zoom_mode = ZoomMode::FitWidth;
                 }
-                if ui.button("Fit page").clicked() {
+                if icon_button(
+                    ui,
+                    ToolbarIcon::FitPage,
+                    true,
+                    self.documents[index].view.zoom_mode == ZoomMode::FitPage,
+                    "ページ全体を表示",
+                )
+                .clicked()
+                {
                     self.documents[index].view.zoom_mode = ZoomMode::FitPage;
                 }
                 ui.separator();
                 let continuous = self.documents[index].view.display_mode == DisplayMode::Continuous;
-                if ui.selectable_label(continuous, "Continuous").clicked() {
+                if icon_button(ui, ToolbarIcon::Continuous, true, continuous, "連続表示").clicked()
+                {
                     self.documents[index].set_display_mode(DisplayMode::Continuous);
                 }
-                if ui.selectable_label(!continuous, "Single page").clicked() {
+                if icon_button(
+                    ui,
+                    ToolbarIcon::SinglePage,
+                    true,
+                    !continuous,
+                    "単一ページ表示",
+                )
+                .clicked()
+                {
                     self.documents[index].set_display_mode(DisplayMode::SinglePage);
                 }
-                ui.separator();
-                let highlight_button = ui
-                    .add_enabled(can_highlight, egui::Button::new("Highlight (H)"))
-                    .on_disabled_hover_text(
-                        highlight_restriction.unwrap_or("Select text before creating a Highlight"),
-                    );
-                if highlight_button.clicked() {
+                let highlight_tooltip = self.documents[index]
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.highlight_capability.restriction())
+                    .unwrap_or("選択範囲をハイライト (H)");
+                if icon_button(
+                    ui,
+                    ToolbarIcon::Highlight,
+                    self.can_create_highlight(),
+                    false,
+                    highlight_tooltip,
+                )
+                .clicked()
+                {
                     self.create_highlight();
                 }
-                if ui.button("Save (Ctrl+S)").clicked() {
-                    self.save();
+                if icon_button(
+                    ui,
+                    ToolbarIcon::Undo,
+                    self.can_undo(),
+                    false,
+                    "元に戻す (Ctrl+Z)",
+                )
+                .clicked()
+                {
+                    self.undo();
                 }
                 ui.separator();
-                if ui
-                    .selectable_label(self.documents[index].search.open, "Find (Ctrl+F)")
-                    .clicked()
-                {
-                    self.documents[index].search.open = true;
-                    let document_id = self.documents[index].document_id;
-                    ui.memory_mut(|memory| {
-                        memory.request_focus(search_query_id(document_id));
-                    });
+
+                let search = &mut self.documents[index].search;
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut search.query)
+                        .id(search_query_id(document_id))
+                        .desired_width(180.0)
+                        .hint_text("PDF内を検索"),
+                );
+                search_changed = response.changed();
+                let enter = ui.input(|input| input.key_pressed(Key::Enter));
+                if response.has_focus() && enter && !search_changed {
+                    search_navigation = Some(!ui.input(|input| input.modifiers.shift));
                 }
-                if self.documents[index].search.open {
-                    let document_id = self.documents[index].document_id;
-                    let search = &mut self.documents[index].search;
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut search.query)
-                            .id(search_query_id(document_id))
-                            .desired_width(180.0)
-                            .hint_text("Search this PDF"),
-                    );
-                    search_changed = response.changed();
-                    let enter = ui.input(|input| input.key_pressed(Key::Enter));
-                    if response.has_focus() && enter && !search_changed {
-                        let backwards = ui.input(|input| input.modifiers.shift);
-                        search_navigation = Some(!backwards);
-                    }
-                    let match_count = search.pages.values().map(Vec::len).sum::<usize>();
-                    let selected = search
-                        .selected
-                        .and_then(|cursor| search_match_ordinal(&search.pages, cursor));
-                    let count = selected.map_or_else(
-                        || format!("{match_count} matches"),
-                        |selected| format!("{selected}/{match_count} matches"),
-                    );
-                    let progress = if search.in_progress {
-                        format!("{count} · {}/{}", search.completed_pages, page_count)
-                    } else {
-                        count
-                    };
-                    ui.label(progress);
-                    if search.truncated {
-                        ui.label("result limit reached");
-                    }
-                    close_search = ui.small_button("×").clicked();
+                let match_count = search.pages.values().map(Vec::len).sum::<usize>();
+                let selected = search
+                    .selected
+                    .and_then(|cursor| search_match_ordinal(&search.pages, cursor));
+                let count = format!("{} / {match_count}", selected.unwrap_or(0));
+                let progress = if search.in_progress {
+                    format!("{count} · {}/{}", search.completed_pages, page_count)
+                } else {
+                    count
+                };
+                ui.label(progress);
+                if search.truncated {
+                    ui.label("上限に到達");
+                }
+                if icon_button(
+                    ui,
+                    ToolbarIcon::Previous,
+                    match_count > 0,
+                    false,
+                    "前の検索結果 (Shift+Enter)",
+                )
+                .clicked()
+                {
+                    search_navigation = Some(false);
+                }
+                if icon_button(
+                    ui,
+                    ToolbarIcon::Next,
+                    match_count > 0,
+                    false,
+                    "次の検索結果 (Enter)",
+                )
+                .clicked()
+                {
+                    search_navigation = Some(true);
                 }
             });
         });
+
+        if open_requested {
+            self.pick_pdf_and_open();
+        }
+        if print_requested {
+            self.print();
+        }
         if let Some(index) = self.active_index() {
-            if close_search {
-                self.cancel_search(index, true);
-            } else if search_changed {
+            if let Some(page) = submitted_page {
+                self.submit_page_number(index, &page);
+            }
+            if let Some(delta) = page_delta_requested {
+                self.move_page(delta);
+            }
+            if search_changed {
                 self.begin_search(index);
             } else if let Some(forward) = search_navigation {
                 self.navigate_search(index, forward);
@@ -1673,81 +2090,165 @@ impl PrototypeApp {
         }
     }
 
+    fn submit_page_number(&mut self, index: usize, input: &str) {
+        let page_count = self.documents[index]
+            .info
+            .as_ref()
+            .map_or(0, |info| info.page_bounds.len());
+        let parsed = input.trim().parse::<usize>();
+        if let Ok(page_number) = parsed
+            && (1..=page_count).contains(&page_number)
+        {
+            self.documents[index].jump_to_page(page_number - 1);
+            self.documents[index].page_input = page_number.to_string();
+            return;
+        }
+        self.documents[index].page_input =
+            (self.documents[index].view.current_page + 1).to_string();
+        self.error = Some(format!(
+            "ページ番号は 1 から {page_count} の範囲で入力してください"
+        ));
+    }
+
+    fn can_copy_selection(&self) -> bool {
+        self.active_index()
+            .and_then(|index| self.documents[index].selection.as_ref())
+            .is_some()
+    }
+
+    fn can_create_highlight(&self) -> bool {
+        let Some(index) = self.active_index() else {
+            return false;
+        };
+        self.documents[index]
+            .info
+            .as_ref()
+            .is_some_and(|info| info.highlight_capability.is_allowed())
+            && self.documents[index]
+                .selection
+                .as_ref()
+                .is_some_and(|selection| !selection.quads.is_empty())
+    }
+
+    fn can_undo(&self) -> bool {
+        if self.window_close_pending || self.close_all_pending || self.close_confirmation.is_some()
+        {
+            return false;
+        }
+        self.active_index().is_some_and(|index| {
+            let tab = &self.documents[index];
+            !tab.edit_history.is_empty()
+                && !tab.undo_in_flight
+                && !tab.save_in_flight
+                && tab.service.is_some()
+        })
+    }
+
+    fn can_print(&self) -> bool {
+        self.active_index().is_some_and(|index| {
+            let tab = &self.documents[index];
+            tab.state != DocumentState::Opening
+                && tab.state != DocumentState::Suspended
+                && tab.state != DocumentState::Error
+                && !tab.save_in_flight
+                && tab.service.is_some()
+                && tab.info.is_some()
+        }) && !self.window_close_pending
+            && !self.close_all_pending
+            && self.close_confirmation.is_none()
+    }
+
+    fn print(&mut self) {
+        #[cfg(windows)]
+        {
+            self.status = "印刷ダイアログを準備しています…".to_owned();
+        }
+        #[cfg(not(windows))]
+        {
+            self.error = Some("このOSでは印刷に対応していません".to_owned());
+        }
+    }
+
     fn status_panel(&self, root_ui: &mut egui::Ui) {
-        egui::Panel::bottom("status")
-            .resizable(true)
-            .default_size(105.0)
-            .show(root_ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(&self.status);
-                    if let Some(index) = self.active_index() {
-                        let tab = &self.documents[index];
-                        if let Some(info) = &tab.info {
-                            ui.separator();
-                            ui.label(format!("open {:.1} ms", milliseconds(info.open_time)));
-                            ui.label(format!("Highlights: {}", info.highlight_count));
-                            // Exposing the chosen strategy makes a potentially slower full
-                            // rewrite visible instead of making it look like a stalled save.
-                            if info.can_save_incrementally {
-                                ui.label("incremental save");
-                            } else {
-                                ui.label("full-file rewrite");
+        #[cfg(debug_assertions)]
+        egui::Panel::bottom("debug-status").show(root_ui, |ui| {
+            egui::CollapsingHeader::new("デバッグ情報")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(&self.status);
+                        if let Some(index) = self.active_index() {
+                            let tab = &self.documents[index];
+                            if let Some(info) = &tab.info {
+                                ui.separator();
+                                ui.label(format!("open {:.1} ms", milliseconds(info.open_time)));
+                                ui.label(format!("Highlights: {}", info.highlight_count));
+                                // The explicit strategy distinguishes a slower full rewrite
+                                // from a stalled save during development diagnostics.
+                                if info.can_save_incrementally {
+                                    ui.label("incremental save");
+                                } else {
+                                    ui.label("full-file rewrite");
+                                }
+                                if let Some(memory) = info.physical_memory_bytes {
+                                    ui.label(format_memory(memory));
+                                }
                             }
-                            if let Some(memory) = info.physical_memory_bytes {
-                                ui.label(format_memory(memory));
+                            let current_tile = tab
+                                .tiles
+                                .values()
+                                .find(|cached| cached.tile.page_index == tab.view.current_page);
+                            if let Some(cached) = current_tile {
+                                ui.label(format!(
+                                    "render {:.1} ms @ {:.2}x",
+                                    milliseconds(cached.tile.render_time),
+                                    cached.tile.scale
+                                ));
+                                if let Some(memory) = cached.tile.physical_memory_bytes {
+                                    ui.label(format_memory(memory));
+                                }
+                            }
+                            if let Some(selection) = &tab.selection {
+                                ui.label(format!(
+                                    "text {:.1} ms",
+                                    milliseconds(selection.extraction_time)
+                                ));
                             }
                         }
-                        let current_tile = tab
-                            .tiles
-                            .values()
-                            .find(|cached| cached.tile.page_index == tab.view.current_page);
-                        if let Some(cached) = current_tile {
+                        ui.separator();
+                        if self.gpu_lru.is_empty() {
+                            ui.label("GPU tiles: empty");
+                        } else {
                             ui.label(format!(
-                                "render {:.1} ms @ {:.2}x",
-                                milliseconds(cached.tile.render_time),
-                                cached.tile.scale
-                            ));
-                            if let Some(memory) = cached.tile.physical_memory_bytes {
-                                ui.label(format_memory(memory));
-                            }
-                        }
-                        if let Some(selection) = &tab.selection {
-                            ui.label(format!(
-                                "text {:.1} ms",
-                                milliseconds(selection.extraction_time)
+                                "GPU tiles: {} ({:.1}/{:.0} MiB)",
+                                self.gpu_lru.len(),
+                                self.gpu_lru.current_bytes() as f64 / 1_048_576.0,
+                                self.gpu_lru.budget() as f64 / 1_048_576.0,
                             ));
                         }
-                    }
-                    ui.separator();
-                    if self.gpu_lru.is_empty() {
-                        ui.label("GPU tiles: empty");
-                    } else {
-                        ui.label(format!(
-                            "GPU tiles: {} ({:.1}/{:.0} MiB)",
-                            self.gpu_lru.len(),
-                            self.gpu_lru.current_bytes() as f64 / 1_048_576.0,
-                            self.gpu_lru.budget() as f64 / 1_048_576.0,
-                        ));
-                    }
+                    });
                 });
-                if let Some(error) = &self.error {
-                    ui.colored_label(Color32::LIGHT_RED, error);
-                }
-                if let Some(error) = self
-                    .active_index()
-                    .and_then(|index| self.documents[index].error.as_deref())
-                {
-                    ui.colored_label(Color32::LIGHT_RED, error);
-                }
-                ui.separator();
-                ui.strong("Logical selection / Ctrl+C");
-                let selection_text = self
-                    .active_index()
-                    .and_then(|index| self.documents[index].selection.as_ref())
-                    .map(|selection| selection.text.as_str())
-                    .unwrap_or("Drag across page text to inspect MuPDF selection Quads.");
-                ui.label(selection_text);
-            });
+        });
+        #[cfg(not(debug_assertions))]
+        let _ = root_ui;
+    }
+
+    fn error_banner(&self, root_ui: &mut egui::Ui) {
+        let app_error = self.error.as_deref();
+        let document_error = self
+            .active_index()
+            .and_then(|index| self.documents[index].error.as_deref());
+        if app_error.is_none() && document_error.is_none() {
+            return;
+        }
+        egui::Panel::top("persistent-error-banner").show(root_ui, |ui| {
+            if let Some(error) = app_error {
+                ui.colored_label(Color32::LIGHT_RED, error);
+            }
+            if let Some(error) = document_error {
+                ui.colored_label(Color32::LIGHT_RED, error);
+            }
+        });
     }
 
     fn sidebar_panel(&mut self, root_ui: &mut egui::Ui) {
@@ -1761,12 +2262,28 @@ impl PrototypeApp {
             .resizable(true)
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Outline, "Outline");
-                    ui.selectable_value(
-                        &mut self.sidebar_tab,
-                        SidebarTab::Thumbnails,
-                        "Thumbnails",
-                    );
+                    if icon_button(
+                        ui,
+                        ToolbarIcon::Outline,
+                        true,
+                        self.sidebar_tab == SidebarTab::Outline,
+                        "目次",
+                    )
+                    .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::Outline;
+                    }
+                    if icon_button(
+                        ui,
+                        ToolbarIcon::Thumbnails,
+                        true,
+                        self.sidebar_tab == SidebarTab::Thumbnails,
+                        "サムネイル",
+                    )
+                    .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::Thumbnails;
+                    }
                 });
                 ui.separator();
                 let Some(index) = self.active_index() else {
@@ -1776,13 +2293,13 @@ impl PrototypeApp {
                     SidebarTab::Outline => {
                         if let Some(outline) = &self.documents[index].outline {
                             if outline.is_empty() {
-                                ui.label("This PDF has no outline.");
+                                ui.label("このPDFには目次がありません");
                             } else {
                                 selected_page = show_outline(ui, outline);
                             }
                         } else {
                             ui.spinner();
-                            ui.label("Loading outline…");
+                            ui.label("目次を読み込み中…");
                         }
                     }
                     SidebarTab::Thumbnails => {
@@ -2057,6 +2574,7 @@ impl PrototypeApp {
         let info = tab.info.as_ref().expect("checked before drawing");
         let path = info.path.clone();
         let revision = info.revision;
+        let page_count = info.page_bounds.len();
         let page_index = tab.view.current_page;
         let bounds = info.page_bounds[page_index];
         let display_size = Vec2::new(
@@ -2136,6 +2654,52 @@ impl PrototypeApp {
             page_content_rect,
             viewport_center.to_pos2(),
         ));
+
+        let (scroll_delta, control_held, pointer_position) = ui.ctx().input(|input| {
+            (
+                input.smooth_scroll_delta,
+                input.modifiers.ctrl,
+                input.pointer.hover_pos(),
+            )
+        });
+        let pointer_over_view =
+            pointer_position.is_some_and(|position| output.inner_rect.contains(position));
+        let vertical_gesture = scroll_delta.y.abs() > scroll_delta.x.abs();
+        let maximum_y = (output.content_size.y - output.inner_rect.height()).max(0.0);
+        let at_top = output.state.offset.y <= 0.5;
+        let at_bottom = output.state.offset.y >= maximum_y - 0.5;
+        let page_delta = if pointer_over_view && vertical_gesture && !control_held {
+            accumulate_single_page_edge_scroll(
+                scroll_delta.y,
+                at_top,
+                at_bottom,
+                &mut tab.view.single_wheel_accumulator,
+                &mut tab.view.single_wheel_latched,
+            )
+        } else {
+            accumulate_single_page_edge_scroll(
+                0.0,
+                false,
+                false,
+                &mut tab.view.single_wheel_accumulator,
+                &mut tab.view.single_wheel_latched,
+            )
+        };
+        if let Some(page_delta) = page_delta {
+            let last_page = page_count.saturating_sub(1);
+            let target = page_index.saturating_add_signed(page_delta).min(last_page);
+            if target != page_index {
+                let x = tab.view.single_center_anchor.unwrap_or(Vec2::splat(0.5)).x;
+                // Enter the next page at its top and the previous page at its
+                // bottom so the wheel continues in the direction of travel.
+                let y = if page_delta > 0 { 0.0 } else { 1.0 };
+                let anchor = Vec2::new(x, y);
+                tab.view.current_page = target;
+                tab.view.single_center_anchor = Some(anchor);
+                tab.view.restore_single_anchor = Some(anchor);
+                tab.invalidate_rendering();
+            }
+        }
 
         if let Some((page_index, start, end)) = completed_drag {
             tab.request_selection(page_index, start, end);
@@ -2359,6 +2923,40 @@ fn normalized_page_point(page_rect: Rect, point: Pos2) -> Vec2 {
 }
 
 /// Centers a normalized PDF page point while respecting both scroll extents.
+/// Converts only a deliberate, unconsumed edge gesture into one page change.
+fn accumulate_single_page_edge_scroll(
+    vertical_delta: f32,
+    at_top: bool,
+    at_bottom: bool,
+    accumulator: &mut f32,
+    latched: &mut bool,
+) -> Option<isize> {
+    if vertical_delta.abs() <= f32::EPSILON {
+        *accumulator = 0.0;
+        *latched = false;
+        return None;
+    }
+    if *latched {
+        return None;
+    }
+    let moves_to_previous = vertical_delta > 0.0 && at_top;
+    let moves_to_next = vertical_delta < 0.0 && at_bottom;
+    if !moves_to_previous && !moves_to_next {
+        *accumulator = 0.0;
+        return None;
+    }
+    if accumulator.signum() != 0.0 && accumulator.signum() != vertical_delta.signum() {
+        *accumulator = 0.0;
+    }
+    *accumulator += vertical_delta;
+    if accumulator.abs() < SINGLE_PAGE_WHEEL_THRESHOLD {
+        return None;
+    }
+    *accumulator = 0.0;
+    *latched = true;
+    Some(if moves_to_next { 1 } else { -1 })
+}
+
 fn single_page_centered_offset(
     page_rect: Rect,
     normalized_anchor: Vec2,
@@ -2467,12 +3065,15 @@ impl DocumentTab {
             selection: None,
             selection_generation: 0,
             pending_highlights: 0,
+            edit_history: Vec::new(),
+            undo_in_flight: false,
             save_in_flight: false,
             thumbnails: HashMap::new(),
             pending_thumbnails: HashSet::new(),
             failed_thumbnails: HashSet::new(),
             thumbnail_generation: 1,
             search: SearchState::default(),
+            page_input: "1".to_owned(),
             view: restored_view.map_or_else(ViewState::new, ViewState::from_session),
             restoring_from_session,
             select_after_restore,
@@ -2619,6 +3220,15 @@ impl DocumentTab {
             || self.info.as_ref().is_some_and(|info| info.dirty)
     }
 
+    fn invalidate_thumbnails(&mut self) -> Vec<ThumbnailCacheKey> {
+        self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
+        self.pending_thumbnails.clear();
+        self.failed_thumbnails.clear();
+        let keys = self.thumbnails.keys().copied().collect();
+        self.thumbnails.clear();
+        keys
+    }
+
     fn invalidate_rendering(&mut self) {
         self.view.generation = self.view.generation.wrapping_add(1);
         let pending = self
@@ -2744,6 +3354,8 @@ impl ViewState {
             restore_anchor: None,
             single_center_anchor: None,
             restore_single_anchor: None,
+            single_wheel_accumulator: 0.0,
+            single_wheel_latched: false,
             generation: 1,
         }
     }
@@ -2777,6 +3389,8 @@ impl ViewState {
                 .then_some(single_anchor),
             restore_single_anchor: (display_mode == DisplayMode::SinglePage)
                 .then_some(single_anchor),
+            single_wheel_accumulator: 0.0,
+            single_wheel_latched: false,
             generation: 1,
         }
     }
@@ -2894,8 +3508,10 @@ impl eframe::App for PrototypeApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.menu_bar(ui);
         self.tab_bar(ui);
         self.toolbar(ui);
+        self.error_banner(ui);
         self.status_panel(ui);
         self.sidebar_panel(ui);
         self.central_panel(ui);
@@ -3149,9 +3765,13 @@ fn search_query_id(document_id: u64) -> Id {
     Id::new(("pdf-search-query", document_id))
 }
 
-fn consume_highlight_shortcut(context: &egui::Context, search_query: Option<Id>) -> bool {
-    if search_query.is_some_and(|id| context.memory(|memory| memory.has_focus(id))) {
-        // A bare `h` belongs to the focused search editor. Consuming it here
+fn page_number_id(document_id: u64) -> Id {
+    Id::new(("pdf-page-number", document_id))
+}
+
+fn consume_highlight_shortcut(context: &egui::Context, active_text_input: Option<Id>) -> bool {
+    if active_text_input.is_some() {
+        // A bare `h` belongs to the focused editor. Consuming it here
         // would both drop the character and create an unrelated annotation.
         return false;
     }
@@ -3384,6 +4004,46 @@ mod tests {
     }
 
     #[test]
+    fn single_page_edge_scroll_changes_one_page_per_gesture() {
+        let mut accumulator = 0.0;
+        let mut latched = false;
+
+        assert_eq!(
+            accumulate_single_page_edge_scroll(-16.0, false, true, &mut accumulator, &mut latched),
+            None
+        );
+        assert_eq!(
+            accumulate_single_page_edge_scroll(-20.0, false, true, &mut accumulator, &mut latched),
+            Some(1)
+        );
+        assert_eq!(
+            accumulate_single_page_edge_scroll(-50.0, false, true, &mut accumulator, &mut latched),
+            None
+        );
+        assert_eq!(
+            accumulate_single_page_edge_scroll(0.0, false, false, &mut accumulator, &mut latched),
+            None
+        );
+        assert_eq!(
+            accumulate_single_page_edge_scroll(32.0, true, false, &mut accumulator, &mut latched),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn single_page_scroll_inside_page_does_not_accumulate() {
+        let mut accumulator = 18.0;
+        let mut latched = false;
+
+        assert_eq!(
+            accumulate_single_page_edge_scroll(-20.0, false, false, &mut accumulator, &mut latched),
+            None
+        );
+        assert_eq!(accumulator, 0.0);
+        assert!(!latched);
+    }
+
+    #[test]
     fn display_mode_roundtrip_preserves_page_and_normalized_position() {
         let expected = PageAnchor {
             page_index: 4,
@@ -3400,6 +4060,8 @@ mod tests {
             restore_anchor: None,
             single_center_anchor: None,
             restore_single_anchor: None,
+            single_wheel_accumulator: 0.0,
+            single_wheel_latched: false,
             generation: 1,
         };
 

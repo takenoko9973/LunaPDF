@@ -27,8 +27,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::domain::document::{
-    DocumentInfo, DocumentVersion, HighlightCapability, HighlightRequest, OutlineItem, PageRect,
-    RenderedThumbnail, RenderedTile, SearchMatch, SearchPageResult, TILE_EDGE_PIXELS,
+    DocumentInfo, DocumentVersion, EditAction, HighlightCapability, HighlightRequest, OutlineItem,
+    PageRect, RenderedThumbnail, RenderedTile, SearchMatch, SearchPageResult, TILE_EDGE_PIXELS,
     ThumbnailRequest, TileRequest, TileSpec,
 };
 use crate::domain::selection::{
@@ -59,7 +59,7 @@ pub(super) struct MuPdfBackend {
     open_time: Duration,
     revision: u64,
     highlight_capability: HighlightCapability,
-    pending_highlights: Vec<HighlightRequest>,
+    pending_highlights: Vec<PendingHighlight>,
     display_list: Option<CachedDisplayList>,
     // A recovery document opened from bytes has no safe association with the
     // original path, so retries must use the full-rewrite path until a fresh
@@ -71,6 +71,12 @@ struct CachedDisplayList {
     page_index: usize,
     revision: u64,
     list: DisplayList,
+}
+
+#[derive(Clone, Debug)]
+struct PendingHighlight {
+    action: EditAction,
+    request: HighlightRequest,
 }
 
 impl MuPdfBackend {
@@ -115,7 +121,10 @@ impl MuPdfBackend {
             highlight_count: highlight_count(&self.document)?,
             can_save_incrementally: self.should_save_incrementally(),
             highlight_capability: self.highlight_capability,
-            dirty: self.document.has_unsaved_changes() || !self.pending_highlights.is_empty(),
+            // MuPDF keeps an xref dirty bit after an annotation is removed;
+            // the application dirty state therefore follows the still-live
+            // LunaPDF actions so create-then-undo returns to a clean tab.
+            dirty: !self.pending_highlights.is_empty(),
             revision: self.revision,
             open_time: self.open_time,
             physical_memory_bytes: physical_memory_bytes(),
@@ -392,7 +401,13 @@ impl MuPdfBackend {
         })
     }
 
-    pub(super) fn create_highlight(&mut self, page_index: usize, quads: &[PageQuad]) -> Result<()> {
+    /// Creates one in-memory Highlight and returns the exact MuPDF identity
+    /// needed to undo this operation without inspecting coordinates or order.
+    pub(super) fn create_highlight(
+        &mut self,
+        page_index: usize,
+        quads: &[PageQuad],
+    ) -> Result<EditAction> {
         ensure!(!quads.is_empty(), "cannot highlight an empty selection");
         ensure!(
             self.highlight_capability.is_allowed(),
@@ -411,12 +426,70 @@ impl MuPdfBackend {
             green: 1.0,
             blue: 0.0,
         })?;
+        let annotation_xref = annotation.xref()?;
+        // PDF xrefs are positive indirect-object numbers; zero is not stable
+        // enough to identify an application-owned annotation for undo.
+        ensure!(
+            annotation_xref > 0,
+            "MuPDF returned an invalid xref for the created Highlight"
+        );
         annotation.update()?;
         page.update()?;
-        self.pending_highlights.push(HighlightRequest {
+        let action = EditAction::CreateHighlight {
             page_index,
-            quads: quads.to_vec(),
+            annotation_xref,
+        };
+        self.pending_highlights.push(PendingHighlight {
+            action: action.clone(),
+            request: HighlightRequest {
+                page_index,
+                quads: quads.to_vec(),
+            },
         });
+        self.display_list = None;
+        self.revision += 1;
+        Ok(action)
+    }
+
+    /// Undoes one application-created edit by its stable MuPDF annotation xref.
+    ///
+    /// The pending-action check is deliberate: an xref supplied after save or
+    /// from an existing PDF is not considered LunaPDF-owned and is rejected,
+    /// so undo can never remove a preexisting annotation by coincidence.
+    pub(super) fn undo(&mut self, action: EditAction) -> Result<()> {
+        let (page_index, annotation_xref) = match &action {
+            EditAction::CreateHighlight {
+                page_index,
+                annotation_xref,
+            } => (*page_index, *annotation_xref),
+        };
+        let pending_index = self
+            .pending_highlights
+            .iter()
+            .position(|pending| pending.action == action)
+            .context("edit action is not an unsaved application edit")?;
+        let page_number = page_number(page_index, self.page_bounds.len())?;
+        let mut page = self.document.load_pdf_page(page_number)?;
+        let mut target = None;
+        for annotation in page.annotations() {
+            if annotation.xref()? == annotation_xref {
+                target = Some(annotation);
+                break;
+            }
+        }
+        let annotation = target.with_context(|| {
+            format!(
+                "application-created Highlight xref {annotation_xref} was not found on page {}",
+                page_index + 1
+            )
+        })?;
+        ensure!(
+            annotation.r#type()? == PdfAnnotationType::Highlight,
+            "application edit xref {annotation_xref} is not a Highlight annotation"
+        );
+        page.delete_annotation(annotation)?;
+        page.update()?;
+        self.pending_highlights.remove(pending_index);
         self.display_list = None;
         self.revision += 1;
         Ok(())
@@ -742,7 +815,7 @@ fn verify_saved_document(
     document: &PdfDocument,
     expected_page_count: usize,
     expected_highlights: usize,
-    pending_highlights: &[HighlightRequest],
+    pending_highlights: &[PendingHighlight],
 ) -> Result<(usize, Vec<PageRect>)> {
     let verified_highlights = highlight_count(document)?;
     ensure!(
@@ -756,9 +829,9 @@ fn verify_saved_document(
     );
     for expected in pending_highlights {
         ensure!(
-            contains_highlight(document, expected)?,
+            contains_highlight(document, &expected.request)?,
             "saved PDF does not contain the Highlight created on page {}",
-            expected.page_index + 1
+            expected.request.page_index + 1
         );
     }
     Ok((verified_highlights, page_bounds))
@@ -1350,6 +1423,66 @@ mod tests {
         assert_eq!(verified_highlights, 1);
         assert_eq!(saved.highlight_count, 1);
         assert!(!saved.dirty);
+    }
+
+    #[test]
+    fn undo_deletes_only_the_exact_created_xref() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("highlight-undo.pdf");
+        let path_text = path.to_str().unwrap();
+        let existing_quad = Quad::from(Rect::new(20.0, 20.0, 80.0, 40.0));
+        let existing_xref = {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut annotation = page.add_highlight_annotation(existing_quad).unwrap();
+            annotation.update().unwrap();
+            page.update().unwrap();
+            drop(annotation);
+            drop(page);
+            document.save(path_text).unwrap();
+            let reopened = PdfDocument::open(path_text).unwrap();
+            let page = reopened.load_pdf_page(0).unwrap();
+            page.annotations().next().unwrap().xref().unwrap()
+        };
+
+        let mut backend = MuPdfBackend::open(path).unwrap();
+        let action = backend
+            .create_highlight(
+                0,
+                &[PageQuad {
+                    upper_left: PagePoint::new(120.0, 20.0),
+                    upper_right: PagePoint::new(180.0, 20.0),
+                    lower_left: PagePoint::new(120.0, 40.0),
+                    lower_right: PagePoint::new(180.0, 40.0),
+                }],
+            )
+            .unwrap();
+        let created_xref = match &action {
+            EditAction::CreateHighlight {
+                annotation_xref, ..
+            } => *annotation_xref,
+        };
+        assert_ne!(created_xref, existing_xref);
+        assert!(backend.info().unwrap().dirty);
+        assert!(
+            backend
+                .undo(EditAction::CreateHighlight {
+                    page_index: 0,
+                    annotation_xref: existing_xref,
+                })
+                .is_err()
+        );
+
+        backend.undo(action).unwrap();
+
+        let page = backend.document.load_pdf_page(0).unwrap();
+        let remaining_xrefs = page
+            .annotations()
+            .map(|annotation| annotation.xref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_xrefs, vec![existing_xref]);
+        assert!(backend.pending_highlights.is_empty());
+        assert!(!backend.info().unwrap().dirty);
     }
 
     #[test]
