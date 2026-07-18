@@ -55,11 +55,26 @@ pdftoppm -png -f 1 -singlefile -r 150 \
 
 画面キャプチャ`target/acceptance-highlight-sumatra-window-only.png`は検証成果物としてリポジトリへコミットしない。
 
+## SumatraPDFによるWindows再保存確認
+
+表示確認と同じSumatraPDF 3.6.1でfixtureのコピーを開き、DDEの`Search`で検証文字列を選択した後、`CmdCreateAnnotHighlight`と`CmdSaveAnnotations`を順に実行した。通常設定とセッションへ影響させないため一時appdataを使い、元のfixtureではなく`target/acceptance-highlight-sumatra-resave.pdf`だけを再保存対象にした。
+
+再保存ログには既存PDFへの注釈保存完了が記録され、コピーは1,785 bytesから2,580 bytesへ変化した。SHA-256も`A8D038192389075277FFCF63B02B5FD116533E3DD2F80D7689A9AF079607C48C`から`A2D35679CB4A6C92AAEB326F666F01C6A955D03C8544C04BE09A27C7C352254B`へ変化しており、実際に再保存されたことを確認した。
+
+Dev Containerのqpdf 12.2.0で再保存コピーを検査し、構文・ストリーム符号化エラーがないことを確認した。`qpdf --json`では注釈が2件になり、LunaPDFが出力した元のHighlightは次の値を含めて変更されずに残っていた。
+
+- `/Subtype /Highlight`
+- `/C [1 1 0]`
+- `/QuadPoints [40 111.825 207.50797 111.825 40 96.711 207.50797 96.711]`
+- `/Rect [36.437479 95.76637 211.07048 112.76962]`
+- 元の`/AP`外観ストリーム
+
+2件目にはSumatraPDFが作成したHighlightと外観ストリームが追加されていた。これにより、Windowsの外部ビューアで注釈を追加して既存PDFへ再保存した後も、LunaPDFが保存した元のHighlightが維持されることを確認済みである。再保存コピーも検証成果物としてリポジトリへコミットしない。
+
 ## 未完了の互換性確認
 
 設計書15.3の完全な互換性確認には、次を確認する必要がある。
 
-- 外部ビューアで再保存した後もHighlightが残る
 - Linuxの対象デスクトップ環境にあるGUIビューアでも同じ位置と色に表示される
 
-WindowsのSumatraPDF表示とLinuxの独立したPoppler描画は合格している。外部ビューアによる再保存とLinux GUI操作は、対象ビューアを備えた環境で別途確認する。
+WindowsのSumatraPDF表示・再保存とLinuxの独立したPoppler描画は合格している。Linux GUI操作は、対象ビューアを備えた環境で別途確認する。
