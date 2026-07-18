@@ -2,8 +2,11 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "type": "cargo",
-            "command": "run",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "run"
+            ],
             "problemMatcher": [
                 "$rustc"
             ],
@@ -14,25 +17,26 @@
             "label": "rust: run linux"
         },
         {
-            "type": "cargo",
-            "command": "run",
+            "type": "shell",
+            "command": "cargo",
             "args": [
                 "--release"
             ],
             "problemMatcher": [
+                "run",
                 "$rustc"
             ],
             "label": "rust: run linux release"
         },
         {
-            "type": "cargo",
-            "command": "build",
+            "type": "shell",
+            "command": "sh",
+            "args": [
+                "-c",
+                "cargo build --target=x86_64-pc-windows-gnu && install -D target/x86_64-pc-windows-gnu/debug/lunapdf.exe /workspace/dist/lunapdf-debug.exe"
+            ],
             "problemMatcher": [
                 "$rustc"
-            ],
-            "args": [
-                "--release",
-                "--target=x86_64-pc-windows-gnu"
             ],
             "group": {
                 "kind": "build",
@@ -41,7 +45,23 @@
             "label": "rust: cross compile for windows"
         },
         {
-            "type": "cargo",
+            "type": "shell",
+            "command": "sh",
+            "args": [
+                "-c",
+                "cargo build --release --target=x86_64-pc-windows-gnu && install -D target/x86_64-pc-windows-gnu/release/lunapdf.exe /workspace/dist/lunapdf-release.exe"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "label": "rust: cross compile for windows release"
+        },
+        {
+            "type": "shell",
             "command": "install-update",
             "problemMatcher": [
                 "$rustc"
