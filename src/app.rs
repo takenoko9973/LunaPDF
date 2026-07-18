@@ -13,7 +13,9 @@ use crate::domain::document::{
     DocumentInfo, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail, RenderedTile,
     SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
 };
-use crate::domain::selection::{PagePoint, SelectionSnapshot};
+use crate::domain::selection::{
+    PagePoint, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
+};
 use crate::domain::tabs::{OpenTabResult, TabState};
 use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService};
 use crate::render::cache::WeightedLruCache;
@@ -78,6 +80,10 @@ struct DocumentTab {
     tiles: HashMap<TileCacheKey, CachedTile>,
     pending_tiles: HashMap<TileCacheKey, TileRequest>,
     wanted_tiles: HashSet<TileCacheKey>,
+    text_snapshots: HashMap<TextSnapshotKey, TextPageSnapshot>,
+    pending_text_snapshots: HashSet<TextSnapshotKey>,
+    failed_text_snapshots: HashSet<TextSnapshotKey>,
+    wanted_text_snapshots: HashSet<TextSnapshotKey>,
     selection: Option<SelectionSnapshot>,
     selection_generation: u64,
     pending_highlights: usize,
@@ -116,6 +122,12 @@ struct ThumbnailCacheKey {
     page_index: usize,
     max_pixel_width: u32,
     max_pixel_height: u32,
+    revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TextSnapshotKey {
+    page_index: usize,
     revision: u64,
 }
 
@@ -301,6 +313,7 @@ impl PrototypeApp {
                         }
                         tab.info = Some(info);
                         tab.invalidate_rendering();
+                        tab.invalidate_text_snapshots();
                         if let Some(path) = saved_path {
                             self.finish_save_for_close(&path, context);
                         }
@@ -383,6 +396,48 @@ impl PrototypeApp {
                         if selection.generation == tab.selection_generation {
                             tab.selection = Some(selection);
                             self.status = "Selection Quad baseline updated".to_owned();
+                        }
+                    }
+                    Ok(DocumentEvent::TextSnapshotReady(snapshot)) => {
+                        let key = TextSnapshotKey::from_snapshot(&snapshot);
+                        let is_active = self.active_index() == Some(index);
+                        let tab = &mut self.documents[index];
+                        tab.pending_text_snapshots.remove(&key);
+                        let current_revision = tab.info.as_ref().map(|info| info.revision);
+                        let page_count = tab.info.as_ref().map_or(0, |info| info.page_bounds.len());
+                        let is_current = text_snapshot_result_is_current(
+                            is_active,
+                            key,
+                            current_revision,
+                            page_count,
+                            &tab.wanted_text_snapshots,
+                        );
+                        if is_current {
+                            tab.failed_text_snapshots.remove(&key);
+                            tab.text_snapshots.insert(key, snapshot);
+                        }
+                    }
+                    Ok(DocumentEvent::TextSnapshotSkipped(request)) => {
+                        let key = TextSnapshotKey::from_request(&request);
+                        self.documents[index].pending_text_snapshots.remove(&key);
+                    }
+                    Ok(DocumentEvent::TextSnapshotFailed { request, message }) => {
+                        let key = TextSnapshotKey::from_request(&request);
+                        let is_active = self.active_index() == Some(index);
+                        let tab = &mut self.documents[index];
+                        tab.pending_text_snapshots.remove(&key);
+                        let current_revision = tab.info.as_ref().map(|info| info.revision);
+                        let page_count = tab.info.as_ref().map_or(0, |info| info.page_bounds.len());
+                        let is_current = text_snapshot_result_is_current(
+                            is_active,
+                            key,
+                            current_revision,
+                            page_count,
+                            &tab.wanted_text_snapshots,
+                        );
+                        if is_current {
+                            tab.failed_text_snapshots.insert(key);
+                            tab.error = Some(format!("text snapshot: {message}"));
                         }
                     }
                     Ok(DocumentEvent::OutlineReady(outline)) => {
@@ -674,6 +729,7 @@ impl PrototypeApp {
             // Pending work is invalidated immediately. Completed textures remain
             // reusable only while the shared byte-budget LRU can retain them.
             self.documents[previous].invalidate_rendering();
+            self.documents[previous].invalidate_text_snapshots();
             self.documents[previous].search.generation =
                 self.documents[previous].search.generation.wrapping_add(1);
             let generation = self.documents[previous].search.generation;
@@ -1050,16 +1106,14 @@ impl PrototypeApp {
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
-        let can_save = tab
-            .info
-            .as_ref()
-            .is_some_and(|info| info.can_save_incrementally);
-        // Safe full-file replacement is not implemented yet. Editing a PDF
-        // that cannot use incremental save would create an unsavable state.
-        if !can_save {
-            self.error = Some(
-                "highlight: this PDF cannot be saved incrementally; editing is disabled".to_owned(),
-            );
+        let highlight_capability = tab.info.as_ref().map(|info| info.highlight_capability);
+        let Some(highlight_capability) = highlight_capability else {
+            return;
+        };
+        if let Some(restriction) = highlight_capability.restriction() {
+            // The adapter reports a concrete restriction; the UI does not
+            // invent a save fallback that could leave an unsavable dirty tab.
+            self.error = Some(format!("highlight: {restriction}; editing is disabled"));
             return;
         }
         let Some(selection) = &tab.selection else {
@@ -1174,10 +1228,14 @@ impl PrototypeApp {
                 .map(|info| info.page_bounds.len())
                 .unwrap_or(0);
             let current_page = self.documents[index].view.current_page;
+            let highlight_restriction = self.documents[index]
+                .info
+                .as_ref()
+                .and_then(|info| info.highlight_capability.restriction());
             let can_highlight = self.documents[index]
                 .info
                 .as_ref()
-                .is_some_and(|info| info.can_save_incrementally)
+                .is_some_and(|info| info.highlight_capability.is_allowed())
                 && self.documents[index]
                     .selection
                     .as_ref()
@@ -1217,10 +1275,12 @@ impl PrototypeApp {
                     self.documents[index].set_display_mode(DisplayMode::SinglePage);
                 }
                 ui.separator();
-                if ui
+                let highlight_button = ui
                     .add_enabled(can_highlight, egui::Button::new("Highlight (H)"))
-                    .clicked()
-                {
+                    .on_disabled_hover_text(
+                        highlight_restriction.unwrap_or("Select text before creating a Highlight"),
+                    );
+                if highlight_button.clicked() {
                     self.create_highlight();
                 }
                 if ui.button("Save (Ctrl+S)").clicked() {
@@ -1537,6 +1597,7 @@ impl PrototypeApp {
         let info = tab.info.as_ref().expect("checked before drawing");
         let path = info.path.clone();
         let page_bounds = info.page_bounds.clone();
+        let revision = info.revision;
         let widest_page = page_bounds
             .iter()
             .map(|bounds| bounds.width() * tab.view.zoom)
@@ -1565,6 +1626,9 @@ impl PrototypeApp {
         let mut completed_drag = None;
         let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
             ui.set_min_size(Vec2::new(content_width, layout.total_height()));
+            let visible_text_pages =
+                layout.visible_pages(visible_viewport.min.y..visible_viewport.max.y, 0.0);
+            tab.prepare_text_snapshots(visible_text_pages, revision);
             // One viewport of prefetch keeps ordinary wheel scrolling smooth
             // while the shared byte LRU supplies the hard memory bound.
             let wanted_pages = layout.visible_pages(
@@ -1613,11 +1677,16 @@ impl PrototypeApp {
                 }
                 let response = ui
                     .scope_builder(UiBuilder::new().max_rect(screen_rect), |page_ui| {
+                        let text_key = TextSnapshotKey {
+                            page_index,
+                            revision,
+                        };
                         viewport.interact_at(
                             page_ui,
                             screen_rect,
                             page_index,
                             page_bounds[page_index],
+                            tab.text_snapshots.get(&text_key),
                             tab.selection.as_ref(),
                         )
                     })
@@ -1646,6 +1715,7 @@ impl PrototypeApp {
         let tab = &mut self.documents[index];
         let info = tab.info.as_ref().expect("checked before drawing");
         let path = info.path.clone();
+        let revision = info.revision;
         let page_index = tab.view.current_page;
         let bounds = info.page_bounds[page_index];
         let display_size = Vec2::new(
@@ -1672,6 +1742,7 @@ impl PrototypeApp {
         }
         let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
             ui.set_min_size(content_size);
+            tab.prepare_text_snapshots(std::iter::once(page_index), revision);
             let screen_rect = Rect::from_min_size(
                 ui.max_rect().min + page_content_rect.min.to_vec2(),
                 display_size,
@@ -1692,11 +1763,16 @@ impl PrototypeApp {
             }
             completed_drag = ui
                 .scope_builder(UiBuilder::new().max_rect(screen_rect), |page_ui| {
+                    let text_key = TextSnapshotKey {
+                        page_index,
+                        revision,
+                    };
                     viewport.interact_at(
                         page_ui,
                         screen_rect,
                         page_index,
                         bounds,
+                        tab.text_snapshots.get(&text_key),
                         tab.selection.as_ref(),
                     )
                 })
@@ -1769,6 +1845,22 @@ impl ThumbnailCacheKey {
             page_index: request.page_index,
             max_pixel_width: request.max_pixel_width,
             max_pixel_height: request.max_pixel_height,
+            revision: request.expected_revision,
+        }
+    }
+}
+
+impl TextSnapshotKey {
+    fn from_snapshot(snapshot: &TextPageSnapshot) -> Self {
+        Self {
+            page_index: snapshot.page_index,
+            revision: snapshot.revision,
+        }
+    }
+
+    fn from_request(request: &TextSnapshotRequest) -> Self {
+        Self {
+            page_index: request.page_index,
             revision: request.expected_revision,
         }
     }
@@ -1983,6 +2075,10 @@ impl DocumentTab {
             tiles: HashMap::new(),
             pending_tiles: HashMap::new(),
             wanted_tiles: HashSet::new(),
+            text_snapshots: HashMap::new(),
+            pending_text_snapshots: HashSet::new(),
+            failed_text_snapshots: HashSet::new(),
+            wanted_text_snapshots: HashSet::new(),
             selection: None,
             selection_generation: 0,
             pending_highlights: 0,
@@ -2019,6 +2115,15 @@ impl DocumentTab {
         }
     }
 
+    fn cancel_text_snapshot(&self, key: TextSnapshotKey) {
+        if let Some(service) = &self.service {
+            service.cancel_text_snapshot(&TextSnapshotRequest {
+                page_index: key.page_index,
+                expected_revision: key.revision,
+            });
+        }
+    }
+
     fn is_saving(&self) -> bool {
         document_save_blocks_close(self.save_in_flight)
     }
@@ -2029,6 +2134,7 @@ impl DocumentTab {
 
     fn suspend(&mut self) {
         self.invalidate_rendering();
+        self.invalidate_text_snapshots();
         self.tiles.clear();
         self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
         self.pending_thumbnails.clear();
@@ -2126,6 +2232,58 @@ impl DocumentTab {
             self.cancel_render(&request);
         }
         self.wanted_tiles.clear();
+    }
+
+    fn invalidate_text_snapshots(&mut self) {
+        self.text_snapshots.clear();
+        let pending = self.pending_text_snapshots.drain().collect::<Vec<_>>();
+        for key in pending {
+            self.cancel_text_snapshot(key);
+        }
+        self.failed_text_snapshots.clear();
+        self.wanted_text_snapshots.clear();
+    }
+
+    fn prepare_text_snapshots(&mut self, page_indices: impl Iterator<Item = usize>, revision: u64) {
+        let wanted = page_indices
+            .map(|page_index| TextSnapshotKey {
+                page_index,
+                revision,
+            })
+            .collect::<HashSet<_>>();
+        let canceled = self
+            .pending_text_snapshots
+            .iter()
+            .filter(|key| !wanted.contains(key))
+            .copied()
+            .collect::<Vec<_>>();
+        for key in canceled {
+            self.pending_text_snapshots.remove(&key);
+            self.cancel_text_snapshot(key);
+        }
+        self.text_snapshots.retain(|key, _| wanted.contains(key));
+        retain_visible_text_failures(&mut self.failed_text_snapshots, &mut self.error, &wanted);
+        self.wanted_text_snapshots = wanted;
+
+        let requests = self
+            .wanted_text_snapshots
+            .iter()
+            .filter(|key| {
+                !self.text_snapshots.contains_key(key)
+                    && !self.pending_text_snapshots.contains(key)
+                    && !self.failed_text_snapshots.contains(key)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for key in requests {
+            let request = TextSnapshotRequest {
+                page_index: key.page_index,
+                expected_revision: key.revision,
+            };
+            if self.send(DocumentCommand::LoadTextSnapshot(request)) {
+                self.pending_text_snapshots.insert(key);
+            }
+        }
     }
 
     fn prepare_tiles(&mut self, requests: Vec<TileRequest>) {
@@ -2313,6 +2471,38 @@ fn search_result_is_current(
     current_revision: Option<u64>,
 ) -> bool {
     result_generation == current_generation && current_revision == Some(result_revision)
+}
+
+fn text_snapshot_result_is_current(
+    is_active: bool,
+    key: TextSnapshotKey,
+    current_revision: Option<u64>,
+    page_count: usize,
+    wanted: &HashSet<TextSnapshotKey>,
+) -> bool {
+    // An extraction may finish after a scroll, tab switch, or annotation
+    // mutation. Only the exact visible document state may affect UI or errors.
+    is_active
+        && current_revision == Some(key.revision)
+        && key.page_index < page_count
+        && wanted.contains(&key)
+}
+
+fn retain_visible_text_failures(
+    failed: &mut HashSet<TextSnapshotKey>,
+    error: &mut Option<String>,
+    wanted: &HashSet<TextSnapshotKey>,
+) {
+    failed.retain(|key| wanted.contains(key));
+    if failed.is_empty()
+        && error
+            .as_ref()
+            .is_some_and(|message| message.starts_with("text snapshot:"))
+    {
+        // A page-local extraction error must not remain attached to the tab
+        // after that page leaves the visible selection scope.
+        *error = None;
+    }
 }
 
 fn mark_thumbnail_failed(
@@ -2550,5 +2740,80 @@ mod tests {
         assert!(!pending.contains(&failed_key));
         assert!(pending.contains(&other_key));
         assert!(failed.contains(&failed_key));
+    }
+
+    #[test]
+    fn text_snapshot_result_requires_active_visible_current_page() {
+        let key = TextSnapshotKey {
+            page_index: 2,
+            revision: 4,
+        };
+        let wanted = HashSet::from([key]);
+
+        assert!(text_snapshot_result_is_current(
+            true,
+            key,
+            Some(4),
+            3,
+            &wanted
+        ));
+        assert!(!text_snapshot_result_is_current(
+            false,
+            key,
+            Some(4),
+            3,
+            &wanted
+        ));
+        assert!(!text_snapshot_result_is_current(
+            true,
+            key,
+            Some(3),
+            3,
+            &wanted
+        ));
+        assert!(!text_snapshot_result_is_current(
+            true,
+            key,
+            Some(4),
+            2,
+            &wanted
+        ));
+        assert!(!text_snapshot_result_is_current(
+            true,
+            key,
+            Some(4),
+            3,
+            &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn text_snapshot_failure_is_cleared_after_page_leaves_visible_scope() {
+        let failed_key = TextSnapshotKey {
+            page_index: 2,
+            revision: 4,
+        };
+        let next_key = TextSnapshotKey {
+            page_index: 3,
+            revision: 4,
+        };
+        let mut failed = HashSet::from([failed_key]);
+        let mut error = Some("text snapshot: extraction failed".to_owned());
+        let wanted = HashSet::from([next_key]);
+
+        retain_visible_text_failures(&mut failed, &mut error, &wanted);
+
+        assert!(failed.is_empty());
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn clearing_text_snapshot_failures_preserves_unrelated_error() {
+        let mut failed = HashSet::new();
+        let mut error = Some("document save: permission denied".to_owned());
+
+        retain_visible_text_failures(&mut failed, &mut error, &HashSet::new());
+
+        assert_eq!(error.as_deref(), Some("document save: permission denied"));
     }
 }

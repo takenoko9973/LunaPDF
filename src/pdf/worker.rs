@@ -3,13 +3,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select_biased, unbounded};
+use crossbeam_channel::{
+    Receiver, Sender, TryRecvError, TrySendError, bounded, select_biased, unbounded,
+};
 
 use crate::domain::document::{
     DocumentInfo, DocumentVersion, HighlightRequest, OutlineItem, RenderPriority,
     RenderedThumbnail, RenderedTile, SearchPageResult, ThumbnailRequest, TileRequest,
 };
-use crate::domain::selection::{PagePoint, SelectionSnapshot};
+use crate::domain::selection::{
+    PagePoint, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
+};
 use crate::pdf::mupdf_backend::MuPdfBackend;
 
 #[derive(Debug)]
@@ -21,6 +25,7 @@ pub(crate) enum DocumentCommand {
         start: PagePoint,
         end: PagePoint,
     },
+    LoadTextSnapshot(TextSnapshotRequest),
     CreateHighlight(HighlightRequest),
     LoadOutline,
     SetSearchGeneration(u64),
@@ -40,6 +45,12 @@ pub(crate) enum DocumentEvent {
     DocumentChanged(DocumentInfo),
     TileRendered(RenderedTile),
     SelectionReady(SelectionSnapshot),
+    TextSnapshotReady(TextPageSnapshot),
+    TextSnapshotSkipped(TextSnapshotRequest),
+    TextSnapshotFailed {
+        request: TextSnapshotRequest,
+        message: String,
+    },
     OutlineReady(Vec<OutlineItem>),
     SearchPageReady(SearchPageResult),
     ThumbnailReady(RenderedThumbnail),
@@ -59,7 +70,9 @@ pub(crate) struct DocumentService {
     foreground_sender: Sender<DocumentCommand>,
     next_viewport_sender: Sender<DocumentCommand>,
     previous_viewport_sender: Sender<DocumentCommand>,
+    text_snapshot_wake_sender: Sender<()>,
     scheduled_tiles: Arc<Mutex<HashMap<WorkerTileKey, RenderPriority>>>,
+    scheduled_text_snapshots: Arc<Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>>,
     event_receiver: Receiver<DocumentEvent>,
 }
 
@@ -72,6 +85,30 @@ struct WorkerTileKey {
     generation: u64,
     expected_revision: u64,
     spec: crate::domain::document::TileSpec,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct WorkerTextKey {
+    page_index: usize,
+    expected_revision: u64,
+}
+
+struct WorkerChannels {
+    foreground: Receiver<DocumentCommand>,
+    text_snapshot_wake: Receiver<()>,
+    text_snapshot_wake_sender: Sender<()>,
+    next_viewport: Receiver<DocumentCommand>,
+    previous_viewport: Receiver<DocumentCommand>,
+    scheduled_text_snapshots: Arc<Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>>,
+}
+
+impl WorkerTextKey {
+    fn from_request(request: &TextSnapshotRequest) -> Self {
+        Self {
+            page_index: request.page_index,
+            expected_revision: request.expected_revision,
+        }
+    }
 }
 
 impl WorkerTileKey {
@@ -111,18 +148,28 @@ impl DocumentService {
         let (foreground_sender, foreground_receiver) = unbounded();
         let (next_viewport_sender, next_viewport_receiver) = unbounded();
         let (previous_viewport_sender, previous_viewport_receiver) = unbounded();
+        let (text_snapshot_wake_sender, text_snapshot_wake_receiver) = bounded(1);
         let (event_sender, event_receiver) = bounded(BUFFERED_EVENT_CAPACITY);
         let scheduled_tiles = Arc::new(Mutex::new(HashMap::new()));
+        let scheduled_text_snapshots = Arc::new(Mutex::new(HashMap::new()));
         let worker_scheduled_tiles = Arc::clone(&scheduled_tiles);
+        let worker_scheduled_text_snapshots = Arc::clone(&scheduled_text_snapshots);
+        let worker_text_snapshot_wake_sender = text_snapshot_wake_sender.clone();
+        let worker_channels = WorkerChannels {
+            foreground: foreground_receiver,
+            text_snapshot_wake: text_snapshot_wake_receiver,
+            text_snapshot_wake_sender: worker_text_snapshot_wake_sender,
+            next_viewport: next_viewport_receiver,
+            previous_viewport: previous_viewport_receiver,
+            scheduled_text_snapshots: worker_scheduled_text_snapshots,
+        };
         thread::Builder::new()
             .name("lunapdf-document-worker".to_owned())
             .spawn(move || {
                 run_worker(
                     path,
                     expected_version,
-                    foreground_receiver,
-                    next_viewport_receiver,
-                    previous_viewport_receiver,
+                    worker_channels,
                     worker_scheduled_tiles,
                     event_sender,
                 )
@@ -133,7 +180,9 @@ impl DocumentService {
             foreground_sender,
             next_viewport_sender,
             previous_viewport_sender,
+            text_snapshot_wake_sender,
             scheduled_tiles,
+            scheduled_text_snapshots,
             event_receiver,
         }
     }
@@ -142,6 +191,7 @@ impl DocumentService {
     pub(crate) fn send(&self, command: DocumentCommand) -> bool {
         match command {
             DocumentCommand::RenderTile(request) => self.queue_render(request),
+            DocumentCommand::LoadTextSnapshot(request) => self.queue_text_snapshot(request),
             DocumentCommand::SearchPage { .. } | DocumentCommand::LoadThumbnail(_) => {
                 self.previous_viewport_sender.send(command).is_ok()
             }
@@ -158,6 +208,29 @@ impl DocumentService {
             .lock()
             .expect("render scheduler mutex poisoned")
             .remove(&key);
+    }
+
+    /// Removes a text extraction request before the worker can enter MuPDF.
+    pub(crate) fn cancel_text_snapshot(&self, request: &TextSnapshotRequest) {
+        cancel_scheduled_text_snapshot(&self.scheduled_text_snapshots, request);
+    }
+
+    fn queue_text_snapshot(&self, request: TextSnapshotRequest) -> bool {
+        let key = WorkerTextKey::from_request(&request);
+        self.scheduled_text_snapshots
+            .lock()
+            .expect("text snapshot scheduler mutex poisoned")
+            .insert(key, request);
+        match self.text_snapshot_wake_sender.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => true,
+            Err(TrySendError::Disconnected(())) => {
+                self.scheduled_text_snapshots
+                    .lock()
+                    .expect("text snapshot scheduler mutex poisoned")
+                    .remove(&key);
+                false
+            }
+        }
     }
 
     fn queue_render(&self, request: TileRequest) -> bool {
@@ -213,9 +286,7 @@ impl Drop for DocumentService {
 fn run_worker(
     path: PathBuf,
     expected_version: Option<DocumentVersion>,
-    foreground_receiver: Receiver<DocumentCommand>,
-    next_viewport_receiver: Receiver<DocumentCommand>,
-    previous_viewport_receiver: Receiver<DocumentCommand>,
+    channels: WorkerChannels,
     scheduled_tiles: Arc<Mutex<HashMap<WorkerTileKey, RenderPriority>>>,
     event_sender: Sender<DocumentEvent>,
 ) {
@@ -231,10 +302,13 @@ fn run_worker(
     }
     let mut active_search_generation = 0;
 
-    while let Some(command) = next_command(
-        &foreground_receiver,
-        &next_viewport_receiver,
-        &previous_viewport_receiver,
+    while let Some(command) = next_worker_command(
+        &channels.foreground,
+        &channels.text_snapshot_wake,
+        &channels.text_snapshot_wake_sender,
+        &channels.next_viewport,
+        &channels.previous_viewport,
+        &channels.scheduled_text_snapshots,
     ) {
         match command {
             DocumentCommand::RenderTile(request) => {
@@ -259,6 +333,20 @@ fn run_worker(
                     let _ = event_sender.send(DocumentEvent::SelectionReady(selection));
                 }
                 Err(error) => send_failure(&event_sender, "selection", error),
+            },
+            DocumentCommand::LoadTextSnapshot(request) => match backend.text_snapshot(request) {
+                Ok(Some(snapshot)) => {
+                    let _ = event_sender.send(DocumentEvent::TextSnapshotReady(snapshot));
+                }
+                Ok(None) => {
+                    let _ = event_sender.send(DocumentEvent::TextSnapshotSkipped(request));
+                }
+                Err(error) => {
+                    let _ = event_sender.send(DocumentEvent::TextSnapshotFailed {
+                        request,
+                        message: format!("{error:#}"),
+                    });
+                }
             },
             DocumentCommand::CreateHighlight(request) => {
                 match backend.create_highlight(request.page_index, &request.quads) {
@@ -342,6 +430,84 @@ fn take_scheduled_render(
     request_is_current
 }
 
+fn next_worker_command(
+    foreground: &Receiver<DocumentCommand>,
+    text_snapshot_wake: &Receiver<()>,
+    text_snapshot_wake_sender: &Sender<()>,
+    next_viewport: &Receiver<DocumentCommand>,
+    previous_viewport: &Receiver<DocumentCommand>,
+    scheduled_text_snapshots: &Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>,
+) -> Option<DocumentCommand> {
+    loop {
+        // Rendering and interactive commands remain preemptive between any two
+        // MuPDF operations. A bounded wake channel prevents offscreen text work
+        // from accumulating channel messages.
+        if let Ok(command) = foreground.try_recv() {
+            return Some(command);
+        }
+        if text_snapshot_wake.try_recv().is_ok() {
+            if let Some(request) =
+                take_scheduled_text_snapshot(scheduled_text_snapshots, text_snapshot_wake_sender)
+            {
+                return Some(DocumentCommand::LoadTextSnapshot(request));
+            }
+            continue;
+        }
+        if let Ok(command) = next_viewport.try_recv() {
+            return Some(command);
+        }
+
+        select_biased! {
+            recv(foreground) -> command => return command.ok(),
+            recv(text_snapshot_wake) -> signal => {
+                signal.ok()?;
+                if let Some(request) = take_scheduled_text_snapshot(
+                    scheduled_text_snapshots,
+                    text_snapshot_wake_sender,
+                ) {
+                    return Some(DocumentCommand::LoadTextSnapshot(request));
+                }
+            },
+            recv(next_viewport) -> command => return command.ok(),
+            recv(previous_viewport) -> command => return command.ok(),
+        }
+    }
+}
+
+fn take_scheduled_text_snapshot(
+    scheduled: &Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>,
+    wake_sender: &Sender<()>,
+) -> Option<TextSnapshotRequest> {
+    let (request, has_more) = {
+        let mut scheduled = scheduled
+            .lock()
+            .expect("text snapshot scheduler mutex poisoned");
+        let key = scheduled.keys().next().copied()?;
+        let request = scheduled
+            .remove(&key)
+            .expect("text snapshot key came from the same scheduler map");
+        (request, !scheduled.is_empty())
+    };
+    if has_more {
+        // At most one wake token exists; the remaining wanted page is claimed
+        // on the next scheduling cycle without producing one message per page.
+        let _ = wake_sender.try_send(());
+    }
+    Some(request)
+}
+
+fn cancel_scheduled_text_snapshot(
+    scheduled: &Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>,
+    request: &TextSnapshotRequest,
+) {
+    let key = WorkerTextKey::from_request(request);
+    scheduled
+        .lock()
+        .expect("text snapshot scheduler mutex poisoned")
+        .remove(&key);
+}
+
+#[cfg(test)]
 fn next_command(
     foreground: &Receiver<DocumentCommand>,
     next_viewport: &Receiver<DocumentCommand>,
@@ -519,6 +685,78 @@ mod tests {
             next_command(&foreground_receiver, &next_receiver, &background_receiver).unwrap();
 
         assert!(matches!(command, DocumentCommand::RenderTile(_)));
+    }
+
+    #[test]
+    fn visible_text_snapshot_is_below_render_and_above_search() {
+        let (foreground_sender, foreground_receiver) = unbounded();
+        let (text_wake_sender, text_wake_receiver) = bounded(1);
+        let (_next_sender, next_receiver) = unbounded();
+        let (search_sender, search_receiver) = unbounded();
+        let request = TextSnapshotRequest {
+            page_index: 0,
+            expected_revision: 0,
+        };
+        let key = WorkerTextKey::from_request(&request);
+        let scheduled_text = Mutex::new(HashMap::from([(key, request)]));
+        search_sender
+            .send(DocumentCommand::SearchPage {
+                page_index: 0,
+                query: Arc::from("needle"),
+                generation: 1,
+            })
+            .unwrap();
+        text_wake_sender.send(()).unwrap();
+        foreground_sender
+            .send(DocumentCommand::RenderTile(tile_request(
+                RenderPriority::Visible,
+            )))
+            .unwrap();
+
+        let first = next_worker_command(
+            &foreground_receiver,
+            &text_wake_receiver,
+            &text_wake_sender,
+            &next_receiver,
+            &search_receiver,
+            &scheduled_text,
+        )
+        .unwrap();
+        let second = next_worker_command(
+            &foreground_receiver,
+            &text_wake_receiver,
+            &text_wake_sender,
+            &next_receiver,
+            &search_receiver,
+            &scheduled_text,
+        )
+        .unwrap();
+
+        assert!(matches!(first, DocumentCommand::RenderTile(_)));
+        assert!(matches!(second, DocumentCommand::LoadTextSnapshot(_)));
+    }
+
+    #[test]
+    fn offscreen_text_snapshot_is_removed_before_worker_claim() {
+        let (wake_sender, _wake_receiver) = bounded(1);
+        let offscreen = TextSnapshotRequest {
+            page_index: 2,
+            expected_revision: 0,
+        };
+        let visible = TextSnapshotRequest {
+            page_index: 8,
+            expected_revision: 0,
+        };
+        let scheduled = Mutex::new(HashMap::from([
+            (WorkerTextKey::from_request(&offscreen), offscreen),
+            (WorkerTextKey::from_request(&visible), visible),
+        ]));
+
+        cancel_scheduled_text_snapshot(&scheduled, &offscreen);
+        let claimed = take_scheduled_text_snapshot(&scheduled, &wake_sender).unwrap();
+
+        assert_eq!(claimed.page_index, visible.page_index);
+        assert!(scheduled.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -49,6 +50,19 @@ pub(crate) struct GlyphSnapshot {
     pub(crate) line_index: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextSnapshotRequest {
+    pub(crate) page_index: usize,
+    pub(crate) expected_revision: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TextPageSnapshot {
+    pub(crate) page_index: usize,
+    pub(crate) revision: u64,
+    pub(crate) glyphs: Vec<GlyphSnapshot>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SelectionSnapshot {
     pub(crate) page_index: usize,
@@ -64,18 +78,13 @@ pub(crate) struct SelectionSnapshot {
 /// Keeping this ordered glyph selection separate ensures future Typst-only
 /// display correction cannot silently alter copy order.
 pub(crate) fn selected_text(glyphs: &[GlyphSnapshot], start: PagePoint, end: PagePoint) -> String {
-    let Some(start_index) = nearest_glyph_index(glyphs, start) else {
+    let Some(range) = selected_glyph_range(glyphs, start, end) else {
         return String::new();
     };
-    let Some(end_index) = nearest_glyph_index(glyphs, end) else {
-        return String::new();
-    };
-    let first = start_index.min(end_index);
-    let last = start_index.max(end_index);
 
     let mut text = String::new();
-    let mut previous_line = glyphs[first].line_index;
-    for glyph in &glyphs[first..=last] {
+    let mut previous_line = glyphs[*range.start()].line_index;
+    for glyph in &glyphs[range] {
         if glyph.line_index != previous_line {
             text.push('\n');
             previous_line = glyph.line_index;
@@ -83,6 +92,24 @@ pub(crate) fn selected_text(glyphs: &[GlyphSnapshot], start: PagePoint, end: Pag
         text.push(glyph.character);
     }
     text
+}
+
+/// Maps a pointer to a stable character center in the Rust-owned text snapshot.
+pub(crate) fn snap_to_glyph(glyphs: &[GlyphSnapshot], point: PagePoint) -> Option<PagePoint> {
+    let glyph = glyphs.get(nearest_glyph_index(glyphs, point)?)?;
+    let (x0, y0, x1, y1) = glyph.quad.bounds();
+    Some(PagePoint::new((x0 + x1) / 2.0, (y0 + y1) / 2.0))
+}
+
+/// Returns the logical glyph range selected by two already page-local points.
+pub(crate) fn selected_glyph_range(
+    glyphs: &[GlyphSnapshot],
+    start: PagePoint,
+    end: PagePoint,
+) -> Option<RangeInclusive<usize>> {
+    let start_index = nearest_glyph_index(glyphs, start)?;
+    let end_index = nearest_glyph_index(glyphs, end)?;
+    Some(start_index.min(end_index)..=start_index.max(end_index))
 }
 
 fn nearest_glyph_index(glyphs: &[GlyphSnapshot], point: PagePoint) -> Option<usize> {
@@ -139,5 +166,18 @@ mod tests {
         let text = selected_text(&glyphs, PagePoint::new(1.0, 5.0), PagePoint::new(1.0, 25.0));
 
         assert_eq!(text, "A\nB");
+    }
+
+    #[test]
+    fn pointer_hit_mapping_snaps_to_the_nearest_glyph_center() {
+        let glyphs = vec![glyph('A', 0.0, 0), glyph('B', 20.0, 0)];
+
+        let snapped = snap_to_glyph(&glyphs, PagePoint::new(27.0, 4.0)).unwrap();
+
+        assert_eq!(snapped, PagePoint::new(24.0, 5.0));
+        assert_eq!(
+            selected_glyph_range(&glyphs, snapped, PagePoint::new(1.0, 5.0)),
+            Some(0..=1)
+        );
     }
 }

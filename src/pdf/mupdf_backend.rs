@@ -9,18 +9,22 @@ use std::os::windows::fs::MetadataExt as _;
 
 use anyhow::{Context, Result, ensure};
 use mupdf::color::AnnotationColor;
-use mupdf::pdf::{AnnotationQuadPoints, PdfAnnotationType, PdfDocument, PdfWriteOptions};
+use mupdf::pdf::{
+    AnnotationQuadPoints, PdfAnnotationType, PdfDocument, PdfWriteOptions, Permission, WidgetType,
+};
 use mupdf::{
     Colorspace, Device, DisplayList, IRect, Matrix, Outline, Pixmap, Point, Quad, Rect,
     TextBlockContent, TextPage, TextPageFlags,
 };
 
 use crate::domain::document::{
-    DocumentInfo, DocumentVersion, HighlightRequest, OutlineItem, PageRect, RenderedThumbnail,
-    RenderedTile, SearchPageResult, TILE_EDGE_PIXELS, ThumbnailRequest, TileRequest, TileSpec,
+    DocumentInfo, DocumentVersion, HighlightCapability, HighlightRequest, OutlineItem, PageRect,
+    RenderedThumbnail, RenderedTile, SearchPageResult, TILE_EDGE_PIXELS, ThumbnailRequest,
+    TileRequest, TileSpec,
 };
 use crate::domain::selection::{
-    GlyphSnapshot, PagePoint, PageQuad, SelectionSnapshot, selected_text,
+    GlyphSnapshot, PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
+    selected_text,
 };
 
 // A one-page selection needs a finite output buffer because the high-level
@@ -46,6 +50,7 @@ pub(super) struct MuPdfBackend {
     version: DocumentVersion,
     open_time: Duration,
     revision: u64,
+    highlight_capability: HighlightCapability,
     pending_highlights: Vec<HighlightRequest>,
     display_list: Option<CachedDisplayList>,
 }
@@ -68,6 +73,7 @@ impl MuPdfBackend {
             .with_context(|| format!("failed to open PDF: {}", path.display()))?;
         let page_bounds = load_page_bounds(&document)?;
         ensure!(!page_bounds.is_empty(), "PDF contains no pages");
+        let highlight_capability = determine_highlight_capability(&document, &path)?;
         let version_after_open = read_document_version(&path)?;
         let version = stable_open_version(version_before_open, version_after_open)?;
         let open_time = open_started.elapsed();
@@ -79,6 +85,7 @@ impl MuPdfBackend {
             version,
             open_time,
             revision: 0,
+            highlight_capability,
             pending_highlights: Vec::new(),
             display_list: None,
         })
@@ -90,6 +97,7 @@ impl MuPdfBackend {
             page_bounds: self.page_bounds.clone(),
             highlight_count: highlight_count(&self.document)?,
             can_save_incrementally: self.document.can_be_saved_incrementally(),
+            highlight_capability: self.highlight_capability,
             dirty: self.document.has_unsaved_changes(),
             revision: self.revision,
             open_time: self.open_time,
@@ -286,6 +294,25 @@ impl MuPdfBackend {
             .list)
     }
 
+    /// Extracts a Rust-owned text snapshot for one currently visible page.
+    pub(super) fn text_snapshot(
+        &self,
+        request: TextSnapshotRequest,
+    ) -> Result<Option<TextPageSnapshot>> {
+        // Annotation mutations can overtake queued extraction. The UI keys
+        // snapshots by revision, so stale work is discarded before allocation.
+        if request.expected_revision != self.revision {
+            return Ok(None);
+        }
+        let (_text_page, glyphs, _extraction_time) =
+            load_text_snapshot(&self.document, request.page_index, self.page_bounds.len())?;
+        Ok(Some(TextPageSnapshot {
+            page_index: request.page_index,
+            revision: self.revision,
+            glyphs,
+        }))
+    }
+
     pub(super) fn select(
         &self,
         page_index: usize,
@@ -324,6 +351,13 @@ impl MuPdfBackend {
 
     pub(super) fn create_highlight(&mut self, page_index: usize, quads: &[PageQuad]) -> Result<()> {
         ensure!(!quads.is_empty(), "cannot highlight an empty selection");
+        ensure!(
+            self.highlight_capability.is_allowed(),
+            "Highlight editing is disabled: {}",
+            self.highlight_capability
+                .restriction()
+                .expect("a disallowed capability has a reason")
+        );
         let page_number = page_number(page_index, self.page_bounds.len())?;
         let annotation_quads = quads.iter().map(mupdf_quad_from_page).collect::<Vec<_>>();
         let mut page = self.document.load_pdf_page(page_number)?;
@@ -393,8 +427,10 @@ impl MuPdfBackend {
             );
         }
 
+        let highlight_capability = determine_highlight_capability(&reopened, &self.path)?;
         self.document = reopened;
         self.page_bounds = page_bounds;
+        self.highlight_capability = highlight_capability;
         self.version = read_document_version(&self.path)?;
         self.pending_highlights.clear();
         self.revision += 1;
@@ -500,6 +536,57 @@ fn load_page_bounds(document: &PdfDocument) -> Result<Vec<PageRect>> {
         });
     }
     Ok(page_bounds)
+}
+
+fn determine_highlight_capability(
+    document: &PdfDocument,
+    path: &Path,
+) -> Result<HighlightCapability> {
+    let file_is_read_only = fs::metadata(path)?.permissions().readonly();
+    let annotation_allowed = document.permissions().contains(Permission::ANNOTATE);
+    let has_signed_signature = document_has_signed_signature(document)?;
+    Ok(highlight_capability_from_constraints(
+        file_is_read_only,
+        annotation_allowed,
+        has_signed_signature,
+        document.can_be_saved_incrementally(),
+    ))
+}
+
+fn highlight_capability_from_constraints(
+    file_is_read_only: bool,
+    annotation_allowed: bool,
+    has_signed_signature: bool,
+    can_save_incrementally: bool,
+) -> HighlightCapability {
+    // These checks are ordered by the restriction the user can act on most
+    // directly. No full-rewrite fallback is inferred while that design choice
+    // remains explicitly unresolved.
+    if file_is_read_only {
+        HighlightCapability::ReadOnlyFile
+    } else if !annotation_allowed {
+        HighlightCapability::AnnotationPermissionDenied
+    } else if has_signed_signature {
+        HighlightCapability::SignedDocument
+    } else if !can_save_incrementally {
+        HighlightCapability::RequiresFullRewrite
+    } else {
+        HighlightCapability::Allowed
+    }
+}
+
+fn document_has_signed_signature(document: &PdfDocument) -> Result<bool> {
+    let page_count =
+        usize::try_from(document.page_count()?).context("MuPDF returned a negative page count")?;
+    for page_index in 0..page_count {
+        let page = document.load_pdf_page(page_number(page_index, page_count)?)?;
+        for widget in page.widgets() {
+            if widget.r#type()? == WidgetType::Signature && widget.is_signed()? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn load_text_snapshot(
@@ -747,6 +834,30 @@ mod tests {
     }
 
     #[test]
+    fn highlight_capability_reports_each_persistence_restriction() {
+        assert_eq!(
+            highlight_capability_from_constraints(true, true, false, true),
+            HighlightCapability::ReadOnlyFile
+        );
+        assert_eq!(
+            highlight_capability_from_constraints(false, false, false, true),
+            HighlightCapability::AnnotationPermissionDenied
+        );
+        assert_eq!(
+            highlight_capability_from_constraints(false, true, true, true),
+            HighlightCapability::SignedDocument
+        );
+        assert_eq!(
+            highlight_capability_from_constraints(false, true, false, false),
+            HighlightCapability::RequiresFullRewrite
+        );
+        assert_eq!(
+            highlight_capability_from_constraints(false, true, false, true),
+            HighlightCapability::Allowed
+        );
+    }
+
+    #[test]
     fn second_page_highlight_is_incrementally_saved_and_verified() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("highlight-roundtrip.pdf");
@@ -793,6 +904,37 @@ mod tests {
         assert_eq!(verified_highlights, 1);
         assert_eq!(saved.highlight_count, 1);
         assert!(!saved.dirty);
+    }
+
+    #[test]
+    fn externally_replaced_pdf_is_not_overwritten_by_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("external-change.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            document.save(path_text).unwrap();
+        }
+        let mut backend = MuPdfBackend::open(path.clone()).unwrap();
+        backend
+            .create_highlight(
+                0,
+                &[PageQuad {
+                    upper_left: PagePoint::new(20.0, 20.0),
+                    upper_right: PagePoint::new(80.0, 20.0),
+                    lower_left: PagePoint::new(20.0, 40.0),
+                    lower_right: PagePoint::new(80.0, 40.0),
+                }],
+            )
+            .unwrap();
+        let external_bytes = b"%PDF-1.7\n% external replacement is intentionally distinct\n";
+        fs::write(&path, external_bytes).unwrap();
+
+        let error = backend.save_incrementally().unwrap_err();
+
+        assert!(error.to_string().contains("changed outside LunaPDF"));
+        assert_eq!(fs::read(path).unwrap(), external_bytes);
     }
 
     #[test]
@@ -915,6 +1057,13 @@ mod tests {
 
         let mut backend = MuPdfBackend::open(path).unwrap();
         let outline = backend.load_outline().unwrap();
+        let text_snapshot = backend
+            .text_snapshot(TextSnapshotRequest {
+                page_index: 0,
+                expected_revision: 0,
+            })
+            .unwrap()
+            .unwrap();
         let search = backend.search_page(0, "needle", 7).unwrap();
         let thumbnail = backend
             .render_thumbnail(ThumbnailRequest {
@@ -929,6 +1078,24 @@ mod tests {
 
         assert_eq!(outline[0].page_index, Some(1));
         assert_eq!(outline[0].children[0].page_index, None);
+        let extracted = text_snapshot
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.character)
+            .collect::<String>();
+        assert!(extracted.contains("Needle in the first page"));
+        let first = text_snapshot.glyphs.first().unwrap().quad.bounds();
+        let last = text_snapshot.glyphs.last().unwrap().quad.bounds();
+        let selection = backend
+            .select(
+                0,
+                11,
+                PagePoint::new((first.0 + first.2) / 2.0, (first.1 + first.3) / 2.0),
+                PagePoint::new((last.0 + last.2) / 2.0, (last.1 + last.3) / 2.0),
+            )
+            .unwrap();
+        assert!(selection.text.contains("Needle in the first page"));
+        assert!(!selection.quads.is_empty());
         assert_eq!(search.generation, 7);
         assert!(!search.quads.is_empty());
         assert_eq!(thumbnail.generation, 9);

@@ -85,11 +85,43 @@ pub(crate) struct DocumentInfo {
     pub(crate) page_bounds: Vec<PageRect>,
     pub(crate) highlight_count: usize,
     pub(crate) can_save_incrementally: bool,
+    pub(crate) highlight_capability: HighlightCapability,
     pub(crate) dirty: bool,
     pub(crate) revision: u64,
     pub(crate) open_time: Duration,
     pub(crate) physical_memory_bytes: Option<usize>,
     pub(crate) version: DocumentVersion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HighlightCapability {
+    Allowed,
+    ReadOnlyFile,
+    AnnotationPermissionDenied,
+    SignedDocument,
+    RequiresFullRewrite,
+}
+
+impl HighlightCapability {
+    /// Reports whether the UI may create a change that the current save path can persist.
+    pub(crate) fn is_allowed(self) -> bool {
+        self == Self::Allowed
+    }
+
+    /// Explains why Highlight creation is unavailable without guessing a fallback save path.
+    pub(crate) fn restriction(self) -> Option<&'static str> {
+        match self {
+            Self::Allowed => None,
+            Self::ReadOnlyFile => Some("the PDF file is read-only"),
+            Self::AnnotationPermissionDenied => {
+                Some("the PDF security permissions do not allow annotations")
+            }
+            Self::SignedDocument => Some("the PDF contains a signed signature field"),
+            Self::RequiresFullRewrite => {
+                Some("the PDF requires a full-file rewrite, which is not enabled")
+            }
+        }
+    }
 }
 
 /// Rust-owned file identity used to reject stale suspended-document restores.

@@ -1,7 +1,9 @@
 use eframe::egui::{Color32, PointerButton, Pos2, Rect, Sense, Shape, Stroke, TextureHandle, Ui};
 
 use crate::domain::document::{PageRect, RenderedTile};
-use crate::domain::selection::{PagePoint, PageQuad, SelectionSnapshot};
+use crate::domain::selection::{
+    PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, selected_glyph_range, snap_to_glyph,
+};
 
 #[derive(Default)]
 pub(crate) struct PageViewport {
@@ -53,6 +55,7 @@ impl PageViewport {
         screen_rect: Rect,
         page_index: usize,
         bounds: PageRect,
+        text_snapshot: Option<&TextPageSnapshot>,
         selection: Option<&SelectionSnapshot>,
     ) -> Option<(usize, PagePoint, PagePoint)> {
         let response = ui.interact(
@@ -75,19 +78,25 @@ impl PageViewport {
         }
 
         if response.drag_started_by(PointerButton::Primary) {
-            self.drag_page = Some(page_index);
             self.drag_start = response
                 .interact_pointer_pos()
-                .map(|position| page_point_from_screen(position, screen_rect, bounds));
+                .map(|position| page_point_from_screen(position, screen_rect, bounds))
+                .and_then(|point| {
+                    text_snapshot.and_then(|snapshot| snap_to_glyph(&snapshot.glyphs, point))
+                });
+            self.drag_page = self.drag_start.map(|_| page_index);
             self.drag_current = self.drag_start;
         }
         if response.dragged_by(PointerButton::Primary) && self.drag_page == Some(page_index) {
             self.drag_current = response
                 .interact_pointer_pos()
-                .map(|position| page_point_from_screen(position, screen_rect, bounds));
+                .map(|position| page_point_from_screen(position, screen_rect, bounds))
+                .and_then(|point| {
+                    text_snapshot.and_then(|snapshot| snap_to_glyph(&snapshot.glyphs, point))
+                });
         }
 
-        self.paint_drag_markers(ui, screen_rect, page_index, bounds);
+        self.paint_drag_preview(ui, screen_rect, page_index, bounds, text_snapshot);
 
         if response.drag_stopped_by(PointerButton::Primary) && self.drag_page == Some(page_index) {
             let completed = self
@@ -102,19 +111,35 @@ impl PageViewport {
         None
     }
 
-    fn paint_drag_markers(&self, ui: &Ui, screen_rect: Rect, page_index: usize, bounds: PageRect) {
+    fn paint_drag_preview(
+        &self,
+        ui: &Ui,
+        screen_rect: Rect,
+        page_index: usize,
+        bounds: PageRect,
+        text_snapshot: Option<&TextPageSnapshot>,
+    ) {
         if self.drag_page != Some(page_index) {
             return;
         }
-        let (Some(start), Some(current)) = (self.drag_start, self.drag_current) else {
+        let (Some(start), Some(current), Some(text_snapshot)) =
+            (self.drag_start, self.drag_current, text_snapshot)
+        else {
             return;
         };
-        let start = screen_point_from_page(start, screen_rect, bounds);
-        let current = screen_point_from_page(current, screen_rect, bounds);
-        ui.painter()
-            .line_segment([start, current], Stroke::new(2.0, Color32::LIGHT_BLUE));
-        ui.painter().circle_filled(start, 5.0, Color32::RED);
-        ui.painter().circle_filled(current, 5.0, Color32::BLUE);
+        let Some(range) = selected_glyph_range(&text_snapshot.glyphs, start, current) else {
+            return;
+        };
+        for glyph in &text_snapshot.glyphs[range] {
+            paint_quad(
+                ui,
+                screen_rect,
+                bounds,
+                glyph.quad,
+                Color32::from_rgba_unmultiplied(255, 210, 0, 56),
+                Color32::from_rgb(220, 150, 0),
+            );
+        }
     }
 }
 
