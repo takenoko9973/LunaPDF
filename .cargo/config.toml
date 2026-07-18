@@ -2,5 +2,11 @@
 linker = "x86_64-w64-mingw32-gcc"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
+[env]
+# mupdf-sysのopaque_type指定で失われるMSVCのmax_align_tだけを事前定義する。
+BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_msvc = "-include lunapdf-mupdf-bindgen-msvc.h"
+# 依存クレート側を作業ディレクトリにするbuild.rsから補助ヘッダーを解決するために必要。
+CPATH = { value = "build-support", relative = true }
+
 [profile.release]
 strip = "symbols"
