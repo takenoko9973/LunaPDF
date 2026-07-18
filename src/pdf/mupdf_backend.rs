@@ -71,6 +71,10 @@ impl MuPdfBackend {
         let open_started = Instant::now();
         let document = PdfDocument::open(mupdf_path)
             .with_context(|| format!("failed to open PDF: {}", path.display()))?;
+        ensure!(
+            !document.needs_password()?,
+            "PDF requires a password; password-protected documents are not supported"
+        );
         let page_bounds = load_page_bounds(&document)?;
         ensure!(!page_bounds.is_empty(), "PDF contains no pages");
         let highlight_capability = determine_highlight_capability(&document, &path)?;
@@ -761,7 +765,7 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
-    use mupdf::pdf::PdfObject;
+    use mupdf::pdf::{Encryption, PdfObject};
     use mupdf::shape::{Shape, TextOptions};
     use mupdf::{DestinationKind, Size};
     use mupdf::{document::Location, link::LinkDestination};
@@ -831,6 +835,73 @@ mod tests {
 
         assert!(stable_open_version(before, before).is_ok());
         assert!(stable_open_version(before, after).is_err());
+    }
+
+    #[test]
+    fn password_protected_pdf_is_rejected_before_page_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("encrypted.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut options = PdfWriteOptions::default();
+            options
+                .set_encryption(Encryption::Aes256)
+                .set_user_password("user-password")
+                .set_owner_password("owner-password");
+            document.save_with_options(path_text, options).unwrap();
+        }
+
+        let error = MuPdfBackend::open(path)
+            .err()
+            .expect("encrypted PDF must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("password-protected documents are not supported")
+        );
+    }
+
+    #[test]
+    fn corrupt_pdf_is_rejected_without_changing_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("corrupt.pdf");
+        let bytes = b"not a PDF";
+        fs::write(&path, bytes).unwrap();
+
+        assert!(MuPdfBackend::open(path.clone()).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn readonly_file_reports_readonly_highlight_capability() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly.pdf");
+        write_blank_pdf_for_test(&path);
+
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        let backend = MuPdfBackend::open(path.clone()).unwrap();
+
+        assert_eq!(
+            backend.info().unwrap().highlight_capability,
+            HighlightCapability::ReadOnlyFile
+        );
+
+        // Windows may deny deletion while the readonly attribute is set;
+        // restoring the original mode/attribute keeps tempfile cleanup
+        // portable without weakening the capability check above.
+        fs::set_permissions(path, original_permissions).unwrap();
+    }
+
+    fn write_blank_pdf_for_test(path: &Path) {
+        let mut document = PdfDocument::new();
+        let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+        document.save(path.to_str().unwrap()).unwrap();
     }
 
     #[test]

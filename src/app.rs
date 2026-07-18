@@ -3070,6 +3070,37 @@ mod tests {
     }
 
     #[test]
+    fn tile_requests_and_cache_keys_separate_display_density() {
+        let spec = TileSpec {
+            pixel_x: 0,
+            pixel_y: 0,
+            pixel_width: 512,
+            pixel_height: 512,
+        };
+        let request_1x = TileRequest {
+            page_index: 0,
+            zoom: 1.0,
+            pixels_per_point: 1.0,
+            scale: 1.0,
+            generation: 1,
+            expected_revision: 0,
+            spec,
+            priority: RenderPriority::Visible,
+        };
+        let request_2x = TileRequest {
+            pixels_per_point: 2.0,
+            scale: 2.0,
+            ..request_1x
+        };
+
+        assert_ne!(request_1x.scale, request_2x.scale);
+        assert_ne!(
+            TileCacheKey::from_request(1, &request_1x),
+            TileCacheKey::from_request(1, &request_2x)
+        );
+    }
+
+    #[test]
     fn huge_page_requests_stay_bounded_to_three_viewports() {
         let bounds = crate::domain::document::PageRect {
             x0: 0.0,

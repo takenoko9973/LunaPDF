@@ -581,6 +581,7 @@ fn send_failure(
 mod tests {
     use super::*;
     use crate::domain::document::TileSpec;
+    use std::time::{Duration, Instant};
 
     fn tile_request(priority: RenderPriority) -> TileRequest {
         TileRequest {
@@ -763,5 +764,28 @@ mod tests {
     fn stale_search_generation_is_rejected_before_backend_work() {
         assert!(search_generation_is_current(3, 3));
         assert!(!search_generation_is_current(4, 3));
+    }
+
+    #[test]
+    fn corrupt_pdf_open_failure_reaches_event_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("corrupt.pdf");
+        std::fs::write(&path, b"not a PDF").unwrap();
+        let service = DocumentService::spawn(path);
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            match service.try_recv() {
+                Ok(DocumentEvent::Failed { operation, .. }) => {
+                    assert_eq!(operation, "open");
+                    break;
+                }
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("worker did not report open failure: {error:?}"),
+            }
+        }
     }
 }
