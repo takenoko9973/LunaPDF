@@ -71,10 +71,14 @@ Dev Containerのqpdf 12.2.0で再保存コピーを検査し、構文・スト�
 
 2件目にはSumatraPDFが作成したHighlightと外観ストリームが追加されていた。これにより、Windowsの外部ビューアで注釈を追加して既存PDFへ再保存した後も、LunaPDFが保存した元のHighlightが維持されることを確認済みである。再保存コピーも検証成果物としてリポジトリへコミットしない。
 
-## 未完了の互換性確認
+## EvinceによるLinux GUI表示確認
 
-設計書15.3の完全な互換性確認には、次を確認する必要がある。
+2026-07-19にDebian GNU/Linux 13.6のWSLg環境でEvince 48.1（GNOME Document Viewer）を起動し、fixtureのコピーを開いた。検証用コンテナにだけEvinceを一時導入し、Dockerfileとプロジェクト依存関係は変更していない。
 
-- Linuxの対象デスクトップ環境にあるGUIビューアでも同じ位置と色に表示される
+EvinceのウィンドウIDを指定したウィンドウ単体の画面キャプチャでは、ページ表示が`1 of 1`で、文字列`LunaPDF external viewer highlight`と同じ位置に黄色のHighlightが表示された。表示後のコンテナ内コピーとホスト側fixtureは、どちらも生成時と同じSHA-256 `A8D038192389075277FFCF63B02B5FD116533E3DD2F80D7689A9AF079607C48C`だった。
 
-WindowsのSumatraPDF表示・再保存とLinuxの独立したPoppler描画は合格している。Linux GUI操作は、対象ビューアを備えた環境で別途確認する。
+画面キャプチャ`target/acceptance-highlight-evince-window-only.png`は検証成果物としてリポジトリへコミットしない。
+
+## 互換性テストの判定
+
+WindowsのSumatraPDF 3.6.1による表示と再保存、LinuxのEvince 48.1によるGUI表示、Popplerによる独立描画、qpdfによる構造検査に合格した。Highlightの位置、色、ページ、外部ビューア再保存後の残存を確認できたため、設計書15.3とN-07の保存互換性をpassと判定する。
