@@ -1,5 +1,6 @@
 # Development environment
 
+- GUIまたは性能の受入検証を行う前に、`.codex/validation-lessons.md`を読む。
 - Source files are stored on the Windows filesystem.
 - Use the Dev Container for Linux builds and tests.
 - Run Linux checks with:
