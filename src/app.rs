@@ -3649,6 +3649,30 @@ mod tests {
     }
 
     #[test]
+    fn startup_does_not_restore_tabs_when_session_restore_is_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = directory.path().join("saved.pdf");
+        write_blank_pdf(&saved);
+        let state = SessionState {
+            restore_enabled: false,
+            selected_tab: Some(0),
+            tabs: vec![saved_tab(std::fs::canonicalize(saved).unwrap(), 0)],
+            ..SessionState::default()
+        };
+        let session_path = directory.path().join("session.json");
+        SessionStore::new(session_path.clone())
+            .save(&state)
+            .unwrap();
+
+        let app = PrototypeApp::from_startup(Vec::new(), SessionStore::new(session_path));
+
+        assert!(!app.restore_enabled);
+        assert!(app.documents.is_empty());
+        assert!(app.tabs.tabs().is_empty());
+        assert!(app.session_restore_progress.is_none());
+    }
+
+    #[test]
     fn failed_initial_restore_is_removed_and_remaining_tab_stays_selected() {
         let directory = tempfile::tempdir().unwrap();
         let inaccessible = directory.path().join("unreadable.pdf");
