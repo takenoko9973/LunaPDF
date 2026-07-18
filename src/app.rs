@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::TryRecvError;
@@ -9,7 +10,8 @@ use eframe::egui::{
 };
 
 use crate::domain::document::{
-    DocumentInfo, HighlightRequest, RenderPriority, RenderedTile, TileRequest, TileSpec,
+    DocumentInfo, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail, RenderedTile,
+    SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
 };
 use crate::domain::selection::{PagePoint, SelectionSnapshot};
 use crate::domain::tabs::{OpenTabResult, TabState};
@@ -17,6 +19,7 @@ use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService};
 use crate::render::cache::WeightedLruCache;
 use crate::render::layout::{ContinuousLayout, PAGE_GAP, PageAnchor};
 use crate::render::tiles::TileGrid;
+use crate::ui::sidebar::{SidebarTab, show_outline};
 use crate::ui::viewport::PageViewport;
 
 // These bounds cover detailed inspection and overview use without allowing an
@@ -32,6 +35,13 @@ const ZOOM_CHANGE_EPSILON: f32 = 0.001;
 // The design budget is shared across all tabs so the active document can use
 // available GPU memory instead of receiving one twentieth of a fixed split.
 const GPU_TILE_BUDGET_BYTES: usize = 192 * 1_024 * 1_024;
+
+// Thumbnails have their own budget so a long sidebar cannot evict the active
+// page's display tiles from the 192 MiB rendering cache.
+const THUMBNAIL_BUDGET_BYTES: usize = 32 * 1_024 * 1_024;
+const THUMBNAIL_MAX_WIDTH: u32 = 160;
+const THUMBNAIL_MAX_HEIGHT: u32 = 220;
+const THUMBNAIL_ROW_HEIGHT: f32 = 248.0;
 
 // N-05 sets 512 MiB as the stable 20-tab process target. Suspension is only
 // allowed after crossing that limit; ordinary tab switches retain documents.
@@ -50,7 +60,10 @@ pub(crate) struct PrototypeApp {
     saved_tab_to_close: Option<PathBuf>,
     next_document_id: u64,
     activity_sequence: u64,
+    sidebar_open: bool,
+    sidebar_tab: SidebarTab,
     gpu_lru: WeightedLruCache<TileCacheKey, ()>,
+    thumbnail_lru: WeightedLruCache<ThumbnailCacheKey, ()>,
 }
 
 struct DocumentTab {
@@ -60,6 +73,8 @@ struct DocumentTab {
     last_selected_sequence: u64,
     info: Option<DocumentInfo>,
     error: Option<String>,
+    outline: Option<Vec<OutlineItem>>,
+    outline_requested: bool,
     tiles: HashMap<TileCacheKey, CachedTile>,
     pending_tiles: HashMap<TileCacheKey, TileRequest>,
     wanted_tiles: HashSet<TileCacheKey>,
@@ -67,6 +82,11 @@ struct DocumentTab {
     selection_generation: u64,
     pending_highlights: usize,
     save_in_flight: bool,
+    thumbnails: HashMap<ThumbnailCacheKey, CachedThumbnail>,
+    pending_thumbnails: HashSet<ThumbnailCacheKey>,
+    failed_thumbnails: HashSet<ThumbnailCacheKey>,
+    thumbnail_generation: u64,
+    search: SearchState,
     view: ViewState,
 }
 
@@ -83,6 +103,31 @@ enum DocumentState {
 struct CachedTile {
     tile: RenderedTile,
     texture: TextureHandle,
+}
+
+struct CachedThumbnail {
+    thumbnail: RenderedThumbnail,
+    texture: TextureHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ThumbnailCacheKey {
+    document_id: u64,
+    page_index: usize,
+    max_pixel_width: u32,
+    max_pixel_height: u32,
+    revision: u64,
+}
+
+#[derive(Default)]
+struct SearchState {
+    open: bool,
+    query: String,
+    generation: u64,
+    pages: BTreeMap<usize, Vec<crate::domain::selection::PageQuad>>,
+    completed_pages: usize,
+    truncated: bool,
+    in_progress: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -160,7 +205,10 @@ impl PrototypeApp {
             saved_tab_to_close: None,
             next_document_id: 1,
             activity_sequence: 0,
+            sidebar_open: false,
+            sidebar_tab: SidebarTab::Outline,
             gpu_lru: WeightedLruCache::new(GPU_TILE_BUDGET_BYTES),
+            thumbnail_lru: WeightedLruCache::new(THUMBNAIL_BUDGET_BYTES),
         };
         for path in paths {
             app.open_document(path);
@@ -224,9 +272,25 @@ impl PrototypeApp {
                         };
                         self.documents[index].error = None;
                         self.documents[index].info = Some(info);
+                        if !self.documents[index].outline_requested
+                            && self.documents[index].send(DocumentCommand::LoadOutline)
+                        {
+                            self.documents[index].outline_requested = true;
+                        }
+                        if self.active_index() == Some(index)
+                            && self.documents[index].search.open
+                            && !self.documents[index].search.query.trim().is_empty()
+                        {
+                            self.begin_search(index);
+                        }
                     }
                     Ok(DocumentEvent::DocumentChanged(info)) => {
                         let saved_path = (!info.dirty).then(|| info.path.clone());
+                        let restart_search = self.active_index() == Some(index)
+                            && self.close_confirmation.is_none()
+                            && !self.window_close_pending
+                            && self.documents[index].search.open
+                            && !self.documents[index].search.query.trim().is_empty();
                         let tab = &mut self.documents[index];
                         if info.dirty {
                             tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
@@ -239,6 +303,9 @@ impl PrototypeApp {
                         tab.invalidate_rendering();
                         if let Some(path) = saved_path {
                             self.finish_save_for_close(&path, context);
+                        }
+                        if restart_search {
+                            self.begin_search(index);
                         }
                     }
                     Ok(DocumentEvent::TileRendered(mut tile)) => {
@@ -318,6 +385,82 @@ impl PrototypeApp {
                             self.status = "Selection Quad baseline updated".to_owned();
                         }
                     }
+                    Ok(DocumentEvent::OutlineReady(outline)) => {
+                        self.documents[index].outline = Some(outline);
+                    }
+                    Ok(DocumentEvent::SearchPageReady(result)) => {
+                        self.receive_search_page(index, result);
+                    }
+                    Ok(DocumentEvent::ThumbnailReady(mut thumbnail)) => {
+                        let key = ThumbnailCacheKey::from_thumbnail(
+                            self.documents[index].document_id,
+                            &thumbnail,
+                        );
+                        let is_active = self.active_index() == Some(index);
+                        let tab = &mut self.documents[index];
+                        tab.pending_thumbnails.remove(&key);
+                        tab.failed_thumbnails.remove(&key);
+                        let result_is_current = is_active
+                            && thumbnail.generation == tab.thumbnail_generation
+                            && tab
+                                .info
+                                .as_ref()
+                                .is_some_and(|info| info.revision == thumbnail.revision);
+                        let expected_bytes = usize::try_from(thumbnail.pixel_width)
+                            .ok()
+                            .and_then(|width| {
+                                usize::try_from(thumbnail.pixel_height)
+                                    .ok()
+                                    .and_then(|height| width.checked_mul(height))
+                            })
+                            .and_then(|pixels| pixels.checked_mul(4));
+                        if !result_is_current || expected_bytes != Some(thumbnail.pixels_rgba.len())
+                        {
+                            continue;
+                        }
+
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [
+                                thumbnail.pixel_width as usize,
+                                thumbnail.pixel_height as usize,
+                            ],
+                            &thumbnail.pixels_rgba,
+                        );
+                        let texture = context.load_texture(
+                            format!(
+                                "pdf-{}-thumbnail-{}-revision-{}",
+                                tab.document_id, thumbnail.page_index, thumbnail.revision
+                            ),
+                            image,
+                            TextureOptions::LINEAR,
+                        );
+                        thumbnail.pixels_rgba.clear();
+                        let weight = expected_bytes.expect("validated thumbnail byte count");
+                        tab.thumbnails
+                            .insert(key, CachedThumbnail { thumbnail, texture });
+                        let outcome = self.thumbnail_lru.insert(key, (), weight);
+                        if !outcome.inserted {
+                            self.documents[index].thumbnails.remove(&key);
+                        }
+                        self.remove_evicted_thumbnails(outcome.evicted);
+                    }
+                    Ok(DocumentEvent::ThumbnailSkipped(request)) => {
+                        let key = ThumbnailCacheKey::from_request(
+                            self.documents[index].document_id,
+                            &request,
+                        );
+                        self.documents[index].pending_thumbnails.remove(&key);
+                    }
+                    Ok(DocumentEvent::ThumbnailFailed { request, message }) => {
+                        let tab = &mut self.documents[index];
+                        let key = ThumbnailCacheKey::from_request(tab.document_id, &request);
+                        mark_thumbnail_failed(
+                            &mut tab.pending_thumbnails,
+                            &mut tab.failed_thumbnails,
+                            key,
+                        );
+                        tab.error = Some(format!("thumbnail: {message}"));
+                    }
                     Ok(DocumentEvent::Status(status)) => {
                         self.status = status;
                         self.documents[index].error = None;
@@ -337,6 +480,12 @@ impl PrototypeApp {
                             // MuPDF already created the annotation; only the
                             // follow-up snapshot failed, so remain dirty.
                             tab.state = DocumentState::ReadyDirty;
+                        }
+                        if operation == "search" {
+                            // A page error normally repeats for every queued page.
+                            // Advancing the generation stops the remaining work instead
+                            // of flooding the UI with identical failures.
+                            self.cancel_search(index, false);
                         }
                         if operation == "save" {
                             self.documents[index].save_in_flight = false;
@@ -392,6 +541,26 @@ impl PrototypeApp {
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
+        let find_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F));
+        if find_pressed && let Some(index) = self.active_index() {
+            self.documents[index].search.open = true;
+            let document_id = self.documents[index].document_id;
+            context.memory_mut(|memory| {
+                memory.request_focus(Id::new(("pdf-search-query", document_id)));
+            });
+            if !self.documents[index].search.query.trim().is_empty()
+                && !self.documents[index].search.in_progress
+                && self.documents[index].search.pages.is_empty()
+            {
+                self.begin_search(index);
+            }
+        }
+        let escape_pressed =
+            context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+        if escape_pressed && let Some(index) = self.active_index() {
+            self.cancel_search(index, true);
+        }
+
         let next_tab = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Tab));
         if next_tab {
             self.select_next_tab();
@@ -437,11 +606,80 @@ impl PrototypeApp {
         self.activity_sequence
     }
 
+    fn begin_search(&mut self, index: usize) {
+        let query = self.documents[index].search.query.trim().to_owned();
+        if query.is_empty() {
+            self.cancel_search(index, false);
+            return;
+        }
+        let Some(page_count) = self.documents[index]
+            .info
+            .as_ref()
+            .map(|info| info.page_bounds.len())
+        else {
+            return;
+        };
+        let current_page = self.documents[index].view.current_page;
+        let generation = self.documents[index].search.generation.wrapping_add(1);
+        let query: Arc<str> = Arc::from(query);
+        let tab = &mut self.documents[index];
+        tab.search.generation = generation;
+        tab.search.pages.clear();
+        tab.search.completed_pages = 0;
+        tab.search.truncated = false;
+        tab.search.in_progress = true;
+        if !tab.send(DocumentCommand::SetSearchGeneration(generation)) {
+            tab.search.in_progress = false;
+            tab.error = Some("search: document worker is unavailable".to_owned());
+            return;
+        }
+        for page_index in search_page_order(current_page, page_count) {
+            let _queued = tab.send(DocumentCommand::SearchPage {
+                page_index,
+                query: Arc::clone(&query),
+                generation,
+            });
+        }
+        self.status = format!("Searching {page_count} pages…");
+    }
+
+    fn cancel_search(&mut self, index: usize, close_bar: bool) {
+        let tab = &mut self.documents[index];
+        tab.search.generation = tab.search.generation.wrapping_add(1);
+        let _queued = tab.send(DocumentCommand::SetSearchGeneration(tab.search.generation));
+        tab.search.pages.clear();
+        tab.search.completed_pages = 0;
+        tab.search.truncated = false;
+        tab.search.in_progress = false;
+        if close_bar {
+            tab.search.open = false;
+        }
+    }
+
+    fn navigate_search(&mut self, index: usize, forward: bool) {
+        let current_page = self.documents[index].view.current_page;
+        let page = next_search_page(
+            self.documents[index].search.pages.keys().copied(),
+            current_page,
+            forward,
+        );
+        if let Some(page) = page {
+            self.documents[index].jump_to_page(page);
+            self.status = format!("Search result on page {}", page + 1);
+        }
+    }
+
     fn activate_document(&mut self, index: usize, previous: Option<usize>) {
         if let Some(previous) = previous.filter(|previous| *previous != index) {
             // Pending work is invalidated immediately. Completed textures remain
             // reusable only while the shared byte-budget LRU can retain them.
             self.documents[previous].invalidate_rendering();
+            self.documents[previous].search.generation =
+                self.documents[previous].search.generation.wrapping_add(1);
+            let generation = self.documents[previous].search.generation;
+            let _queued =
+                self.documents[previous].send(DocumentCommand::SetSearchGeneration(generation));
+            self.documents[previous].search.in_progress = false;
         }
 
         let sequence = self.next_activity_sequence();
@@ -450,6 +688,11 @@ impl PrototypeApp {
             let path = self.tabs.tabs()[index].path().to_path_buf();
             self.documents[index].resume(path);
             self.status = "Reopening suspended PDF after external-change check…".to_owned();
+        } else if self.documents[index].search.open
+            && !self.documents[index].search.query.trim().is_empty()
+            && !self.documents[index].search.in_progress
+        {
+            self.begin_search(index);
         }
     }
 
@@ -488,6 +731,14 @@ impl PrototypeApp {
             .collect::<Vec<_>>();
         for key in keys {
             self.gpu_lru.remove(&key);
+        }
+        let thumbnail_keys = self.documents[index]
+            .thumbnails
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for key in thumbnail_keys {
+            self.thumbnail_lru.remove(&key);
         }
         self.documents[index].suspend();
         self.status = format!(
@@ -533,6 +784,9 @@ impl PrototypeApp {
             for key in self.documents[index].tiles.keys() {
                 self.gpu_lru.remove(key);
             }
+            for key in self.documents[index].thumbnails.keys() {
+                self.thumbnail_lru.remove(key);
+            }
             self.documents.remove(index);
             self.status = "Tab closed".to_owned();
         }
@@ -547,6 +801,40 @@ impl PrototypeApp {
             {
                 document.tiles.remove(&key);
             }
+        }
+    }
+
+    fn remove_evicted_thumbnails(&mut self, evicted: Vec<(ThumbnailCacheKey, ())>) {
+        for (key, ()) in evicted {
+            if let Some(document) = self
+                .documents
+                .iter_mut()
+                .find(|document| document.document_id == key.document_id)
+            {
+                document.thumbnails.remove(&key);
+            }
+        }
+    }
+
+    fn receive_search_page(&mut self, index: usize, result: SearchPageResult) {
+        let tab = &mut self.documents[index];
+        let current_revision = tab.info.as_ref().map(|info| info.revision);
+        if !search_result_is_current(
+            result.generation,
+            tab.search.generation,
+            result.revision,
+            current_revision,
+        ) {
+            return;
+        }
+        tab.search.completed_pages = tab.search.completed_pages.saturating_add(1);
+        tab.search.truncated |= result.truncated;
+        if !result.quads.is_empty() {
+            tab.search.pages.insert(result.page_index, result.quads);
+        }
+        let page_count = tab.info.as_ref().map_or(0, |info| info.page_bounds.len());
+        if tab.search.completed_pages >= page_count {
+            tab.search.in_progress = false;
         }
     }
 
@@ -872,6 +1160,9 @@ impl PrototypeApp {
     }
 
     fn toolbar(&mut self, root_ui: &mut egui::Ui) {
+        let mut search_changed = false;
+        let mut search_navigation = None;
+        let mut close_search = false;
         egui::Panel::top("toolbar").show(root_ui, |ui| {
             let Some(index) = self.active_index() else {
                 ui.label("Drop PDF files here (maximum 20 tabs)");
@@ -893,6 +1184,9 @@ impl PrototypeApp {
                     .is_some_and(|selection| !selection.quads.is_empty());
 
             ui.horizontal_wrapped(|ui| {
+                if ui.selectable_label(self.sidebar_open, "Sidebar").clicked() {
+                    self.sidebar_open = !self.sidebar_open;
+                }
                 if ui.button("◀").clicked() {
                     self.move_page(-1);
                 }
@@ -932,8 +1226,58 @@ impl PrototypeApp {
                 if ui.button("Save (Ctrl+S)").clicked() {
                     self.save();
                 }
+                ui.separator();
+                if ui
+                    .selectable_label(self.documents[index].search.open, "Find (Ctrl+F)")
+                    .clicked()
+                {
+                    self.documents[index].search.open = true;
+                    let document_id = self.documents[index].document_id;
+                    ui.memory_mut(|memory| {
+                        memory.request_focus(Id::new(("pdf-search-query", document_id)));
+                    });
+                }
+                if self.documents[index].search.open {
+                    let document_id = self.documents[index].document_id;
+                    let search = &mut self.documents[index].search;
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut search.query)
+                            .id(Id::new(("pdf-search-query", document_id)))
+                            .desired_width(180.0)
+                            .hint_text("Search this PDF"),
+                    );
+                    search_changed = response.changed();
+                    let enter = ui.input(|input| input.key_pressed(Key::Enter));
+                    if response.has_focus() && enter && !search_changed {
+                        let backwards = ui.input(|input| input.modifiers.shift);
+                        search_navigation = Some(!backwards);
+                    }
+                    let area_count = search.pages.values().map(Vec::len).sum::<usize>();
+                    let progress = if search.in_progress {
+                        format!(
+                            "{area_count} areas · {}/{}",
+                            search.completed_pages, page_count
+                        )
+                    } else {
+                        format!("{area_count} areas")
+                    };
+                    ui.label(progress);
+                    if search.truncated {
+                        ui.label("result limit reached");
+                    }
+                    close_search = ui.small_button("×").clicked();
+                }
             });
         });
+        if let Some(index) = self.active_index() {
+            if close_search {
+                self.cancel_search(index, true);
+            } else if search_changed {
+                self.begin_search(index);
+            } else if let Some(forward) = search_navigation {
+                self.navigate_search(index, forward);
+            }
+        }
     }
 
     fn status_panel(&self, root_ui: &mut egui::Ui) {
@@ -1009,6 +1353,118 @@ impl PrototypeApp {
                     .unwrap_or("Drag across page text to inspect MuPDF selection Quads.");
                 ui.label(selection_text);
             });
+    }
+
+    fn sidebar_panel(&mut self, root_ui: &mut egui::Ui) {
+        if !self.sidebar_open {
+            return;
+        }
+        let mut selected_page = None;
+        egui::Panel::left("document-sidebar")
+            .default_size(220.0)
+            .size_range(180.0..=360.0)
+            .resizable(true)
+            .show(root_ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Outline, "Outline");
+                    ui.selectable_value(
+                        &mut self.sidebar_tab,
+                        SidebarTab::Thumbnails,
+                        "Thumbnails",
+                    );
+                });
+                ui.separator();
+                let Some(index) = self.active_index() else {
+                    return;
+                };
+                match self.sidebar_tab {
+                    SidebarTab::Outline => {
+                        if let Some(outline) = &self.documents[index].outline {
+                            if outline.is_empty() {
+                                ui.label("This PDF has no outline.");
+                            } else {
+                                selected_page = show_outline(ui, outline);
+                            }
+                        } else {
+                            ui.spinner();
+                            ui.label("Loading outline…");
+                        }
+                    }
+                    SidebarTab::Thumbnails => {
+                        selected_page = self.thumbnail_sidebar(ui, index);
+                    }
+                }
+            });
+        if let Some(index) = self.active_index()
+            && let Some(page) = selected_page
+        {
+            self.documents[index].jump_to_page(page);
+        }
+    }
+
+    fn thumbnail_sidebar(&mut self, ui: &mut egui::Ui, index: usize) -> Option<usize> {
+        let (page_count, revision) = self.documents[index]
+            .info
+            .as_ref()
+            .map(|info| (info.page_bounds.len(), info.revision))?;
+        let tab = &mut self.documents[index];
+        let thumbnail_lru = &mut self.thumbnail_lru;
+        let mut selected_page = None;
+        egui::ScrollArea::vertical().show_rows(
+            ui,
+            THUMBNAIL_ROW_HEIGHT,
+            page_count,
+            |ui, visible_rows| {
+                for page_index in visible_rows {
+                    let key = ThumbnailCacheKey::for_page(tab.document_id, page_index, revision);
+                    tab.request_thumbnail(page_index, key);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), THUMBNAIL_ROW_HEIGHT),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            if thumbnail_lru.get(&key).is_some()
+                                && let Some(cached) = tab.thumbnails.get(&key)
+                            {
+                                let available_width = ui.available_width().max(1.0);
+                                let scale = (available_width / cached.thumbnail.pixel_width as f32)
+                                    .min(1.0);
+                                let size = Vec2::new(
+                                    cached.thumbnail.pixel_width as f32 * scale,
+                                    cached.thumbnail.pixel_height as f32 * scale,
+                                );
+                                let image = egui::Image::new((cached.texture.id(), size))
+                                    .sense(egui::Sense::click());
+                                if ui.add(image).clicked() {
+                                    selected_page = Some(page_index);
+                                }
+                            } else if tab.failed_thumbnails.contains(&key) {
+                                ui.add_space(THUMBNAIL_MAX_HEIGHT as f32 / 2.0);
+                                ui.label("Thumbnail unavailable");
+                                if ui.button("Retry").clicked() {
+                                    // Persistent PDF errors must not trigger a retry on
+                                    // every frame; only an explicit user action requeues it.
+                                    tab.failed_thumbnails.remove(&key);
+                                    tab.request_thumbnail(page_index, key);
+                                }
+                            } else {
+                                ui.add_space(THUMBNAIL_MAX_HEIGHT as f32 / 2.0);
+                                ui.spinner();
+                            }
+                            if ui
+                                .selectable_label(
+                                    tab.view.current_page == page_index,
+                                    format!("Page {}", page_index + 1),
+                                )
+                                .clicked()
+                            {
+                                selected_page = Some(page_index);
+                            }
+                        },
+                    );
+                }
+            },
+        );
+        selected_page
     }
 
     fn central_panel(&mut self, root_ui: &mut egui::Ui) {
@@ -1147,6 +1603,14 @@ impl PrototypeApp {
                     Vec2::new(placement.width, placement.height),
                 );
                 paint_page_tiles(ui, screen_rect, page_index, tab, gpu_lru);
+                if let Some(quads) = tab.search.pages.get(&page_index) {
+                    PageViewport::paint_search_quads(
+                        ui,
+                        screen_rect,
+                        page_bounds[page_index],
+                        quads,
+                    );
+                }
                 let response = ui
                     .scope_builder(UiBuilder::new().max_rect(screen_rect), |page_ui| {
                         viewport.interact_at(
@@ -1223,6 +1687,9 @@ impl PrototypeApp {
             .unwrap_or_default();
             tab.prepare_tiles(requests);
             paint_page_tiles(ui, screen_rect, page_index, tab, gpu_lru);
+            if let Some(quads) = tab.search.pages.get(&page_index) {
+                PageViewport::paint_search_quads(ui, screen_rect, bounds, quads);
+            }
             completed_drag = ui
                 .scope_builder(UiBuilder::new().max_rect(screen_rect), |page_ui| {
                     viewport.interact_at(
@@ -1271,6 +1738,38 @@ impl TileCacheKey {
             rotation_quarter_turns: 0,
             spec: tile.spec,
             revision: tile.revision,
+        }
+    }
+}
+
+impl ThumbnailCacheKey {
+    fn for_page(document_id: u64, page_index: usize, revision: u64) -> Self {
+        Self {
+            document_id,
+            page_index,
+            max_pixel_width: THUMBNAIL_MAX_WIDTH,
+            max_pixel_height: THUMBNAIL_MAX_HEIGHT,
+            revision,
+        }
+    }
+
+    fn from_thumbnail(document_id: u64, thumbnail: &RenderedThumbnail) -> Self {
+        Self {
+            document_id,
+            page_index: thumbnail.page_index,
+            max_pixel_width: thumbnail.max_pixel_width,
+            max_pixel_height: thumbnail.max_pixel_height,
+            revision: thumbnail.revision,
+        }
+    }
+
+    fn from_request(document_id: u64, request: &ThumbnailRequest) -> Self {
+        Self {
+            document_id,
+            page_index: request.page_index,
+            max_pixel_width: request.max_pixel_width,
+            max_pixel_height: request.max_pixel_height,
+            revision: request.expected_revision,
         }
     }
 }
@@ -1479,6 +1978,8 @@ impl DocumentTab {
             last_selected_sequence,
             info: None,
             error: None,
+            outline: None,
+            outline_requested: false,
             tiles: HashMap::new(),
             pending_tiles: HashMap::new(),
             wanted_tiles: HashSet::new(),
@@ -1486,6 +1987,11 @@ impl DocumentTab {
             selection_generation: 0,
             pending_highlights: 0,
             save_in_flight: false,
+            thumbnails: HashMap::new(),
+            pending_thumbnails: HashSet::new(),
+            failed_thumbnails: HashSet::new(),
+            thumbnail_generation: 1,
+            search: SearchState::default(),
             view: ViewState {
                 display_mode: DisplayMode::Continuous,
                 zoom_mode: ZoomMode::FitWidth,
@@ -1524,6 +2030,13 @@ impl DocumentTab {
     fn suspend(&mut self) {
         self.invalidate_rendering();
         self.tiles.clear();
+        self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
+        self.pending_thumbnails.clear();
+        self.failed_thumbnails.clear();
+        self.thumbnails.clear();
+        self.search.generation = self.search.generation.wrapping_add(1);
+        let _queued = self.send(DocumentCommand::SetSearchGeneration(self.search.generation));
+        self.search.in_progress = false;
         self.service = None;
         self.state = DocumentState::Suspended;
     }
@@ -1554,6 +2067,45 @@ impl DocumentTab {
     fn set_display_mode(&mut self, mode: DisplayMode) {
         if self.view.switch_display_mode(mode) {
             self.invalidate_rendering();
+        }
+    }
+
+    fn jump_to_page(&mut self, page_index: usize) {
+        let page_count = self.info.as_ref().map_or(0, |info| info.page_bounds.len());
+        if page_index >= page_count {
+            return;
+        }
+        self.view.current_page = page_index;
+        match self.view.display_mode {
+            DisplayMode::Continuous => {
+                self.view.scroll_to_page = Some(page_index);
+                self.view.restore_anchor = None;
+            }
+            DisplayMode::SinglePage => {
+                let center = Vec2::splat(0.5);
+                self.view.single_center_anchor = Some(center);
+                self.view.restore_single_anchor = Some(center);
+            }
+        }
+        self.invalidate_rendering();
+    }
+
+    fn request_thumbnail(&mut self, page_index: usize, key: ThumbnailCacheKey) {
+        if self.thumbnails.contains_key(&key)
+            || self.pending_thumbnails.contains(&key)
+            || self.failed_thumbnails.contains(&key)
+        {
+            return;
+        }
+        let request = ThumbnailRequest {
+            page_index,
+            max_pixel_width: key.max_pixel_width,
+            max_pixel_height: key.max_pixel_height,
+            generation: self.thumbnail_generation,
+            expected_revision: key.revision,
+        };
+        if self.send(DocumentCommand::LoadThumbnail(request)) {
+            self.pending_thumbnails.insert(key);
         }
     }
 
@@ -1676,6 +2228,7 @@ impl eframe::App for PrototypeApp {
         self.tab_bar(ui);
         self.toolbar(ui);
         self.status_panel(ui);
+        self.sidebar_panel(ui);
         self.central_panel(ui);
         self.close_confirmation_dialog(ui.ctx());
     }
@@ -1709,6 +2262,68 @@ fn state_after_document_info(current: DocumentState, dirty: bool) -> DocumentSta
     } else {
         DocumentState::ReadyClean
     }
+}
+
+fn search_page_order(current_page: usize, page_count: usize) -> Vec<usize> {
+    if page_count == 0 {
+        return Vec::new();
+    }
+    let current_page = current_page.min(page_count - 1);
+    let mut pages = Vec::with_capacity(page_count);
+    pages.push(current_page);
+    for distance in 1..page_count {
+        if let Some(page) = current_page.checked_add(distance)
+            && page < page_count
+        {
+            pages.push(page);
+        }
+        if let Some(page) = current_page.checked_sub(distance) {
+            pages.push(page);
+        }
+    }
+    pages
+}
+
+fn next_search_page(
+    pages: impl Iterator<Item = usize>,
+    current_page: usize,
+    forward: bool,
+) -> Option<usize> {
+    let pages = pages.collect::<Vec<_>>();
+    if forward {
+        pages
+            .iter()
+            .copied()
+            .find(|page| *page > current_page)
+            .or_else(|| pages.first().copied())
+    } else {
+        pages
+            .iter()
+            .rev()
+            .copied()
+            .find(|page| *page < current_page)
+            .or_else(|| pages.last().copied())
+    }
+}
+
+fn search_result_is_current(
+    result_generation: u64,
+    current_generation: u64,
+    result_revision: u64,
+    current_revision: Option<u64>,
+) -> bool {
+    result_generation == current_generation && current_revision == Some(result_revision)
+}
+
+fn mark_thumbnail_failed(
+    pending: &mut HashSet<ThumbnailCacheKey>,
+    failed: &mut HashSet<ThumbnailCacheKey>,
+    key: ThumbnailCacheKey,
+) {
+    // A failed key stays blocked until the user explicitly retries it. Other
+    // pending pages remain intact because their worker commands are still valid.
+    pending.remove(&key);
+    failed.insert(key);
 }
 
 /// Accepts a raster only when it still belongs to the visible document state.
@@ -1898,5 +2513,42 @@ mod tests {
         let after_save_event = state_after_document_info(after_highlight_event, false);
         assert_eq!(after_save_event, DocumentState::ReadyClean);
         assert!(!document_save_blocks_close(false));
+    }
+
+    #[test]
+    fn search_starts_at_current_page_and_alternates_forward_and_backward() {
+        assert_eq!(search_page_order(3, 7), [3, 4, 2, 5, 1, 6, 0]);
+        assert!(search_page_order(0, 0).is_empty());
+    }
+
+    #[test]
+    fn search_navigation_wraps_across_matching_pages() {
+        let pages = [1, 4, 8];
+
+        assert_eq!(next_search_page(pages.into_iter(), 4, true), Some(8));
+        assert_eq!(next_search_page(pages.into_iter(), 8, true), Some(1));
+        assert_eq!(next_search_page(pages.into_iter(), 4, false), Some(1));
+        assert_eq!(next_search_page(pages.into_iter(), 1, false), Some(8));
+    }
+
+    #[test]
+    fn stale_search_result_is_rejected_by_generation_and_revision() {
+        assert!(search_result_is_current(4, 4, 2, Some(2)));
+        assert!(!search_result_is_current(3, 4, 2, Some(2)));
+        assert!(!search_result_is_current(4, 4, 1, Some(2)));
+    }
+
+    #[test]
+    fn thumbnail_failure_blocks_only_the_failed_request() {
+        let failed_key = ThumbnailCacheKey::for_page(1, 2, 3);
+        let other_key = ThumbnailCacheKey::for_page(1, 4, 3);
+        let mut pending = HashSet::from([failed_key, other_key]);
+        let mut failed = HashSet::new();
+
+        mark_thumbnail_failed(&mut pending, &mut failed, failed_key);
+
+        assert!(!pending.contains(&failed_key));
+        assert!(pending.contains(&other_key));
+        assert!(failed.contains(&failed_key));
     }
 }

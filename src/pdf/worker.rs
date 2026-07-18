@@ -6,7 +6,8 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select_biased, unbounded};
 
 use crate::domain::document::{
-    DocumentInfo, DocumentVersion, HighlightRequest, RenderPriority, RenderedTile, TileRequest,
+    DocumentInfo, DocumentVersion, HighlightRequest, OutlineItem, RenderPriority,
+    RenderedThumbnail, RenderedTile, SearchPageResult, ThumbnailRequest, TileRequest,
 };
 use crate::domain::selection::{PagePoint, SelectionSnapshot};
 use crate::pdf::mupdf_backend::MuPdfBackend;
@@ -21,6 +22,14 @@ pub(crate) enum DocumentCommand {
         end: PagePoint,
     },
     CreateHighlight(HighlightRequest),
+    LoadOutline,
+    SetSearchGeneration(u64),
+    SearchPage {
+        page_index: usize,
+        query: Arc<str>,
+        generation: u64,
+    },
+    LoadThumbnail(ThumbnailRequest),
     Save,
     Shutdown,
 }
@@ -31,6 +40,14 @@ pub(crate) enum DocumentEvent {
     DocumentChanged(DocumentInfo),
     TileRendered(RenderedTile),
     SelectionReady(SelectionSnapshot),
+    OutlineReady(Vec<OutlineItem>),
+    SearchPageReady(SearchPageResult),
+    ThumbnailReady(RenderedThumbnail),
+    ThumbnailSkipped(ThumbnailRequest),
+    ThumbnailFailed {
+        request: ThumbnailRequest,
+        message: String,
+    },
     Status(String),
     Failed {
         operation: &'static str,
@@ -125,6 +142,9 @@ impl DocumentService {
     pub(crate) fn send(&self, command: DocumentCommand) -> bool {
         match command {
             DocumentCommand::RenderTile(request) => self.queue_render(request),
+            DocumentCommand::SearchPage { .. } | DocumentCommand::LoadThumbnail(_) => {
+                self.previous_viewport_sender.send(command).is_ok()
+            }
             command => self.foreground_sender.send(command).is_ok(),
         }
     }
@@ -209,6 +229,7 @@ fn run_worker(
     if !send_opened_info(&backend, expected_version, &event_sender) {
         return;
     }
+    let mut active_search_generation = 0;
 
     while let Some(command) = next_command(
         &foreground_receiver,
@@ -250,6 +271,44 @@ fn run_worker(
                     Err(error) => send_failure(&event_sender, "highlight", error),
                 }
             }
+            DocumentCommand::LoadOutline => match backend.load_outline() {
+                Ok(outline) => {
+                    let _ = event_sender.send(DocumentEvent::OutlineReady(outline));
+                }
+                Err(error) => send_failure(&event_sender, "outline", error),
+            },
+            DocumentCommand::SetSearchGeneration(generation) => {
+                active_search_generation = generation;
+            }
+            DocumentCommand::SearchPage {
+                page_index,
+                query,
+                generation,
+            } => {
+                if !search_generation_is_current(active_search_generation, generation) {
+                    continue;
+                }
+                match backend.search_page(page_index, &query, generation) {
+                    Ok(result) => {
+                        let _ = event_sender.send(DocumentEvent::SearchPageReady(result));
+                    }
+                    Err(error) => send_failure(&event_sender, "search", error),
+                }
+            }
+            DocumentCommand::LoadThumbnail(request) => match backend.render_thumbnail(request) {
+                Ok(Some(thumbnail)) => {
+                    let _ = event_sender.send(DocumentEvent::ThumbnailReady(thumbnail));
+                }
+                Ok(None) => {
+                    let _ = event_sender.send(DocumentEvent::ThumbnailSkipped(request));
+                }
+                Err(error) => {
+                    let _ = event_sender.send(DocumentEvent::ThumbnailFailed {
+                        request,
+                        message: format!("{error:#}"),
+                    });
+                }
+            },
             DocumentCommand::Save => match backend.save_incrementally() {
                 Ok(highlight_count) => {
                     let _ = event_sender.send(DocumentEvent::Status(format!(
@@ -298,6 +357,10 @@ fn next_command(
         recv(next_viewport) -> command => command.ok(),
         recv(previous_viewport) -> command => command.ok(),
     }
+}
+
+fn search_generation_is_current(active_generation: u64, request_generation: u64) -> bool {
+    active_generation == request_generation
 }
 
 fn send_opened_info(
@@ -432,5 +495,35 @@ mod tests {
         assert!(!take_scheduled_render(&scheduled, &prefetch));
         assert!(take_scheduled_render(&scheduled, &visible));
         assert!(scheduled.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn visible_render_precedes_queued_search_page() {
+        let (foreground_sender, foreground_receiver) = unbounded();
+        let (_next_sender, next_receiver) = unbounded();
+        let (background_sender, background_receiver) = unbounded();
+        background_sender
+            .send(DocumentCommand::SearchPage {
+                page_index: 0,
+                query: Arc::from("needle"),
+                generation: 2,
+            })
+            .unwrap();
+        foreground_sender
+            .send(DocumentCommand::RenderTile(tile_request(
+                RenderPriority::Visible,
+            )))
+            .unwrap();
+
+        let command =
+            next_command(&foreground_receiver, &next_receiver, &background_receiver).unwrap();
+
+        assert!(matches!(command, DocumentCommand::RenderTile(_)));
+    }
+
+    #[test]
+    fn stale_search_generation_is_rejected_before_backend_work() {
+        assert!(search_generation_is_current(3, 3));
+        assert!(!search_generation_is_current(4, 3));
     }
 }

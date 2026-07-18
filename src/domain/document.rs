@@ -107,6 +107,43 @@ pub(crate) struct HighlightRequest {
     pub(crate) quads: Vec<PageQuad>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutlineItem {
+    pub(crate) title: String,
+    pub(crate) page_index: Option<usize>,
+    pub(crate) children: Vec<OutlineItem>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SearchPageResult {
+    pub(crate) page_index: usize,
+    pub(crate) generation: u64,
+    pub(crate) revision: u64,
+    pub(crate) quads: Vec<PageQuad>,
+    pub(crate) truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ThumbnailRequest {
+    pub(crate) page_index: usize,
+    pub(crate) max_pixel_width: u32,
+    pub(crate) max_pixel_height: u32,
+    pub(crate) generation: u64,
+    pub(crate) expected_revision: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct RenderedThumbnail {
+    pub(crate) page_index: usize,
+    pub(crate) max_pixel_width: u32,
+    pub(crate) max_pixel_height: u32,
+    pub(crate) generation: u64,
+    pub(crate) revision: u64,
+    pub(crate) pixel_width: u32,
+    pub(crate) pixel_height: u32,
+    pub(crate) pixels_rgba: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,12 +11,13 @@ use anyhow::{Context, Result, ensure};
 use mupdf::color::AnnotationColor;
 use mupdf::pdf::{AnnotationQuadPoints, PdfAnnotationType, PdfDocument, PdfWriteOptions};
 use mupdf::{
-    Colorspace, Device, DisplayList, IRect, Matrix, Pixmap, Point, Quad, Rect, TextBlockContent,
-    TextPage, TextPageFlags,
+    Colorspace, Device, DisplayList, IRect, Matrix, Outline, Pixmap, Point, Quad, Rect,
+    TextBlockContent, TextPage, TextPageFlags,
 };
 
 use crate::domain::document::{
-    DocumentInfo, DocumentVersion, HighlightRequest, PageRect, RenderedTile, TileRequest, TileSpec,
+    DocumentInfo, DocumentVersion, HighlightRequest, OutlineItem, PageRect, RenderedThumbnail,
+    RenderedTile, SearchPageResult, TILE_EDGE_PIXELS, ThumbnailRequest, TileRequest, TileSpec,
 };
 use crate::domain::selection::{
     GlyphSnapshot, PagePoint, PageQuad, SelectionSnapshot, selected_text,
@@ -32,6 +33,11 @@ const SELECTION_QUAD_CAPACITY: usize = 4_096;
 // update. One hundredth of a PDF point is below display-pixel precision at the
 // supported zoom range while still detecting a materially different Quad.
 const PDF_COORDINATE_TOLERANCE: f32 = 0.01;
+
+// The high-level search API requires a caller-provided Quad limit. 16,384
+// Quads bound one page snapshot near 512 KiB while covering dense papers; the
+// result explicitly reports saturation instead of pretending the count is full.
+const SEARCH_QUAD_CAPACITY: u32 = 16_384;
 
 pub(super) struct MuPdfBackend {
     path: PathBuf,
@@ -90,6 +96,96 @@ impl MuPdfBackend {
             physical_memory_bytes: physical_memory_bytes(),
             version: self.version,
         })
+    }
+
+    /// Returns a Rust-owned hierarchy with only validated internal page targets.
+    pub(super) fn load_outline(&self) -> Result<Vec<OutlineItem>> {
+        let outlines = self.document.outlines()?;
+        Ok(outlines
+            .into_iter()
+            .map(|outline| outline_item(outline, self.page_bounds.len()))
+            .collect())
+    }
+
+    /// Searches one page so foreground rendering can run between page commands.
+    pub(super) fn search_page(
+        &mut self,
+        page_index: usize,
+        query: &str,
+        generation: u64,
+    ) -> Result<SearchPageResult> {
+        ensure!(!query.is_empty(), "cannot search for an empty string");
+        page_number(page_index, self.page_bounds.len())?;
+        let revision = self.revision;
+        let quads = self
+            .display_list(page_index)?
+            .search(query, SEARCH_QUAD_CAPACITY)?;
+        let truncated = quads.len() == SEARCH_QUAD_CAPACITY as usize;
+        Ok(SearchPageResult {
+            page_index,
+            generation,
+            revision,
+            quads: quads.iter().map(page_quad_from_mupdf).collect(),
+            truncated,
+        })
+    }
+
+    /// Renders a bounded whole-page image through the same annotated tile path.
+    pub(super) fn render_thumbnail(
+        &mut self,
+        request: ThumbnailRequest,
+    ) -> Result<Option<RenderedThumbnail>> {
+        ensure!(
+            request.max_pixel_width > 0 && request.max_pixel_height > 0,
+            "thumbnail dimensions must be positive"
+        );
+        ensure!(
+            request.max_pixel_width <= TILE_EDGE_PIXELS
+                && request.max_pixel_height <= TILE_EDGE_PIXELS,
+            "thumbnail dimensions exceed the single-tile transfer bound"
+        );
+        page_number(request.page_index, self.page_bounds.len())?;
+        if request.expected_revision != self.revision {
+            return Ok(None);
+        }
+
+        let bounds = self.page_bounds[request.page_index];
+        let scale = (request.max_pixel_width as f32 / bounds.width())
+            .min(request.max_pixel_height as f32 / bounds.height());
+        ensure!(
+            scale.is_finite() && scale > 0.0,
+            "thumbnail scale must be finite and positive"
+        );
+        let pixel_bounds = Rect::new(bounds.x0, bounds.y0, bounds.x1, bounds.y1)
+            .transform(&Matrix::new_scale(scale, scale))
+            .round();
+        let pixel_width = u32::try_from(pixel_bounds.x1 - pixel_bounds.x0)?;
+        let pixel_height = u32::try_from(pixel_bounds.y1 - pixel_bounds.y0)?;
+        let tile = self.render_tile(TileRequest {
+            page_index: request.page_index,
+            zoom: scale,
+            pixels_per_point: 1.0,
+            scale,
+            generation: request.generation,
+            expected_revision: request.expected_revision,
+            spec: TileSpec {
+                pixel_x: 0,
+                pixel_y: 0,
+                pixel_width,
+                pixel_height,
+            },
+            priority: crate::domain::document::RenderPriority::PreviousViewport,
+        })?;
+        Ok(tile.map(|tile| RenderedThumbnail {
+            page_index: tile.page_index,
+            max_pixel_width: request.max_pixel_width,
+            max_pixel_height: request.max_pixel_height,
+            generation: tile.generation,
+            revision: tile.revision,
+            pixel_width: tile.spec.pixel_width,
+            pixel_height: tile.spec.pixel_height,
+            pixels_rgba: tile.pixels_rgba,
+        }))
     }
 
     pub(super) fn render_tile(&mut self, request: TileRequest) -> Result<Option<RenderedTile>> {
@@ -535,6 +631,22 @@ fn page_number(page_index: usize, page_count: usize) -> Result<i32> {
     i32::try_from(page_index).context("page index exceeds MuPDF's supported range")
 }
 
+fn outline_item(outline: Outline, page_count: usize) -> OutlineItem {
+    let page_index = outline
+        .dest
+        .and_then(|destination| usize::try_from(destination.loc.page_number).ok())
+        .filter(|page_index| *page_index < page_count);
+    OutlineItem {
+        title: outline.title,
+        page_index,
+        children: outline
+            .down
+            .into_iter()
+            .map(|child| outline_item(child, page_count))
+            .collect(),
+    }
+}
+
 fn physical_memory_bytes() -> Option<usize> {
     memory_stats::memory_stats().map(|stats| stats.physical_mem)
 }
@@ -562,8 +674,10 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
-    use mupdf::Size;
     use mupdf::pdf::PdfObject;
+    use mupdf::shape::{Shape, TextOptions};
+    use mupdf::{DestinationKind, Size};
+    use mupdf::{document::Location, link::LinkDestination};
 
     fn tile_request(page_index: usize, scale: f32, generation: u64, revision: u64) -> TileRequest {
         tile_request_with_spec(
@@ -755,5 +869,74 @@ mod tests {
             assert_eq!(tile.spec, spec);
             assert_eq!(tile.pixels_rgba.len(), spec.rgba_bytes().unwrap());
         }
+    }
+
+    #[test]
+    fn outline_search_and_thumbnail_return_owned_phase_three_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("phase-three.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let mut first_page = document.new_page(Size::new(400.0, 600.0)).unwrap();
+            let mut shape = Shape::new(&mut first_page).unwrap();
+            shape
+                .insert_text(
+                    Point::new(50.0, 100.0),
+                    "Needle in the first page",
+                    &TextOptions::default(),
+                )
+                .unwrap()
+                .commit(&mut document, true)
+                .unwrap();
+            let _second_page = document.new_page(Size::new(600.0, 400.0)).unwrap();
+            document
+                .set_outlines(&[Outline {
+                    title: "Second page".to_owned(),
+                    uri: None,
+                    dest: Some(LinkDestination {
+                        loc: Location {
+                            chapter: 0,
+                            page_in_chapter: 1,
+                            page_number: 1,
+                        },
+                        kind: DestinationKind::Fit,
+                    }),
+                    down: vec![Outline {
+                        title: "External entry".to_owned(),
+                        uri: Some("https://example.invalid".to_owned()),
+                        dest: None,
+                        down: Vec::new(),
+                    }],
+                }])
+                .unwrap();
+            document.save(path_text).unwrap();
+        }
+
+        let mut backend = MuPdfBackend::open(path).unwrap();
+        let outline = backend.load_outline().unwrap();
+        let search = backend.search_page(0, "needle", 7).unwrap();
+        let thumbnail = backend
+            .render_thumbnail(ThumbnailRequest {
+                page_index: 1,
+                max_pixel_width: 160,
+                max_pixel_height: 220,
+                generation: 9,
+                expected_revision: 0,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outline[0].page_index, Some(1));
+        assert_eq!(outline[0].children[0].page_index, None);
+        assert_eq!(search.generation, 7);
+        assert!(!search.quads.is_empty());
+        assert_eq!(thumbnail.generation, 9);
+        assert!(thumbnail.pixel_width <= 160);
+        assert!(thumbnail.pixel_height <= 220);
+        assert_eq!(
+            thumbnail.pixels_rgba.len(),
+            thumbnail.pixel_width as usize * thumbnail.pixel_height as usize * 4
+        );
     }
 }

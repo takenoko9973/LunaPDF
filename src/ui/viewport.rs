@@ -27,6 +27,25 @@ impl PageViewport {
         );
     }
 
+    /// Paints search geometry without changing the logical text selection.
+    pub(crate) fn paint_search_quads(
+        ui: &Ui,
+        screen_rect: Rect,
+        bounds: PageRect,
+        quads: &[PageQuad],
+    ) {
+        for quad in quads {
+            paint_quad(
+                ui,
+                screen_rect,
+                bounds,
+                *quad,
+                Color32::from_rgba_unmultiplied(80, 170, 255, 72),
+                Color32::from_rgb(35, 110, 210),
+            );
+        }
+    }
+
     /// Handles selection interaction and overlays for one logical PDF page.
     pub(crate) fn interact_at(
         &mut self,
@@ -44,7 +63,14 @@ impl PageViewport {
 
         if let Some(selection) = selection.filter(|value| value.page_index == page_index) {
             for quad in &selection.quads {
-                paint_selection_quad(ui, screen_rect, bounds, *quad);
+                paint_quad(
+                    ui,
+                    screen_rect,
+                    bounds,
+                    *quad,
+                    Color32::from_rgba_unmultiplied(255, 210, 0, 72),
+                    Color32::from_rgb(220, 150, 0),
+                );
             }
         }
 
@@ -111,7 +137,14 @@ fn screen_rect_for_tile(page_screen_rect: Rect, tile: &RenderedTile) -> Rect {
     )
 }
 
-fn paint_selection_quad(ui: &Ui, screen_rect: Rect, bounds: PageRect, quad: PageQuad) {
+fn paint_quad(
+    ui: &Ui,
+    screen_rect: Rect,
+    bounds: PageRect,
+    quad: PageQuad,
+    fill: Color32,
+    stroke: Color32,
+) {
     let points = vec![
         screen_point_from_page(quad.upper_left, screen_rect, bounds),
         screen_point_from_page(quad.upper_right, screen_rect, bounds),
@@ -120,8 +153,8 @@ fn paint_selection_quad(ui: &Ui, screen_rect: Rect, bounds: PageRect, quad: Page
     ];
     ui.painter().add(Shape::convex_polygon(
         points,
-        Color32::from_rgba_unmultiplied(255, 210, 0, 72),
-        Stroke::new(1.5, Color32::from_rgb(220, 150, 0)),
+        fill,
+        Stroke::new(1.5, stroke),
     ));
 }
 
