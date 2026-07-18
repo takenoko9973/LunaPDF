@@ -17,7 +17,13 @@ serde_json = "1.0"
 tempfile = "3.27.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_UI_Controls_Dialogs",
+] }
 
 [profile.release]
 strip = "symbols"

@@ -106,6 +106,7 @@ struct DocumentTab {
     edit_history: Vec<EditAction>,
     undo_in_flight: bool,
     save_in_flight: bool,
+    print_in_flight: bool,
     thumbnails: HashMap<ThumbnailCacheKey, CachedThumbnail>,
     pending_thumbnails: HashSet<ThumbnailCacheKey>,
     failed_thumbnails: HashSet<ThumbnailCacheKey>,
@@ -715,6 +716,16 @@ impl PrototypeApp {
                         );
                         tab.error = Some(format!("thumbnail: {message}"));
                     }
+                    #[cfg(windows)]
+                    Ok(DocumentEvent::PrintCompleted) => {
+                        self.documents[index].print_in_flight = false;
+                        self.status = "印刷データをプリンターへ送信しました".to_owned();
+                    }
+                    #[cfg(windows)]
+                    Ok(DocumentEvent::PrintCancelled) => {
+                        self.documents[index].print_in_flight = false;
+                        self.status = "印刷をキャンセルしました".to_owned();
+                    }
                     Ok(DocumentEvent::Status(status)) => {
                         self.status = status;
                         self.documents[index].error = None;
@@ -751,6 +762,9 @@ impl PrototypeApp {
                         }
                         if operation == "undo" {
                             self.documents[index].undo_in_flight = false;
+                        }
+                        if operation == "print" {
+                            self.documents[index].print_in_flight = false;
                         }
                         if operation == "save" {
                             self.documents[index].save_in_flight = false;
@@ -805,13 +819,19 @@ impl PrototypeApp {
         if self.window_close_pending
             && self.close_confirmation.is_none()
             && self.session_close_failure.is_none()
-            && !self.documents.iter().any(DocumentTab::is_saving)
+            && !self
+                .documents
+                .iter()
+                .any(|document| document.is_saving() || document.is_printing())
         {
             self.prompt_next_window_document(context);
         }
         if self.close_all_pending
             && self.close_confirmation.is_none()
-            && !self.documents.iter().any(DocumentTab::is_saving)
+            && !self
+                .documents
+                .iter()
+                .any(|document| document.is_saving() || document.is_printing())
         {
             self.prompt_next_close_all_document();
         }
@@ -1110,6 +1130,10 @@ impl PrototypeApp {
             self.status = "Waiting for the current save before closing…".to_owned();
             return;
         }
+        if document.is_printing() {
+            self.status = "印刷処理の完了を待ってからタブを閉じます…".to_owned();
+            return;
+        }
         if document.has_unsaved_changes() {
             self.close_confirmation = Some(CloseConfirmation {
                 scope: CloseScope::Tab,
@@ -1130,8 +1154,12 @@ impl PrototypeApp {
     }
 
     fn prompt_next_close_all_document(&mut self) {
-        if self.documents.iter().any(DocumentTab::is_saving) {
-            self.status = "保存の完了を待ってからすべて閉じます…".to_owned();
+        if self
+            .documents
+            .iter()
+            .any(|document| document.is_saving() || document.is_printing())
+        {
+            self.status = "保存または印刷の完了を待ってからすべて閉じます…".to_owned();
             return;
         }
         let next_path = self
@@ -1259,8 +1287,12 @@ impl PrototypeApp {
         if self.session_close_failure.is_some() {
             return;
         }
-        if self.documents.iter().any(DocumentTab::is_saving) {
-            self.status = "Waiting for the current save before closing…".to_owned();
+        if self
+            .documents
+            .iter()
+            .any(|document| document.is_saving() || document.is_printing())
+        {
+            self.status = "保存または印刷の完了を待ってから終了します…".to_owned();
             return;
         }
         if self.session_restore_progress.is_some() {
@@ -1440,22 +1472,22 @@ impl PrototypeApp {
         let save_in_flight = confirmation.save_in_flight;
 
         let modal = egui::Modal::new(Id::new("unsaved-document-close")).show(context, |ui| {
-            ui.heading("Unsaved Highlight annotations");
-            ui.label(format!("Save changes to {file_name}?"));
+            ui.heading("未保存のハイライトがあります");
+            ui.label(format!("{file_name} の変更を保存しますか？"));
             ui.horizontal(|ui| {
                 let save = ui
-                    .add_enabled(!save_in_flight, egui::Button::new("Save"))
+                    .add_enabled(!save_in_flight, egui::Button::new("保存"))
                     .clicked()
                     .then_some(CloseDecision::Save);
                 let discard = ui
-                    .add_enabled(!save_in_flight, egui::Button::new("Discard"))
+                    .add_enabled(!save_in_flight, egui::Button::new("破棄"))
                     .clicked()
                     .then_some(CloseDecision::Discard);
                 let cancel = ui
                     .button(if save_in_flight {
-                        "Keep open"
+                        "開いたままにする"
                     } else {
-                        "Cancel"
+                        "キャンセル"
                     })
                     .clicked()
                     .then_some(CloseDecision::Cancel);
@@ -1476,20 +1508,20 @@ impl PrototypeApp {
             return;
         };
         let modal = egui::Modal::new(Id::new("session-save-close-failure")).show(context, |ui| {
-            ui.heading("Session could not be saved");
+            ui.heading("セッションを保存できませんでした");
             ui.label(&message);
-            ui.label("The PDF documents were not changed by this failure.");
+            ui.label("このエラーによってPDF文書は変更されていません。");
             ui.horizontal(|ui| {
                 let retry = ui
-                    .button("Retry")
+                    .button("再試行")
                     .clicked()
                     .then_some(SessionCloseDecision::Retry);
                 let exit = ui
-                    .button("Exit without session")
+                    .button("セッションを保存せず終了")
                     .clicked()
                     .then_some(SessionCloseDecision::ExitWithoutSession);
                 let cancel = ui
-                    .button("Cancel")
+                    .button("キャンセル")
                     .clicked()
                     .then_some(SessionCloseDecision::Cancel);
                 retry.or(exit).or(cancel)
@@ -1574,6 +1606,9 @@ impl PrototypeApp {
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
+        if tab.is_printing() {
+            return;
+        }
         let highlight_capability = tab.info.as_ref().map(|info| info.highlight_capability);
         let Some(highlight_capability) = highlight_capability else {
             return;
@@ -1631,7 +1666,8 @@ impl PrototypeApp {
     }
 
     fn save(&mut self) {
-        if self.window_close_pending || self.close_confirmation.is_some() {
+        if self.window_close_pending || self.close_all_pending || self.close_confirmation.is_some()
+        {
             return;
         }
         let Some(tab) = self.active_tab_mut() else {
@@ -1639,6 +1675,10 @@ impl PrototypeApp {
         };
         if tab.is_saving() {
             self.status = "A save is already in progress".to_owned();
+            return;
+        }
+        if tab.is_printing() {
+            self.status = "印刷処理の完了後に保存してください".to_owned();
             return;
         }
         let Some(info) = &tab.info else {
@@ -1687,7 +1727,13 @@ impl PrototypeApp {
                         {
                             select_request = Some(index);
                         }
-                        if ui.small_button("×").clicked() {
+                        if ui
+                            .add_enabled(
+                                !self.documents[index].is_printing(),
+                                egui::Button::new("×"),
+                            )
+                            .clicked()
+                        {
                             close_request = Some(index);
                         }
                         ui.separator();
@@ -1738,7 +1784,8 @@ impl PrototypeApp {
                     ui.separator();
                     if ui
                         .add_enabled(
-                            self.active_index().is_some(),
+                            self.active_index()
+                                .is_some_and(|index| !self.documents[index].is_printing()),
                             egui::Button::new("現在のタブを閉じる"),
                         )
                         .clicked()
@@ -2124,6 +2171,7 @@ impl PrototypeApp {
             .info
             .as_ref()
             .is_some_and(|info| info.highlight_capability.is_allowed())
+            && !self.documents[index].print_in_flight
             && self.documents[index]
                 .selection
                 .as_ref()
@@ -2140,17 +2188,21 @@ impl PrototypeApp {
             !tab.edit_history.is_empty()
                 && !tab.undo_in_flight
                 && !tab.save_in_flight
+                && !tab.print_in_flight
                 && tab.service.is_some()
         })
     }
 
     fn can_print(&self) -> bool {
+        // The native dialog runs on the document worker, so opening, saving,
+        // printing, shutdown confirmation, and a missing worker are exclusive.
         self.active_index().is_some_and(|index| {
             let tab = &self.documents[index];
             tab.state != DocumentState::Opening
                 && tab.state != DocumentState::Suspended
                 && tab.state != DocumentState::Error
                 && !tab.save_in_flight
+                && !tab.print_in_flight
                 && tab.service.is_some()
                 && tab.info.is_some()
         }) && !self.window_close_pending
@@ -2161,7 +2213,18 @@ impl PrototypeApp {
     fn print(&mut self) {
         #[cfg(windows)]
         {
-            self.status = "印刷ダイアログを準備しています…".to_owned();
+            if !self.can_print() {
+                return;
+            }
+            let tab = self
+                .active_tab_mut()
+                .expect("can_print requires an active tab");
+            if tab.send(DocumentCommand::Print) {
+                tab.print_in_flight = true;
+                self.status = "印刷ダイアログを準備しています…".to_owned();
+            } else {
+                self.error = Some("印刷: 文書ワーカーを利用できません".to_owned());
+            }
         }
         #[cfg(not(windows))]
         {
@@ -2293,7 +2356,7 @@ impl PrototypeApp {
                     SidebarTab::Outline => {
                         if let Some(outline) = &self.documents[index].outline {
                             if outline.is_empty() {
-                                ui.label("このPDFには目次がありません");
+                                ui.label("目次はありません");
                             } else {
                                 selected_page = show_outline(ui, outline);
                             }
@@ -2351,8 +2414,8 @@ impl PrototypeApp {
                                 }
                             } else if tab.failed_thumbnails.contains(&key) {
                                 ui.add_space(THUMBNAIL_MAX_HEIGHT as f32 / 2.0);
-                                ui.label("Thumbnail unavailable");
-                                if ui.button("Retry").clicked() {
+                                ui.label("サムネイルを読み込めませんでした");
+                                if ui.button("再試行").clicked() {
                                     // Persistent PDF errors must not trigger a retry on
                                     // every frame; only an explicit user action requeues it.
                                     tab.failed_thumbnails.remove(&key);
@@ -2365,7 +2428,7 @@ impl PrototypeApp {
                             if ui
                                 .selectable_label(
                                     tab.view.current_page == page_index,
-                                    format!("Page {}", page_index + 1),
+                                    format!("{}ページ", page_index + 1),
                                 )
                                 .clicked()
                             {
@@ -2383,7 +2446,7 @@ impl PrototypeApp {
         egui::CentralPanel::default().show(root_ui, |ui| {
             let Some(index) = self.active_index() else {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Drop one or more PDF files into this window");
+                    ui.label("PDFをこのウィンドウへドロップしてください");
                 });
                 return;
             };
@@ -2398,7 +2461,7 @@ impl PrototypeApp {
                         self.documents[index]
                             .error
                             .as_deref()
-                            .unwrap_or("The PDF worker stopped"),
+                            .unwrap_or("PDF文書ワーカーが停止しました"),
                     );
                 });
                 return;
@@ -3068,6 +3131,7 @@ impl DocumentTab {
             edit_history: Vec::new(),
             undo_in_flight: false,
             save_in_flight: false,
+            print_in_flight: false,
             thumbnails: HashMap::new(),
             pending_thumbnails: HashSet::new(),
             failed_thumbnails: HashSet::new(),
@@ -3103,6 +3167,10 @@ impl DocumentTab {
 
     fn is_saving(&self) -> bool {
         document_save_blocks_close(self.save_in_flight)
+    }
+
+    fn is_printing(&self) -> bool {
+        self.print_in_flight
     }
 
     fn is_suspendable(&self) -> bool {

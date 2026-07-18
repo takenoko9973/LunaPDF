@@ -37,6 +37,8 @@ pub(crate) enum DocumentCommand {
         generation: u64,
     },
     LoadThumbnail(ThumbnailRequest),
+    #[cfg(windows)]
+    Print,
     Save,
     Shutdown,
 }
@@ -65,6 +67,10 @@ pub(crate) enum DocumentEvent {
         request: ThumbnailRequest,
         message: String,
     },
+    #[cfg(windows)]
+    PrintCompleted,
+    #[cfg(windows)]
+    PrintCancelled,
     Status(String),
     Failed {
         operation: &'static str,
@@ -412,6 +418,18 @@ fn run_worker(
                     });
                 }
             },
+            #[cfg(windows)]
+            DocumentCommand::Print => {
+                match crate::pdf::windows_print::print_document(&mut backend) {
+                    Ok(crate::pdf::windows_print::PrintOutcome::Completed) => {
+                        let _ = event_sender.send(DocumentEvent::PrintCompleted);
+                    }
+                    Ok(crate::pdf::windows_print::PrintOutcome::Cancelled) => {
+                        let _ = event_sender.send(DocumentEvent::PrintCancelled);
+                    }
+                    Err(error) => send_failure(&event_sender, "print", error),
+                }
+            }
             DocumentCommand::Save => match backend.save() {
                 Ok(highlight_count) => {
                     let _ = event_sender.send(DocumentEvent::Status(format!(
