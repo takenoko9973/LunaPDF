@@ -1,6 +1,7 @@
 mod app;
 mod domain;
 mod pdf;
+mod persistence;
 mod render;
 mod ui;
 
@@ -10,12 +11,14 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::app::PrototypeApp;
+use crate::persistence::session_store::SessionStore;
 
 /// Starts LunaPDF with zero or more PDF paths supplied on the command line.
 ///
 /// Additional documents can be opened by dropping PDF files onto the window.
 fn main() -> Result<()> {
     let pdf_paths = pdf_paths_from_args();
+    let session_store = SessionStore::for_current_user()?;
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
@@ -28,7 +31,11 @@ fn main() -> Result<()> {
         "LunaPDF",
         native_options,
         Box::new(move |creation_context| {
-            Ok(Box::new(PrototypeApp::new(creation_context, pdf_paths)))
+            Ok(Box::new(PrototypeApp::new(
+                creation_context,
+                pdf_paths,
+                session_store,
+            )))
         }),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=LunaPDF
+Comment=View and highlight PDF documents
+TryExec=lunapdf
+Exec=lunapdf %F
+Terminal=false
+MimeType=application/pdf;
+Categories=Office;Viewer;
+Keywords=PDF;Viewer;Highlight;

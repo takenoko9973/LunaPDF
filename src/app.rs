@@ -16,8 +16,13 @@ use crate::domain::document::{
 use crate::domain::selection::{
     PagePoint, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
 };
+use crate::domain::session::{
+    DisplayMode as SessionDisplayMode, SessionState, SessionTab, SessionView,
+    SidebarTab as SessionSidebarTab, ZoomMode as SessionZoomMode,
+};
 use crate::domain::tabs::{OpenTabResult, TabState};
 use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService};
+use crate::persistence::session_store::SessionStore;
 use crate::render::cache::WeightedLruCache;
 use crate::render::layout::{ContinuousLayout, PAGE_GAP, PageAnchor};
 use crate::render::tiles::TileGrid;
@@ -59,7 +64,11 @@ pub(crate) struct PrototypeApp {
     approved_window_documents: HashSet<PathBuf>,
     allow_window_close: bool,
     window_close_pending: bool,
+    session_close_failure: Option<String>,
     saved_tab_to_close: Option<PathBuf>,
+    session_store: SessionStore,
+    restore_enabled: bool,
+    session_restore_progress: Option<SessionRestoreProgress>,
     next_document_id: u64,
     activity_sequence: u64,
     sidebar_open: bool,
@@ -94,6 +103,8 @@ struct DocumentTab {
     thumbnail_generation: u64,
     search: SearchState,
     view: ViewState,
+    restoring_from_session: bool,
+    select_after_restore: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +183,34 @@ enum CloseDecision {
     Cancel,
 }
 
+#[derive(Clone, Copy)]
+enum SessionCloseDecision {
+    Retry,
+    ExitWithoutSession,
+    Cancel,
+}
+
+enum OpenIntent {
+    User,
+    Restored {
+        view: SessionView,
+        select_after_open: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum OpenDocumentResult {
+    Pending,
+    Existing(usize),
+}
+
+struct SessionRestoreProgress {
+    requested: usize,
+    pending: usize,
+    restored: usize,
+    skipped: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DisplayMode {
     Continuous,
@@ -203,18 +242,34 @@ impl PrototypeApp {
     pub(crate) fn new(
         _creation_context: &eframe::CreationContext<'_>,
         paths: Vec<PathBuf>,
+        session_store: SessionStore,
     ) -> Self {
+        Self::from_startup(paths, session_store)
+    }
+
+    fn from_startup(paths: Vec<PathBuf>, session_store: SessionStore) -> Self {
+        let (saved_session, session_load_error) = match session_store.load() {
+            Ok(session) => (session, None),
+            Err(error) => (None, Some(format!("session restore skipped: {error}"))),
+        };
+        let restore_enabled = saved_session
+            .as_ref()
+            .is_none_or(|session| session.restore_enabled);
         let mut app = Self {
             tabs: TabState::new(),
             documents: Vec::new(),
             viewport: PageViewport::default(),
             status: "Drop a PDF into the window to open it".to_owned(),
-            error: None,
+            error: session_load_error,
             close_confirmation: None,
             approved_window_documents: HashSet::new(),
             allow_window_close: false,
             window_close_pending: false,
+            session_close_failure: None,
             saved_tab_to_close: None,
+            session_store,
+            restore_enabled,
+            session_restore_progress: None,
             next_document_id: 1,
             activity_sequence: 0,
             sidebar_open: false,
@@ -222,16 +277,90 @@ impl PrototypeApp {
             gpu_lru: WeightedLruCache::new(GPU_TILE_BUDGET_BYTES),
             thumbnail_lru: WeightedLruCache::new(THUMBNAIL_BUDGET_BYTES),
         };
-        for path in paths {
-            app.open_document(path);
+        if paths.is_empty() && restore_enabled {
+            if let Some(session) = saved_session {
+                app.restore_session(session);
+            }
+        } else {
+            // Explicit command-line files take precedence so a full saved
+            // session cannot consume the tab cap before the requested PDFs.
+            for path in paths {
+                app.open_document(path);
+            }
         }
         app
     }
 
     fn open_document(&mut self, path: PathBuf) {
+        let _opened_index = self.open_document_with_intent(path, OpenIntent::User);
+    }
+
+    fn restore_session(&mut self, session: SessionState) {
+        self.sidebar_open = session.sidebar_open;
+        self.sidebar_tab = match session.sidebar_tab {
+            SessionSidebarTab::Outline => SidebarTab::Outline,
+            SessionSidebarTab::Thumbnails => SidebarTab::Thumbnails,
+        };
+
+        let saved_tab_count = session.tabs.len();
+        let saved_selection = session.selected_tab;
+        let mut restored_selection = None;
+        let mut pending_count = 0;
+        let mut restored_count = 0;
+        let mut skipped_count = 0;
+        for (saved_index, tab) in session.tabs.into_iter().enumerate() {
+            let should_select = saved_selection == Some(saved_index);
+            let opened = self.open_document_with_intent(
+                tab.path,
+                OpenIntent::Restored {
+                    view: tab.view,
+                    select_after_open: should_select,
+                },
+            );
+            match opened {
+                Some(OpenDocumentResult::Pending) => pending_count += 1,
+                Some(OpenDocumentResult::Existing(index)) if should_select => {
+                    restored_selection = Some(index);
+                    restored_count += 1;
+                }
+                Some(OpenDocumentResult::Existing(_)) => restored_count += 1,
+                None => skipped_count += 1,
+            }
+        }
+
+        if let Some(index) = restored_selection {
+            self.select_tab(index);
+        }
+        let progress = SessionRestoreProgress {
+            requested: saved_tab_count,
+            pending: pending_count,
+            restored: restored_count,
+            skipped: skipped_count,
+        };
+        self.status = progress.status();
+        if progress.pending > 0 {
+            self.session_restore_progress = Some(progress);
+        }
+    }
+
+    fn open_document_with_intent(
+        &mut self,
+        path: PathBuf,
+        intent: OpenIntent,
+    ) -> Option<OpenDocumentResult> {
+        let report_to_user = matches!(&intent, OpenIntent::User);
+        let (restored_view, select_after_restore) = match intent {
+            OpenIntent::User => (None, false),
+            OpenIntent::Restored {
+                view,
+                select_after_open,
+            } => (Some(view), select_after_open),
+        };
         if !is_pdf_path(&path) {
-            self.error = Some(format!("not a PDF file: {}", path.display()));
-            return;
+            if report_to_user {
+                self.error = Some(format!("not a PDF file: {}", path.display()));
+            }
+            return None;
         }
 
         let previously_active = self.active_index();
@@ -248,26 +377,42 @@ impl PrototypeApp {
                     document_id,
                     canonical_path,
                     activity_sequence,
+                    restored_view,
+                    select_after_restore,
                 ));
                 self.activate_document(index, previously_active);
-                self.status = format!("Opening {}…", path.display());
-                self.error = None;
+                if report_to_user {
+                    self.status = format!("Opening {}…", path.display());
+                    self.error = None;
+                }
+                Some(OpenDocumentResult::Pending)
             }
             Ok(OpenTabResult::SelectedExisting(index)) => {
                 self.activate_document(index, previously_active);
-                self.status = format!("Selected existing tab: {}", path.display());
-                self.error = None;
+                if report_to_user {
+                    self.status = format!("Selected existing tab: {}", path.display());
+                    self.error = None;
+                }
+                Some(OpenDocumentResult::Existing(index))
             }
             Ok(OpenTabResult::LimitReached) => {
-                self.error = Some("tab limit reached (20); no existing tab was closed".to_owned());
+                if report_to_user {
+                    self.error =
+                        Some("tab limit reached (20); no existing tab was closed".to_owned());
+                }
+                None
             }
             Err(error) => {
-                self.error = Some(format!("open {}: {error}", path.display()));
+                if report_to_user {
+                    self.error = Some(format!("open {}: {error}", path.display()));
+                }
+                None
             }
         }
     }
 
     fn receive_document_events(&mut self, context: &egui::Context) {
+        let mut failed_restored_paths = Vec::new();
         for index in 0..self.documents.len() {
             while let Some(event) = self.documents[index]
                 .service
@@ -276,7 +421,14 @@ impl PrototypeApp {
             {
                 match event {
                     Ok(DocumentEvent::Opened(info)) => {
+                        let restored_open = self.documents[index].restoring_from_session;
+                        let select_after_restore = self.documents[index].select_after_restore;
+                        self.documents[index].restoring_from_session = false;
+                        self.documents[index].select_after_restore = false;
                         self.status = format!("Opened {}", info.path.display());
+                        self.documents[index]
+                            .view
+                            .clamp_to_page_count(info.page_bounds.len());
                         self.documents[index].state = if info.dirty {
                             DocumentState::ReadyDirty
                         } else {
@@ -294,6 +446,12 @@ impl PrototypeApp {
                             && !self.documents[index].search.query.trim().is_empty()
                         {
                             self.begin_search(index);
+                        }
+                        if restored_open {
+                            if select_after_restore {
+                                self.select_tab(index);
+                            }
+                            self.finish_session_restore(true);
                         }
                     }
                     Ok(DocumentEvent::DocumentChanged(info)) => {
@@ -521,6 +679,14 @@ impl PrototypeApp {
                         self.documents[index].error = None;
                     }
                     Ok(DocumentEvent::Failed { operation, message }) => {
+                        if operation == "open" && self.documents[index].restoring_from_session {
+                            // The tab vector cannot be shifted while its event
+                            // queues are being traversed. Remove failed restore
+                            // tabs only after every current index is inspected.
+                            let path = self.tabs.tabs()[index].path().to_path_buf();
+                            failed_restored_paths.push(path);
+                            break;
+                        }
                         self.documents[index].error = Some(format!("{operation}: {message}"));
                         if operation == "highlight" {
                             let tab = &mut self.documents[index];
@@ -560,6 +726,11 @@ impl PrototypeApp {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
+                        if self.documents[index].restoring_from_session {
+                            let path = self.tabs.tabs()[index].path().to_path_buf();
+                            failed_restored_paths.push(path);
+                            break;
+                        }
                         let tab = &mut self.documents[index];
                         tab.save_in_flight = false;
                         if tab.state != DocumentState::Error {
@@ -578,8 +749,18 @@ impl PrototypeApp {
         if let Some(path) = self.saved_tab_to_close.take() {
             self.close_tab_by_path(&path);
         }
+        for path in failed_restored_paths {
+            if let Some(index) = self.tabs.tabs().iter().position(|tab| tab.path() == path) {
+                self.remove_tab_now(index);
+            } else {
+                // A concurrent close may have removed the tab after its worker
+                // reported failure; account for that completion exactly once.
+                self.finish_session_restore(false);
+            }
+        }
         if self.window_close_pending
             && self.close_confirmation.is_none()
+            && self.session_close_failure.is_none()
             && !self.documents.iter().any(DocumentTab::is_saving)
         {
             self.prompt_next_window_document(context);
@@ -836,16 +1017,29 @@ impl PrototypeApp {
     }
 
     fn close_tab_now(&mut self, index: usize) {
-        if self.tabs.close(index).is_some() {
-            for key in self.documents[index].tiles.keys() {
-                self.gpu_lru.remove(key);
-            }
-            for key in self.documents[index].thumbnails.keys() {
-                self.thumbnail_lru.remove(key);
-            }
-            self.documents.remove(index);
+        if self.remove_tab_now(index) {
             self.status = "Tab closed".to_owned();
         }
+    }
+
+    fn remove_tab_now(&mut self, index: usize) -> bool {
+        if self.tabs.close(index).is_none() {
+            return false;
+        }
+        let was_restoring = self.documents[index].restoring_from_session;
+        for key in self.documents[index].tiles.keys() {
+            self.gpu_lru.remove(key);
+        }
+        for key in self.documents[index].thumbnails.keys() {
+            self.thumbnail_lru.remove(key);
+        }
+        self.documents.remove(index);
+        if was_restoring {
+            // Closing an opening restore tab consumes its pending result; the
+            // worker is dropped with the tab, so no event can complete it later.
+            self.finish_session_restore(false);
+        }
+        true
     }
 
     fn remove_evicted_gpu_tiles(&mut self, evicted: Vec<(TileCacheKey, ())>) {
@@ -917,8 +1111,18 @@ impl PrototypeApp {
     }
 
     fn prompt_next_window_document(&mut self, context: &egui::Context) {
+        if self.session_close_failure.is_some() {
+            return;
+        }
         if self.documents.iter().any(DocumentTab::is_saving) {
             self.status = "Waiting for the current save before closing…".to_owned();
+            return;
+        }
+        if self.session_restore_progress.is_some() {
+            // Session state must not be captured until every restored open has
+            // reported success or failure; receive_document_events retries the
+            // close flow when the last pending result is consumed.
+            self.status = "Waiting for session restore before closing…".to_owned();
             return;
         }
 
@@ -941,10 +1145,58 @@ impl PrototypeApp {
             return;
         }
 
+        self.finalize_session_and_close(context);
+    }
+
+    fn finalize_session_and_close(&mut self, context: &egui::Context) {
+        let session = self.current_session();
+        if let Err(error) = self.session_store.save(&session) {
+            self.session_close_failure = Some(format!("session save failed: {error}"));
+            self.status = "Session could not be saved; choose how to continue".to_owned();
+            return;
+        }
+
         self.allow_window_close = true;
         self.window_close_pending = false;
         self.close_confirmation = None;
         context.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    fn finish_session_restore(&mut self, opened: bool) {
+        let progress = self
+            .session_restore_progress
+            .as_mut()
+            .expect("only pending restored tabs emit completion events");
+        progress.finish_one(opened);
+        let finished = progress.pending == 0;
+        self.status = progress.status();
+        if finished {
+            self.session_restore_progress = None;
+        }
+    }
+
+    fn current_session(&self) -> SessionState {
+        let mut session = SessionState {
+            restore_enabled: self.restore_enabled,
+            selected_tab: self.active_index(),
+            sidebar_open: self.sidebar_open,
+            sidebar_tab: match self.sidebar_tab {
+                SidebarTab::Outline => SessionSidebarTab::Outline,
+                SidebarTab::Thumbnails => SessionSidebarTab::Thumbnails,
+            },
+            ..SessionState::default()
+        };
+        session.tabs = self
+            .tabs
+            .tabs()
+            .iter()
+            .zip(&self.documents)
+            .map(|(tab, document)| SessionTab {
+                path: tab.path().to_path_buf(),
+                view: document.view.to_session(),
+            })
+            .collect();
+        session
     }
 
     fn finish_save_for_close(&mut self, path: &Path, context: &egui::Context) {
@@ -1062,6 +1314,67 @@ impl PrototypeApp {
             self.apply_close_decision(decision, context);
         } else if modal.should_close() && !save_in_flight {
             self.apply_close_decision(CloseDecision::Cancel, context);
+        }
+    }
+
+    fn session_close_failure_dialog(&mut self, context: &egui::Context) {
+        let Some(message) = self.session_close_failure.clone() else {
+            return;
+        };
+        let modal = egui::Modal::new(Id::new("session-save-close-failure")).show(context, |ui| {
+            ui.heading("Session could not be saved");
+            ui.label(&message);
+            ui.label("The PDF documents were not changed by this failure.");
+            ui.horizontal(|ui| {
+                let retry = ui
+                    .button("Retry")
+                    .clicked()
+                    .then_some(SessionCloseDecision::Retry);
+                let exit = ui
+                    .button("Exit without session")
+                    .clicked()
+                    .then_some(SessionCloseDecision::ExitWithoutSession);
+                let cancel = ui
+                    .button("Cancel")
+                    .clicked()
+                    .then_some(SessionCloseDecision::Cancel);
+                retry.or(exit).or(cancel)
+            })
+            .inner
+        });
+
+        let decision = modal
+            .inner
+            .or_else(|| modal.should_close().then_some(SessionCloseDecision::Cancel));
+        if let Some(decision) = decision {
+            self.apply_session_close_decision(decision, message, context);
+        }
+    }
+
+    fn apply_session_close_decision(
+        &mut self,
+        decision: SessionCloseDecision,
+        message: String,
+        context: &egui::Context,
+    ) {
+        self.session_close_failure = None;
+        match decision {
+            SessionCloseDecision::Retry => self.prompt_next_window_document(context),
+            SessionCloseDecision::ExitWithoutSession => {
+                // This explicit choice is the only path that permits shutdown
+                // without the atomic session update required by normal close.
+                self.allow_window_close = true;
+                self.window_close_pending = false;
+                self.close_confirmation = None;
+                context.send_viewport_cmd(ViewportCommand::Close);
+            }
+            SessionCloseDecision::Cancel => {
+                self.approved_window_documents.clear();
+                self.allow_window_close = false;
+                self.window_close_pending = false;
+                self.error = Some(message);
+                self.status = "Close canceled".to_owned();
+            }
         }
     }
 
@@ -1218,6 +1531,9 @@ impl PrototypeApp {
         let mut search_navigation = None;
         let mut close_search = false;
         egui::Panel::top("toolbar").show(root_ui, |ui| {
+            ui.checkbox(&mut self.restore_enabled, "Restore previous session")
+                .on_hover_text("Restore tabs only when LunaPDF starts without PDF arguments");
+            ui.separator();
             let Some(index) = self.active_index() else {
                 ui.label("Drop PDF files here (maximum 20 tabs)");
                 return;
@@ -2061,8 +2377,41 @@ fn paint_page_tiles(
     }
 }
 
+impl SessionRestoreProgress {
+    fn finish_one(&mut self, opened: bool) {
+        self.pending = self
+            .pending
+            .checked_sub(1)
+            .expect("a restore result must correspond to one pending tab");
+        if opened {
+            self.restored += 1;
+        } else {
+            self.skipped += 1;
+        }
+    }
+
+    fn status(&self) -> String {
+        if self.pending > 0 {
+            let completed = self.restored + self.skipped;
+            format!("Restoring session: {completed}/{} checked", self.requested)
+        } else {
+            format!(
+                "Restored {} tabs; skipped {} unavailable files",
+                self.restored, self.skipped
+            )
+        }
+    }
+}
+
 impl DocumentTab {
-    fn new(document_id: u64, path: PathBuf, last_selected_sequence: u64) -> Self {
+    fn new(
+        document_id: u64,
+        path: PathBuf,
+        last_selected_sequence: u64,
+        restored_view: Option<SessionView>,
+        select_after_restore: bool,
+    ) -> Self {
+        let restoring_from_session = restored_view.is_some();
         Self {
             document_id,
             service: Some(DocumentService::spawn(path)),
@@ -2088,18 +2437,9 @@ impl DocumentTab {
             failed_thumbnails: HashSet::new(),
             thumbnail_generation: 1,
             search: SearchState::default(),
-            view: ViewState {
-                display_mode: DisplayMode::Continuous,
-                zoom_mode: ZoomMode::FitWidth,
-                zoom: 1.0,
-                current_page: 0,
-                scroll_to_page: Some(0),
-                center_anchor: None,
-                restore_anchor: None,
-                single_center_anchor: None,
-                restore_single_anchor: None,
-                generation: 1,
-            },
+            view: restored_view.map_or_else(ViewState::new, ViewState::from_session),
+            restoring_from_session,
+            select_after_restore,
         }
     }
 
@@ -2335,6 +2675,119 @@ impl DocumentTab {
 }
 
 impl ViewState {
+    fn new() -> Self {
+        Self {
+            display_mode: DisplayMode::Continuous,
+            zoom_mode: ZoomMode::FitWidth,
+            zoom: 1.0,
+            current_page: 0,
+            scroll_to_page: Some(0),
+            center_anchor: None,
+            restore_anchor: None,
+            single_center_anchor: None,
+            restore_single_anchor: None,
+            generation: 1,
+        }
+    }
+
+    fn from_session(saved: SessionView) -> Self {
+        let display_mode = match saved.display {
+            SessionDisplayMode::Continuous => DisplayMode::Continuous,
+            SessionDisplayMode::SinglePage => DisplayMode::SinglePage,
+        };
+        let zoom_mode = match saved.zoom_mode {
+            SessionZoomMode::Fixed => ZoomMode::Fixed,
+            SessionZoomMode::FitWidth => ZoomMode::FitWidth,
+            SessionZoomMode::FitPage => ZoomMode::FitPage,
+        };
+        let page_anchor = PageAnchor {
+            page_index: saved.page_index,
+            page_x_fraction: saved.page_x,
+            page_y_fraction: saved.page_y,
+        };
+        let single_anchor = Vec2::new(saved.page_x, saved.page_y);
+
+        Self {
+            display_mode,
+            zoom_mode,
+            zoom: saved.zoom,
+            current_page: saved.page_index,
+            scroll_to_page: None,
+            center_anchor: (display_mode == DisplayMode::Continuous).then_some(page_anchor),
+            restore_anchor: (display_mode == DisplayMode::Continuous).then_some(page_anchor),
+            single_center_anchor: (display_mode == DisplayMode::SinglePage)
+                .then_some(single_anchor),
+            restore_single_anchor: (display_mode == DisplayMode::SinglePage)
+                .then_some(single_anchor),
+            generation: 1,
+        }
+    }
+
+    fn to_session(&self) -> SessionView {
+        let (page_index, page_x, page_y) = match self.display_mode {
+            DisplayMode::Continuous => {
+                // A queued page jump has not updated the scroll area's center
+                // yet, so it must supersede the previous frame's anchor.
+                let anchor = self
+                    .scroll_to_page
+                    .map(|page_index| PageAnchor {
+                        page_index,
+                        page_x_fraction: 0.5,
+                        page_y_fraction: 0.5,
+                    })
+                    .or(self.center_anchor)
+                    .or(self.restore_anchor)
+                    .unwrap_or(PageAnchor {
+                        page_index: self.current_page,
+                        page_x_fraction: 0.5,
+                        page_y_fraction: 0.5,
+                    });
+                (
+                    anchor.page_index,
+                    anchor.page_x_fraction,
+                    anchor.page_y_fraction,
+                )
+            }
+            DisplayMode::SinglePage => {
+                let anchor = self
+                    .single_center_anchor
+                    .or(self.restore_single_anchor)
+                    .unwrap_or(Vec2::splat(0.5));
+                (self.current_page, anchor.x, anchor.y)
+            }
+        };
+
+        SessionView {
+            page_index,
+            page_x,
+            page_y,
+            display: match self.display_mode {
+                DisplayMode::Continuous => SessionDisplayMode::Continuous,
+                DisplayMode::SinglePage => SessionDisplayMode::SinglePage,
+            },
+            zoom_mode: match self.zoom_mode {
+                ZoomMode::Fixed => SessionZoomMode::Fixed,
+                ZoomMode::FitWidth => SessionZoomMode::FitWidth,
+                ZoomMode::FitPage => SessionZoomMode::FitPage,
+            },
+            zoom: self.zoom,
+        }
+    }
+
+    fn clamp_to_page_count(&mut self, page_count: usize) {
+        let last_page = page_count.saturating_sub(1);
+        self.current_page = self.current_page.min(last_page);
+        self.scroll_to_page = self.scroll_to_page.map(|page| page.min(last_page));
+        for anchor in [&mut self.center_anchor, &mut self.restore_anchor]
+            .into_iter()
+            .flatten()
+        {
+            // Session positions are captured before the next open knows the
+            // page count; a shorter replacement PDF must stay in bounds.
+            anchor.page_index = anchor.page_index.min(last_page);
+        }
+    }
+
     /// Transfers the centered PDF coordinate between the two display modes.
     fn switch_display_mode(&mut self, mode: DisplayMode) -> bool {
         if self.display_mode == mode {
@@ -2389,6 +2842,7 @@ impl eframe::App for PrototypeApp {
         self.sidebar_panel(ui);
         self.central_panel(ui);
         self.close_confirmation_dialog(ui.ctx());
+        self.session_close_failure_dialog(ui.ctx());
     }
 }
 
@@ -2553,6 +3007,44 @@ fn format_memory(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mupdf::Size;
+    use mupdf::pdf::PdfDocument;
+
+    fn write_blank_pdf(path: &Path) {
+        let path_text = path.to_str().unwrap();
+        let mut document = PdfDocument::new();
+        let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+        document.save(path_text).unwrap();
+    }
+
+    fn saved_tab(path: PathBuf, page_index: usize) -> SessionTab {
+        SessionTab {
+            path,
+            view: SessionView {
+                page_index,
+                page_x: 0.5,
+                page_y: 0.5,
+                display: SessionDisplayMode::Continuous,
+                zoom_mode: SessionZoomMode::FitWidth,
+                zoom: 1.0,
+            },
+        }
+    }
+
+    fn finish_async_session_restore(app: &mut PrototypeApp) {
+        let context = egui::Context::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.session_restore_progress.is_some() && std::time::Instant::now() < deadline {
+            app.receive_document_events(&context);
+            if app.session_restore_progress.is_some() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            app.session_restore_progress.is_none(),
+            "document workers did not finish session restoration before the test deadline"
+        );
+    }
 
     #[test]
     fn render_result_requires_active_tab_and_current_document_state() {
@@ -2815,5 +3307,206 @@ mod tests {
         retain_visible_text_failures(&mut failed, &mut error, &HashSet::new());
 
         assert_eq!(error.as_deref(), Some("document save: permission denied"));
+    }
+
+    #[test]
+    fn continuous_session_view_restores_anchor_and_clamps_shorter_document() {
+        let saved = SessionView {
+            page_index: 9,
+            page_x: 0.25,
+            page_y: 0.75,
+            display: SessionDisplayMode::Continuous,
+            zoom_mode: SessionZoomMode::Fixed,
+            zoom: 1.5,
+        };
+        let mut view = ViewState::from_session(saved);
+
+        view.clamp_to_page_count(4);
+        let restored = view.to_session();
+
+        assert_eq!(restored.page_index, 3);
+        assert_eq!(restored.page_x, 0.25);
+        assert_eq!(restored.page_y, 0.75);
+        assert_eq!(restored.display, SessionDisplayMode::Continuous);
+        assert_eq!(restored.zoom_mode, SessionZoomMode::Fixed);
+        assert_eq!(restored.zoom, 1.5);
+    }
+
+    #[test]
+    fn single_page_session_view_preserves_fit_mode_and_two_axis_anchor() {
+        let saved = SessionView {
+            page_index: 6,
+            page_x: 0.2,
+            page_y: 0.8,
+            display: SessionDisplayMode::SinglePage,
+            zoom_mode: SessionZoomMode::FitPage,
+            zoom: 0.75,
+        };
+
+        let restored = ViewState::from_session(saved).to_session();
+
+        assert_eq!(restored.page_index, 6);
+        assert_eq!(restored.page_x, 0.2);
+        assert_eq!(restored.page_y, 0.8);
+        assert_eq!(restored.display, SessionDisplayMode::SinglePage);
+        assert_eq!(restored.zoom_mode, SessionZoomMode::FitPage);
+        assert_eq!(restored.zoom, 0.75);
+    }
+
+    #[test]
+    fn startup_restores_twenty_tabs_in_order_and_selects_saved_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = (0..20)
+            .map(|index| {
+                let path = directory.path().join(format!("{index:02}.pdf"));
+                write_blank_pdf(&path);
+                std::fs::canonicalize(path).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let state = SessionState {
+            selected_tab: Some(12),
+            tabs: paths
+                .iter()
+                .cloned()
+                .map(|path| saved_tab(path, 0))
+                .collect(),
+            ..SessionState::default()
+        };
+        let session_path = directory.path().join("session.json");
+        SessionStore::new(session_path.clone())
+            .save(&state)
+            .unwrap();
+
+        let mut app = PrototypeApp::from_startup(Vec::new(), SessionStore::new(session_path));
+        finish_async_session_restore(&mut app);
+
+        let restored_paths = app
+            .tabs
+            .tabs()
+            .iter()
+            .map(|tab| tab.path().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(restored_paths, paths);
+        assert_eq!(app.active_index(), Some(12));
+    }
+
+    #[test]
+    fn failed_initial_restore_is_removed_and_remaining_tab_stays_selected() {
+        let directory = tempfile::tempdir().unwrap();
+        let inaccessible = directory.path().join("unreadable.pdf");
+        std::fs::write(&inaccessible, b"not a PDF").unwrap();
+        let valid = directory.path().join("valid.pdf");
+        write_blank_pdf(&valid);
+        let inaccessible = std::fs::canonicalize(inaccessible).unwrap();
+        let valid = std::fs::canonicalize(valid).unwrap();
+        let state = SessionState {
+            selected_tab: Some(0),
+            tabs: vec![saved_tab(inaccessible, 0), saved_tab(valid.clone(), 0)],
+            ..SessionState::default()
+        };
+        let session_path = directory.path().join("session.json");
+        SessionStore::new(session_path.clone())
+            .save(&state)
+            .unwrap();
+
+        let mut app = PrototypeApp::from_startup(Vec::new(), SessionStore::new(session_path));
+        assert!(app.session_restore_progress.is_some());
+        finish_async_session_restore(&mut app);
+
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(app.tabs.tabs()[0].path(), valid);
+        assert_eq!(app.active_index(), Some(0));
+    }
+
+    #[test]
+    fn closing_restored_tab_consumes_pending_restore_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.pdf");
+        let second = directory.path().join("second.pdf");
+        write_blank_pdf(&first);
+        write_blank_pdf(&second);
+        let state = SessionState {
+            selected_tab: Some(0),
+            tabs: vec![
+                saved_tab(std::fs::canonicalize(first).unwrap(), 0),
+                saved_tab(std::fs::canonicalize(second).unwrap(), 0),
+            ],
+            ..SessionState::default()
+        };
+        let session_path = directory.path().join("session.json");
+        SessionStore::new(session_path.clone())
+            .save(&state)
+            .unwrap();
+
+        let mut app = PrototypeApp::from_startup(Vec::new(), SessionStore::new(session_path));
+        assert_eq!(
+            app.session_restore_progress.as_ref().map(|p| p.pending),
+            Some(2)
+        );
+        app.close_tab(0);
+
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(
+            app.session_restore_progress.as_ref().map(|p| p.pending),
+            Some(1)
+        );
+        finish_async_session_restore(&mut app);
+    }
+
+    #[test]
+    fn window_close_waits_for_pending_session_restore_before_saving() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("restore.pdf");
+        write_blank_pdf(&path);
+        let state = SessionState {
+            restore_enabled: true,
+            selected_tab: Some(0),
+            tabs: vec![saved_tab(std::fs::canonicalize(path).unwrap(), 0)],
+            ..SessionState::default()
+        };
+        let session_path = directory.path().join("session.json");
+        SessionStore::new(session_path.clone())
+            .save(&state)
+            .unwrap();
+
+        let mut app =
+            PrototypeApp::from_startup(Vec::new(), SessionStore::new(session_path.clone()));
+        assert!(app.session_restore_progress.is_some());
+        app.restore_enabled = false;
+        app.window_close_pending = true;
+        app.prompt_next_window_document(&egui::Context::default());
+
+        let saved = SessionStore::new(session_path).load().unwrap().unwrap();
+        assert!(saved.restore_enabled);
+        assert!(app.window_close_pending);
+        assert!(!app.allow_window_close);
+        finish_async_session_restore(&mut app);
+    }
+
+    #[test]
+    fn explicit_cli_pdf_takes_precedence_over_saved_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = directory.path().join("saved.pdf");
+        let explicit = directory.path().join("explicit.pdf");
+        write_blank_pdf(&saved);
+        write_blank_pdf(&explicit);
+        let saved = std::fs::canonicalize(saved).unwrap();
+        let explicit = std::fs::canonicalize(explicit).unwrap();
+        let state = SessionState {
+            selected_tab: Some(0),
+            tabs: vec![saved_tab(saved, 0)],
+            ..SessionState::default()
+        };
+        let session_path = directory.path().join("session.json");
+        SessionStore::new(session_path.clone())
+            .save(&state)
+            .unwrap();
+
+        let app =
+            PrototypeApp::from_startup(vec![explicit.clone()], SessionStore::new(session_path));
+
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(app.tabs.tabs()[0].path(), explicit);
+        assert!(app.session_restore_progress.is_none());
     }
 }
