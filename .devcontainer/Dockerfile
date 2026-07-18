@@ -26,6 +26,10 @@ RUN apt-get update; \
         libgl1-mesa-dev \
         libegl1-mesa-dev \
         mesa-utils \
+        qpdf \
+        desktop-file-utils \
+        poppler-utils \
+        x11-utils \
         mingw-w64 \
         ; \
     apt-get clean; \

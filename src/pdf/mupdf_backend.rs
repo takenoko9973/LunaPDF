@@ -1323,6 +1323,76 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes a PDF to LUNAPDF_ACCEPTANCE_OUTPUT for external inspection"]
+    fn exports_highlight_fixture_for_external_viewers() {
+        let output = PathBuf::from(
+            std::env::var_os("LUNAPDF_ACCEPTANCE_OUTPUT")
+                .expect("LUNAPDF_ACCEPTANCE_OUTPUT must name the output PDF"),
+        );
+        // Requiring an absolute destination prevents an explicit acceptance run
+        // from leaving an untracked artifact at a shell-dependent relative path.
+        assert!(
+            output.is_absolute(),
+            "LUNAPDF_ACCEPTANCE_OUTPUT must be an absolute path"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("external-viewer-highlight.pdf");
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(400.0, 200.0)).unwrap();
+            let mut shape = Shape::new(&mut page).unwrap();
+            // Keeping the text away from page edges makes the annotation easy to
+            // identify without depending on a viewer's page-margin presentation.
+            shape
+                .insert_text(
+                    Point::new(40.0, 100.0),
+                    "LunaPDF external viewer highlight",
+                    &TextOptions::default(),
+                )
+                .unwrap()
+                .commit(&mut document, true)
+                .unwrap();
+            document.save(source.to_str().unwrap()).unwrap();
+        }
+
+        let mut backend = MuPdfBackend::open(source.clone()).unwrap();
+        let text_snapshot = backend
+            .text_snapshot(TextSnapshotRequest {
+                page_index: 0,
+                expected_revision: 0,
+            })
+            .unwrap()
+            .unwrap();
+        let first = text_snapshot.glyphs.first().unwrap().quad.bounds();
+        let last = text_snapshot.glyphs.last().unwrap().quad.bounds();
+        let selection = backend
+            .select(
+                0,
+                1,
+                PagePoint::new((first.0 + first.2) / 2.0, (first.1 + first.3) / 2.0),
+                PagePoint::new((last.0 + last.2) / 2.0, (last.1 + last.3) / 2.0),
+            )
+            .unwrap();
+        assert!(!selection.quads.is_empty());
+        backend.create_highlight(0, &selection.quads).unwrap();
+        assert_eq!(backend.save().unwrap(), 1);
+        drop(backend);
+
+        let output_directory = output.parent().expect("absolute paths have a parent");
+        fs::create_dir_all(output_directory).unwrap();
+        // create_new is the non-overwrite guarantee: a separate process cannot
+        // replace the existence check between validation and the final copy.
+        let mut source_file = fs::File::open(source).unwrap();
+        let mut output_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)
+            .unwrap();
+        std::io::copy(&mut source_file, &mut output_file).unwrap();
+        output_file.sync_all().unwrap();
+    }
+
+    #[test]
     fn redacted_pdf_accepts_highlight_and_is_saved_by_full_rewrite() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("redacted.pdf");
