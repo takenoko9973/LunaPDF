@@ -1,0 +1,13 @@
+{
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "plantuml.render": "PlantUMLServer",
+                "plantuml.server": "http://plantuml-server:8080"
+            },
+            "extensions": [
+                "jebbs.plantuml"
+            ]
+        }
+    }
+}

@@ -1,0 +1,17 @@
+services:
+    workspace:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        init: true
+        working_dir: /workspace
+        command: /bin/sh -c "while sleep 1000; do :; done"
+        volumes:
+            - ..:/workspace
+            - cargo-target:/workspace/target
+            - cargo-registry:/usr/local/cargo/registry
+        tty: true
+
+volumes:
+    cargo-target:
+    cargo-registry:

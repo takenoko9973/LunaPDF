@@ -1,0 +1,59 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "cargo",
+            "command": "run",
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "label": "rust: run linux"
+        },
+        {
+            "type": "cargo",
+            "command": "run",
+            "args": [
+                "--release"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "label": "rust: run linux release"
+        },
+        {
+            "type": "cargo",
+            "command": "build",
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "args": [
+                "--release",
+                "--target=x86_64-pc-windows-gnu"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "label": "rust: cross compile for windows"
+        },
+        {
+            "type": "cargo",
+            "command": "install-update",
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "args": [
+                "-a",
+            ],
+            "group": {
+                "kind": "none",
+                "isDefault": false
+            },
+            "label": "rust: update all cargo installed package"
+        }
+    ]
+}

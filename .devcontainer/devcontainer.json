@@ -1,0 +1,39 @@
+{
+    "name": "luna-pdf-viewer-devcontainer",
+    "dockerComposeFile": [
+        "compose.base.yml",
+        // Optional overlays:
+        "overlays/wlsg.compose.yml",
+        "overlays/plantuml.compose.yml"
+    ],
+    "service": "workspace",
+    "workspaceFolder": "/workspace",
+    "shutdownAction": "stopCompose",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "files.watcherExclude": {
+                    "**/target/**": true
+                },
+                "[rust]": {
+                    "editor.formatOnSave": true
+                },
+                "rust-analyzer.checkOnSave": true,
+                "rust-analyzer.check.command": "clippy",
+                "rust-analyzer.check.extraArgs": [
+                    "--",
+                    "-A",
+                    "clippy::needless_return"
+                ]
+            },
+            "extensions": [
+                "vadimcn.vscode-lldb",
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "donjayamanne.githistory",
+                "fill-labs.dependi",
+                "mhutchie.git-graph"
+            ]
+        }
+    }
+}
