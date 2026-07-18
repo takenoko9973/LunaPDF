@@ -143,11 +143,18 @@ pub(crate) struct OutlineItem {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct SearchMatch {
+    // One logical MuPDF hit can span lines and therefore own several Quads.
+    // Keeping the boundary lets Enter move once per hit instead of once per line.
+    pub(crate) quads: Vec<PageQuad>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct SearchPageResult {
     pub(crate) page_index: usize,
     pub(crate) generation: u64,
     pub(crate) revision: u64,
-    pub(crate) quads: Vec<PageQuad>,
+    pub(crate) matches: Vec<SearchMatch>,
     pub(crate) truncated: bool,
 }
 

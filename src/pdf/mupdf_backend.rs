@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
+#[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -13,16 +15,19 @@ use mupdf::pdf::{
     AnnotationQuadPoints, Encryption, PdfAnnotationType, PdfDocument, PdfWriteOptions, Permission,
     WidgetType,
 };
+use mupdf::text_page::SearchHitResponse;
 use mupdf::{
     Colorspace, Device, DisplayList, IRect, Matrix, Outline, Pixmap, Point, Quad, Rect,
     TextBlockContent, TextPage, TextPageFlags,
 };
 use tempfile::{Builder as TempFileBuilder, TempPath};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
 use crate::domain::document::{
     DocumentInfo, DocumentVersion, HighlightCapability, HighlightRequest, OutlineItem, PageRect,
-    RenderedThumbnail, RenderedTile, SearchPageResult, TILE_EDGE_PIXELS, ThumbnailRequest,
-    TileRequest, TileSpec,
+    RenderedThumbnail, RenderedTile, SearchMatch, SearchPageResult, TILE_EDGE_PIXELS,
+    ThumbnailRequest, TileRequest, TileSpec,
 };
 use crate::domain::selection::{
     GlyphSnapshot, PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
@@ -40,10 +45,9 @@ const SELECTION_QUAD_CAPACITY: usize = 4_096;
 // supported zoom range while still detecting a materially different Quad.
 const PDF_COORDINATE_TOLERANCE: f32 = 0.01;
 
-// The high-level search API requires a caller-provided Quad limit. 16,384
-// Quads bound one page snapshot near 512 KiB while covering dense papers; the
-// result explicitly reports saturation instead of pretending the count is full.
-const SEARCH_QUAD_CAPACITY: u32 = 16_384;
+// 16,384 Quads bound one page snapshot near 512 KiB while covering dense
+// papers. Logical hit boundaries are preserved within that byte-oriented cap.
+const SEARCH_QUAD_CAPACITY: usize = 16_384;
 
 pub(super) struct MuPdfBackend {
     path: PathBuf,
@@ -136,16 +140,42 @@ impl MuPdfBackend {
         ensure!(!query.is_empty(), "cannot search for an empty string");
         page_number(page_index, self.page_bounds.len())?;
         let revision = self.revision;
-        let quads = self
+        let text_page = self
             .display_list(page_index)?
-            .search(query, SEARCH_QUAD_CAPACITY)?;
-        let truncated = quads.len() == SEARCH_QUAD_CAPACITY as usize;
+            .to_text_page(TextPageFlags::empty())?;
+        struct PageSearchMatches {
+            matches: Vec<SearchMatch>,
+            quad_count: usize,
+            truncated: bool,
+        }
+        let mut result = PageSearchMatches {
+            matches: Vec::new(),
+            quad_count: 0,
+            truncated: false,
+        };
+        text_page.search_cb(query, &mut result, |result, quads| {
+            let Some(next_quad_count) = result.quad_count.checked_add(quads.len()) else {
+                result.truncated = true;
+                return SearchHitResponse::AbortSearch;
+            };
+            if next_quad_count > SEARCH_QUAD_CAPACITY {
+                // Never split a multi-line hit at the memory boundary. A partial
+                // hit would make navigation and the painted result disagree.
+                result.truncated = true;
+                return SearchHitResponse::AbortSearch;
+            }
+            result.quad_count = next_quad_count;
+            result.matches.push(SearchMatch {
+                quads: quads.iter().map(page_quad_from_mupdf).collect(),
+            });
+            SearchHitResponse::ContinueSearch
+        })?;
         Ok(SearchPageResult {
             page_index,
             generation,
             revision,
-            quads: quads.iter().map(page_quad_from_mupdf).collect(),
-            truncated,
+            matches: result.matches,
+            truncated: result.truncated,
         })
     }
 
@@ -443,9 +473,6 @@ impl MuPdfBackend {
             .path
             .parent()
             .context("PDF path has no parent directory for atomic replacement")?;
-        let original_permissions = fs::metadata(&self.path)
-            .with_context(|| format!("failed to read PDF permissions: {}", self.path.display()))?
-            .permissions();
         let expected_highlights = highlight_count(&self.document)?;
         let expected_page_count = self.page_bounds.len();
         let named_temp = TempFileBuilder::new()
@@ -455,9 +482,7 @@ impl MuPdfBackend {
             .with_context(|| format!("failed to create temporary PDF in {}", parent.display()))?;
         let temp_path = named_temp.into_temp_path();
 
-        if let Err(error) = fs::set_permissions(&temp_path, original_permissions)
-            .with_context(|| format!("failed to preserve permissions on {}", temp_path.display()))
-        {
+        if let Err(error) = preserve_temp_permissions(&self.path, &temp_path) {
             return Err(cleanup_temp_after_error(temp_path, error));
         }
         let temp_name = match temp_path.to_str() {
@@ -607,6 +632,29 @@ fn persist_temp_if_current(
         return Err(cleanup_temp_after_error(temp_path, error));
     }
     release_original_handle();
+    replace_temp_file(temp_path, destination)
+}
+
+#[cfg(not(windows))]
+fn preserve_temp_permissions(source: &Path, temp_path: &Path) -> Result<()> {
+    let permissions = fs::metadata(source)
+        .with_context(|| format!("failed to read PDF permissions: {}", source.display()))?
+        .permissions();
+    fs::set_permissions(temp_path, permissions)
+        .with_context(|| format!("failed to preserve permissions on {}", temp_path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn preserve_temp_permissions(_source: &Path, _temp_path: &Path) -> Result<()> {
+    // ReplaceFileW merges the original file's DACL, attributes, encryption,
+    // compression, and named streams. Pre-copying Rust's readonly bit would be
+    // incomplete and tempfile::keep must normalize the replacement first.
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_temp_file(temp_path: TempPath, destination: &Path) -> Result<()> {
     if let Err(error) = temp_path.persist(destination) {
         let tempfile::PathPersistError { error, path } = error;
         return Err(cleanup_temp_after_error(
@@ -618,6 +666,74 @@ fn persist_temp_if_current(
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn replace_temp_file(temp_path: TempPath, destination: &Path) -> Result<()> {
+    let replacement = match temp_path.keep() {
+        Ok(path) => path,
+        Err(tempfile::PathPersistError { error, path }) => {
+            return Err(cleanup_temp_after_error(
+                path,
+                anyhow!("failed to prepare temporary PDF for replacement: {error}"),
+            ));
+        }
+    };
+    let destination_wide = match wide_path(destination) {
+        Ok(path) => path,
+        Err(error) => return cleanup_kept_temp_after_error(&replacement, error),
+    };
+    let replacement_wide = match wide_path(&replacement) {
+        Ok(path) => path,
+        Err(error) => return cleanup_kept_temp_after_error(&replacement, error),
+    };
+    // Passing no IGNORE_* flag is deliberate: a merge failure must abort
+    // instead of silently replacing the PDF with relaxed ACLs or attributes.
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced != 0 {
+        return Ok(());
+    }
+
+    let error = anyhow!(
+        "failed to atomically replace {} while preserving Windows metadata: {}",
+        destination.display(),
+        std::io::Error::last_os_error()
+    );
+    cleanup_kept_temp_after_error(&replacement, error)
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Result<Vec<u16>> {
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    ensure!(
+        !wide.contains(&0),
+        "Windows cannot replace a path containing an embedded NUL: {}",
+        path.display()
+    );
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn cleanup_kept_temp_after_error(path: &Path, error: anyhow::Error) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Err(error),
+        // ReplaceFileW can consume the replacement while still reporting a
+        // merge/move error. Missing temp cleanup must not hide that first error.
+        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => Err(error),
+        Err(cleanup_error) => Err(anyhow!(
+            "{error:#}; additionally failed to remove temporary PDF: {cleanup_error}"
+        )),
+    }
 }
 
 fn verify_saved_document(
@@ -993,6 +1109,10 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(windows)]
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, GetFileAttributesW, SetFileAttributesW,
+    };
 
     use mupdf::pdf::{Encryption, PdfObject};
     use mupdf::shape::{Shape, TextOptions};
@@ -1308,6 +1428,7 @@ mod tests {
         let error = backend.save().unwrap_err();
 
         assert!(error.to_string().contains("changed outside LunaPDF"));
+        assert!(backend.info().unwrap().dirty);
         assert_eq!(fs::read(path).unwrap(), external_bytes);
     }
 
@@ -1350,6 +1471,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("callback.pdf");
         write_blank_pdf_for_test(&path);
+        #[cfg(windows)]
+        let original_attributes = {
+            let path_wide = wide_path(&path).unwrap();
+            let attributes = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN;
+            assert_ne!(
+                unsafe { SetFileAttributesW(path_wide.as_ptr(), attributes) },
+                0
+            );
+            unsafe { GetFileAttributesW(path_wide.as_ptr()) }
+        };
         let expected_version = read_document_version(&path).unwrap();
         let named_temp = TempFileBuilder::new()
             .prefix(".lunapdf-")
@@ -1370,6 +1501,11 @@ mod tests {
                 .page_count()
                 .unwrap(),
             1
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            unsafe { GetFileAttributesW(wide_path(&path).unwrap().as_ptr()) },
+            original_attributes
         );
     }
 
@@ -1490,7 +1626,7 @@ mod tests {
             shape
                 .insert_text(
                     Point::new(50.0, 100.0),
-                    "Needle in the first page",
+                    "Needle in the first page and another Needle",
                     &TextOptions::default(),
                 )
                 .unwrap()
@@ -1548,7 +1684,7 @@ mod tests {
             .iter()
             .map(|glyph| glyph.character)
             .collect::<String>();
-        assert!(extracted.contains("Needle in the first page"));
+        assert!(extracted.contains("Needle in the first page and another Needle"));
         let first = text_snapshot.glyphs.first().unwrap().quad.bounds();
         let last = text_snapshot.glyphs.last().unwrap().quad.bounds();
         let selection = backend
@@ -1559,10 +1695,15 @@ mod tests {
                 PagePoint::new((last.0 + last.2) / 2.0, (last.1 + last.3) / 2.0),
             )
             .unwrap();
-        assert!(selection.text.contains("Needle in the first page"));
+        assert!(
+            selection
+                .text
+                .contains("Needle in the first page and another Needle")
+        );
         assert!(!selection.quads.is_empty());
         assert_eq!(search.generation, 7);
-        assert!(!search.quads.is_empty());
+        assert_eq!(search.matches.len(), 2);
+        assert!(search.matches.iter().all(|hit| !hit.quads.is_empty()));
         assert_eq!(thumbnail.generation, 9);
         assert!(thumbnail.pixel_width <= 160);
         assert!(thumbnail.pixel_height <= 220);

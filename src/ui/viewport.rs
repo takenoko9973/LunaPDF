@@ -1,6 +1,6 @@
 use eframe::egui::{Color32, PointerButton, Pos2, Rect, Sense, Shape, Stroke, TextureHandle, Ui};
 
-use crate::domain::document::{PageRect, RenderedTile};
+use crate::domain::document::{PageRect, RenderedTile, SearchMatch};
 use crate::domain::selection::{
     PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, selected_glyph_range, snap_to_glyph,
 };
@@ -30,21 +30,31 @@ impl PageViewport {
     }
 
     /// Paints search geometry without changing the logical text selection.
-    pub(crate) fn paint_search_quads(
+    pub(crate) fn paint_search_matches(
         ui: &Ui,
         screen_rect: Rect,
         bounds: PageRect,
-        quads: &[PageQuad],
+        matches: &[SearchMatch],
+        selected_match: Option<usize>,
     ) {
-        for quad in quads {
-            paint_quad(
-                ui,
-                screen_rect,
-                bounds,
-                *quad,
-                Color32::from_rgba_unmultiplied(80, 170, 255, 72),
-                Color32::from_rgb(35, 110, 210),
-            );
+        for (match_index, search_match) in matches.iter().enumerate() {
+            // A distinct color makes the result Enter selected visible while
+            // retaining every other hit as document-wide search context.
+            let selected = selected_match == Some(match_index);
+            let (fill, stroke) = if selected {
+                (
+                    Color32::from_rgba_unmultiplied(255, 185, 30, 96),
+                    Color32::from_rgb(220, 120, 0),
+                )
+            } else {
+                (
+                    Color32::from_rgba_unmultiplied(80, 170, 255, 72),
+                    Color32::from_rgb(35, 110, 210),
+                )
+            };
+            for quad in &search_match.quads {
+                paint_quad(ui, screen_rect, bounds, *quad, fill, stroke);
+            }
         }
     }
 

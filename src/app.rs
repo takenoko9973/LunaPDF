@@ -11,7 +11,7 @@ use eframe::egui::{
 
 use crate::domain::document::{
     DocumentInfo, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail, RenderedTile,
-    SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
+    SearchMatch, SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
 };
 use crate::domain::selection::{
     PagePoint, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
@@ -147,10 +147,17 @@ struct SearchState {
     open: bool,
     query: String,
     generation: u64,
-    pages: BTreeMap<usize, Vec<crate::domain::selection::PageQuad>>,
+    pages: BTreeMap<usize, Vec<SearchMatch>>,
+    selected: Option<SearchCursor>,
     completed_pages: usize,
     truncated: bool,
     in_progress: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SearchCursor {
+    page_index: usize,
+    match_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -861,6 +868,7 @@ impl PrototypeApp {
         let tab = &mut self.documents[index];
         tab.search.generation = generation;
         tab.search.pages.clear();
+        tab.search.selected = None;
         tab.search.completed_pages = 0;
         tab.search.truncated = false;
         tab.search.in_progress = true;
@@ -884,6 +892,7 @@ impl PrototypeApp {
         tab.search.generation = tab.search.generation.wrapping_add(1);
         let _queued = tab.send(DocumentCommand::SetSearchGeneration(tab.search.generation));
         tab.search.pages.clear();
+        tab.search.selected = None;
         tab.search.completed_pages = 0;
         tab.search.truncated = false;
         tab.search.in_progress = false;
@@ -894,14 +903,26 @@ impl PrototypeApp {
 
     fn navigate_search(&mut self, index: usize, forward: bool) {
         let current_page = self.documents[index].view.current_page;
-        let page = next_search_page(
-            self.documents[index].search.pages.keys().copied(),
+        let cursor = next_search_match(
+            &self.documents[index].search.pages,
+            self.documents[index].search.selected,
             current_page,
             forward,
         );
-        if let Some(page) = page {
-            self.documents[index].jump_to_page(page);
-            self.status = format!("Search result on page {}", page + 1);
+        if let Some(cursor) = cursor {
+            let anchor = search_match_anchor_for_cursor(&self.documents[index], cursor);
+            let ordinal = search_match_ordinal(&self.documents[index].search.pages, cursor);
+            let tab = &mut self.documents[index];
+            tab.search.selected = Some(cursor);
+            if let Some(anchor) = anchor {
+                tab.jump_to_search_match(anchor);
+            } else {
+                tab.jump_to_page(cursor.page_index);
+            }
+            self.status = ordinal.map_or_else(
+                || format!("Search result on page {}", cursor.page_index + 1),
+                |ordinal| format!("Search result {ordinal} on page {}", cursor.page_index + 1),
+            );
         }
     }
 
@@ -1079,8 +1100,8 @@ impl PrototypeApp {
         }
         tab.search.completed_pages = tab.search.completed_pages.saturating_add(1);
         tab.search.truncated |= result.truncated;
-        if !result.quads.is_empty() {
-            tab.search.pages.insert(result.page_index, result.quads);
+        if !result.matches.is_empty() {
+            tab.search.pages.insert(result.page_index, result.matches);
         }
         let page_count = tab.info.as_ref().map_or(0, |info| info.page_bounds.len());
         if tab.search.completed_pages >= page_count {
@@ -1628,14 +1649,18 @@ impl PrototypeApp {
                         let backwards = ui.input(|input| input.modifiers.shift);
                         search_navigation = Some(!backwards);
                     }
-                    let area_count = search.pages.values().map(Vec::len).sum::<usize>();
+                    let match_count = search.pages.values().map(Vec::len).sum::<usize>();
+                    let selected = search
+                        .selected
+                        .and_then(|cursor| search_match_ordinal(&search.pages, cursor));
+                    let count = selected.map_or_else(
+                        || format!("{match_count} matches"),
+                        |selected| format!("{selected}/{match_count} matches"),
+                    );
                     let progress = if search.in_progress {
-                        format!(
-                            "{area_count} areas · {}/{}",
-                            search.completed_pages, page_count
-                        )
+                        format!("{count} · {}/{}", search.completed_pages, page_count)
                     } else {
-                        format!("{area_count} areas")
+                        count
                     };
                     ui.label(progress);
                     if search.truncated {
@@ -1985,12 +2010,18 @@ impl PrototypeApp {
                     Vec2::new(placement.width, placement.height),
                 );
                 paint_page_tiles(ui, screen_rect, page_index, tab, gpu_lru);
-                if let Some(quads) = tab.search.pages.get(&page_index) {
-                    PageViewport::paint_search_quads(
+                if let Some(matches) = tab.search.pages.get(&page_index) {
+                    let selected_match = tab
+                        .search
+                        .selected
+                        .filter(|cursor| cursor.page_index == page_index)
+                        .map(|cursor| cursor.match_index);
+                    PageViewport::paint_search_matches(
                         ui,
                         screen_rect,
                         page_bounds[page_index],
-                        quads,
+                        matches,
+                        selected_match,
                     );
                 }
                 let response = ui
@@ -2076,8 +2107,19 @@ impl PrototypeApp {
             .unwrap_or_default();
             tab.prepare_tiles(requests);
             paint_page_tiles(ui, screen_rect, page_index, tab, gpu_lru);
-            if let Some(quads) = tab.search.pages.get(&page_index) {
-                PageViewport::paint_search_quads(ui, screen_rect, bounds, quads);
+            if let Some(matches) = tab.search.pages.get(&page_index) {
+                let selected_match = tab
+                    .search
+                    .selected
+                    .filter(|cursor| cursor.page_index == page_index)
+                    .map(|cursor| cursor.match_index);
+                PageViewport::paint_search_matches(
+                    ui,
+                    screen_rect,
+                    bounds,
+                    matches,
+                    selected_match,
+                );
             }
             completed_drag = ui
                 .scope_builder(UiBuilder::new().max_rect(screen_rect), |page_ui| {
@@ -2538,6 +2580,28 @@ impl DocumentTab {
         self.invalidate_rendering();
     }
 
+    fn jump_to_search_match(&mut self, anchor: PageAnchor) {
+        let page_count = self.info.as_ref().map_or(0, |info| info.page_bounds.len());
+        if anchor.page_index >= page_count {
+            return;
+        }
+        self.view.current_page = anchor.page_index;
+        match self.view.display_mode {
+            DisplayMode::Continuous => {
+                // Page-top scrolling would hide lower-page hits. Reuse the
+                // pending center-anchor path so the complete hit stays visible.
+                self.view.scroll_to_page = None;
+                self.view.restore_anchor = Some(anchor);
+            }
+            DisplayMode::SinglePage => {
+                let center = Vec2::new(anchor.page_x_fraction, anchor.page_y_fraction);
+                self.view.single_center_anchor = Some(center);
+                self.view.restore_single_anchor = Some(center);
+            }
+        }
+        self.invalidate_rendering();
+    }
+
     fn request_thumbnail(&mut self, page_index: usize, key: ThumbnailCacheKey) {
         if self.thumbnails.contains_key(&key)
             || self.pending_thumbnails.contains(&key)
@@ -2898,26 +2962,117 @@ fn search_page_order(current_page: usize, page_count: usize) -> Vec<usize> {
     pages
 }
 
-fn next_search_page(
-    pages: impl Iterator<Item = usize>,
+fn next_search_match(
+    pages: &BTreeMap<usize, Vec<SearchMatch>>,
+    selected: Option<SearchCursor>,
     current_page: usize,
     forward: bool,
-) -> Option<usize> {
-    let pages = pages.collect::<Vec<_>>();
+) -> Option<SearchCursor> {
+    let matches = pages
+        .iter()
+        .flat_map(|(page_index, matches)| {
+            (0..matches.len()).map(|match_index| SearchCursor {
+                page_index: *page_index,
+                match_index,
+            })
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return None;
+    }
+
+    if let Some(position) =
+        selected.and_then(|cursor| matches.iter().position(|candidate| *candidate == cursor))
+    {
+        // The selected logical hit is stable while later page results arrive;
+        // wrapping is based on its new ordered position, not a stale flat index.
+        let next = if forward {
+            (position + 1) % matches.len()
+        } else {
+            position.checked_sub(1).unwrap_or(matches.len() - 1)
+        };
+        return matches.get(next).copied();
+    }
+
     if forward {
-        pages
+        matches
             .iter()
             .copied()
-            .find(|page| *page > current_page)
-            .or_else(|| pages.first().copied())
+            .find(|cursor| cursor.page_index >= current_page)
+            .or_else(|| matches.first().copied())
     } else {
-        pages
+        matches
             .iter()
             .rev()
             .copied()
-            .find(|page| *page < current_page)
-            .or_else(|| pages.last().copied())
+            .find(|cursor| cursor.page_index <= current_page)
+            .or_else(|| matches.last().copied())
     }
+}
+
+fn search_match_ordinal(
+    pages: &BTreeMap<usize, Vec<SearchMatch>>,
+    selected: SearchCursor,
+) -> Option<usize> {
+    pages
+        .iter()
+        .flat_map(|(page_index, matches)| {
+            (0..matches.len()).map(|match_index| SearchCursor {
+                page_index: *page_index,
+                match_index,
+            })
+        })
+        .position(|candidate| candidate == selected)
+        .map(|position| position + 1)
+}
+
+fn search_match_anchor_for_cursor(
+    document: &DocumentTab,
+    cursor: SearchCursor,
+) -> Option<PageAnchor> {
+    let page_bounds = document
+        .info
+        .as_ref()?
+        .page_bounds
+        .get(cursor.page_index)
+        .copied()?;
+    let search_match = document
+        .search
+        .pages
+        .get(&cursor.page_index)?
+        .get(cursor.match_index)?;
+    search_match_anchor(cursor.page_index, search_match, page_bounds)
+}
+
+fn search_match_anchor(
+    page_index: usize,
+    search_match: &SearchMatch,
+    page_bounds: crate::domain::document::PageRect,
+) -> Option<PageAnchor> {
+    let first = search_match.quads.first()?.bounds();
+    let (x0, y0, x1, y1) =
+        search_match
+            .quads
+            .iter()
+            .skip(1)
+            .fold(first, |(x0, y0, x1, y1), quad| {
+                let bounds = quad.bounds();
+                (
+                    x0.min(bounds.0),
+                    y0.min(bounds.1),
+                    x1.max(bounds.2),
+                    y1.max(bounds.3),
+                )
+            });
+    // Center the union of all line Quads so a multi-line hit is navigated as
+    // one result. Clamping contains minor PDF coordinate rounding at page edges.
+    let x = (((x0 + x1) / 2.0 - page_bounds.x0) / page_bounds.width()).clamp(0.0, 1.0);
+    let y = (((y0 + y1) / 2.0 - page_bounds.y0) / page_bounds.height()).clamp(0.0, 1.0);
+    (x.is_finite() && y.is_finite()).then_some(PageAnchor {
+        page_index,
+        page_x_fraction: x,
+        page_y_fraction: y,
+    })
 }
 
 fn search_result_is_current(
@@ -3009,6 +3164,7 @@ fn format_memory(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::selection::PageQuad;
     use mupdf::Size;
     use mupdf::pdf::PdfDocument;
 
@@ -3237,13 +3393,82 @@ mod tests {
     }
 
     #[test]
-    fn search_navigation_wraps_across_matching_pages() {
-        let pages = [1, 4, 8];
+    fn search_navigation_visits_each_logical_match_and_wraps() {
+        let search_match = || SearchMatch { quads: Vec::new() };
+        let pages = BTreeMap::from([
+            (1, vec![search_match()]),
+            (4, vec![search_match(), search_match()]),
+            (8, vec![search_match()]),
+        ]);
+        let first_on_page_four = SearchCursor {
+            page_index: 4,
+            match_index: 0,
+        };
+        let second_on_page_four = SearchCursor {
+            page_index: 4,
+            match_index: 1,
+        };
 
-        assert_eq!(next_search_page(pages.into_iter(), 4, true), Some(8));
-        assert_eq!(next_search_page(pages.into_iter(), 8, true), Some(1));
-        assert_eq!(next_search_page(pages.into_iter(), 4, false), Some(1));
-        assert_eq!(next_search_page(pages.into_iter(), 1, false), Some(8));
+        assert_eq!(
+            next_search_match(&pages, None, 4, true),
+            Some(first_on_page_four)
+        );
+        assert_eq!(
+            next_search_match(&pages, Some(first_on_page_four), 4, true),
+            Some(second_on_page_four)
+        );
+        assert_eq!(
+            next_search_match(&pages, Some(second_on_page_four), 4, false),
+            Some(first_on_page_four)
+        );
+        assert_eq!(
+            next_search_match(
+                &pages,
+                Some(SearchCursor {
+                    page_index: 8,
+                    match_index: 0,
+                }),
+                8,
+                true,
+            ),
+            Some(SearchCursor {
+                page_index: 1,
+                match_index: 0,
+            })
+        );
+        assert_eq!(search_match_ordinal(&pages, second_on_page_four), Some(3));
+    }
+
+    #[test]
+    fn multi_quad_search_match_uses_the_union_center() {
+        let search_match = SearchMatch {
+            quads: vec![
+                PageQuad {
+                    upper_left: PagePoint::new(10.0, 20.0),
+                    upper_right: PagePoint::new(30.0, 20.0),
+                    lower_left: PagePoint::new(10.0, 30.0),
+                    lower_right: PagePoint::new(30.0, 30.0),
+                },
+                PageQuad {
+                    upper_left: PagePoint::new(50.0, 60.0),
+                    upper_right: PagePoint::new(70.0, 60.0),
+                    lower_left: PagePoint::new(50.0, 80.0),
+                    lower_right: PagePoint::new(70.0, 80.0),
+                },
+            ],
+        };
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 100.0,
+            y1: 100.0,
+        };
+
+        let anchor = search_match_anchor(2, &search_match, bounds).unwrap();
+
+        assert_eq!(anchor.page_index, 2);
+        assert!((anchor.page_x_fraction - 0.4).abs() < f32::EPSILON);
+        assert!((anchor.page_y_fraction - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]
