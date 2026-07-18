@@ -999,7 +999,7 @@ impl PrototypeApp {
         let Some(document) = self.documents.get(index) else {
             return;
         };
-        // A queued incremental save precedes Shutdown on the worker command
+        // A queued save precedes Shutdown on the worker command
         // queue, so Discard cannot honestly cancel it. Wait for completion.
         if document.is_saving() {
             self.status = "Waiting for the current save before closing…".to_owned();
@@ -1248,7 +1248,7 @@ impl PrototypeApp {
                     if let Some(confirmation) = &mut self.close_confirmation {
                         confirmation.save_in_flight = true;
                     }
-                    self.status = "Saving before close…".to_owned();
+                    self.status = "Saving PDF before close…".to_owned();
                 } else {
                     self.error = Some("save: document worker is unavailable".to_owned());
                 }
@@ -1475,7 +1475,7 @@ impl PrototypeApp {
         if tab.send(DocumentCommand::Save) {
             tab.save_in_flight = true;
             tab.state = DocumentState::Saving;
-            self.status = "Saving incrementally and reopening for verification…".to_owned();
+            self.status = "Saving PDF and reopening for verification…".to_owned();
         } else {
             self.error = Some("save: document worker is unavailable".to_owned());
         }
@@ -1669,10 +1669,12 @@ impl PrototypeApp {
                             ui.separator();
                             ui.label(format!("open {:.1} ms", milliseconds(info.open_time)));
                             ui.label(format!("Highlights: {}", info.highlight_count));
-                            // LunaPDF must expose the MuPDF capability directly; it does not
-                            // substitute a full rewrite when incremental save is unavailable.
+                            // Exposing the chosen strategy makes a potentially slower full
+                            // rewrite visible instead of making it look like a stalled save.
                             if info.can_save_incrementally {
                                 ui.label("incremental save");
+                            } else {
+                                ui.label("full-file rewrite");
                             }
                             if let Some(memory) = info.physical_memory_bytes {
                                 ui.label(format_memory(memory));

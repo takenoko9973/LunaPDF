@@ -7,15 +7,17 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use mupdf::color::AnnotationColor;
 use mupdf::pdf::{
-    AnnotationQuadPoints, PdfAnnotationType, PdfDocument, PdfWriteOptions, Permission, WidgetType,
+    AnnotationQuadPoints, Encryption, PdfAnnotationType, PdfDocument, PdfWriteOptions, Permission,
+    WidgetType,
 };
 use mupdf::{
     Colorspace, Device, DisplayList, IRect, Matrix, Outline, Pixmap, Point, Quad, Rect,
     TextBlockContent, TextPage, TextPageFlags,
 };
+use tempfile::{Builder as TempFileBuilder, TempPath};
 
 use crate::domain::document::{
     DocumentInfo, DocumentVersion, HighlightCapability, HighlightRequest, OutlineItem, PageRect,
@@ -53,6 +55,10 @@ pub(super) struct MuPdfBackend {
     highlight_capability: HighlightCapability,
     pending_highlights: Vec<HighlightRequest>,
     display_list: Option<CachedDisplayList>,
+    // A recovery document opened from bytes has no safe association with the
+    // original path, so retries must use the full-rewrite path until a fresh
+    // path-backed document is installed after successful verification.
+    incremental_association_lost: bool,
 }
 
 struct CachedDisplayList {
@@ -92,6 +98,7 @@ impl MuPdfBackend {
             highlight_capability,
             pending_highlights: Vec::new(),
             display_list: None,
+            incremental_association_lost: false,
         })
     }
 
@@ -100,9 +107,9 @@ impl MuPdfBackend {
             path: self.path.clone(),
             page_bounds: self.page_bounds.clone(),
             highlight_count: highlight_count(&self.document)?,
-            can_save_incrementally: self.document.can_be_saved_incrementally(),
+            can_save_incrementally: self.should_save_incrementally(),
             highlight_capability: self.highlight_capability,
-            dirty: self.document.has_unsaved_changes(),
+            dirty: self.document.has_unsaved_changes() || !self.pending_highlights.is_empty(),
             revision: self.revision,
             open_time: self.open_time,
             physical_memory_bytes: physical_memory_bytes(),
@@ -383,22 +390,26 @@ impl MuPdfBackend {
         Ok(())
     }
 
-    /// Saves incrementally and reopens the file before reporting it as clean.
+    /// Saves the in-memory PDF, choosing MuPDF's safe incremental path first.
     ///
-    /// Full-file replacement is intentionally deferred: the design requires a
-    /// same-directory temporary file and atomic platform replacement. A PDF
-    /// that cannot be saved incrementally fails visibly in this phase.
-    pub(super) fn save_incrementally(&mut self) -> Result<usize> {
-        let current_version = read_document_version(&self.path)?;
-        ensure!(
-            current_version == self.version,
-            "the PDF changed outside LunaPDF; refusing to overwrite it"
-        );
-        ensure!(
-            self.document.can_be_saved_incrementally(),
-            "this PDF cannot be saved incrementally in the current milestone"
-        );
+    /// A document that needs a full rewrite is written to a same-directory
+    /// temporary PDF, verified there, and atomically replaced only after the
+    /// original version is checked again. This keeps a failed write from
+    /// truncating the user's only copy.
+    pub(super) fn save(&mut self) -> Result<usize> {
+        ensure_current_version(&self.path, self.version)?;
+        if self.should_save_incrementally() {
+            self.save_incrementally_verified()
+        } else {
+            self.save_full_rewrite()
+        }
+    }
 
+    fn should_save_incrementally(&self) -> bool {
+        !self.incremental_association_lost && self.document.can_be_saved_incrementally()
+    }
+
+    fn save_incrementally_verified(&mut self) -> Result<usize> {
         let file_name = self
             .path
             .to_str()
@@ -406,39 +417,258 @@ impl MuPdfBackend {
         let expected_highlights = highlight_count(&self.document)?;
         let expected_page_count = self.page_bounds.len();
         let mut options = PdfWriteOptions::default();
-        options.set_incremental(true);
+        options
+            .set_incremental(true)
+            // Keep the original encryption settings instead of allowing the
+            // writer default to silently change a protected document.
+            .set_encryption(Encryption::Keep);
         self.document
             .save_with_options(file_name, options)
             .with_context(|| format!("failed to save PDF: {}", self.path.display()))?;
 
         let reopened = PdfDocument::open(file_name)
             .context("saved PDF could not be reopened for verification")?;
-        let verified_highlights = highlight_count(&reopened)?;
-        ensure!(
-            verified_highlights == expected_highlights,
-            "saved PDF Highlight count changed during verification"
-        );
-        let page_bounds = load_page_bounds(&reopened)?;
-        ensure!(
-            page_bounds.len() == expected_page_count,
-            "saved PDF page count changed during verification"
-        );
-        for expected in &self.pending_highlights {
-            ensure!(
-                contains_highlight(&reopened, expected)?,
-                "saved PDF does not contain the Highlight created on page {}",
-                expected.page_index + 1
-            );
+        let (verified_highlights, page_bounds) = verify_saved_document(
+            &reopened,
+            expected_page_count,
+            expected_highlights,
+            &self.pending_highlights,
+        )?;
+        self.update_after_save(reopened, page_bounds)?;
+        Ok(verified_highlights)
+    }
+
+    fn save_full_rewrite(&mut self) -> Result<usize> {
+        let parent = self
+            .path
+            .parent()
+            .context("PDF path has no parent directory for atomic replacement")?;
+        let original_permissions = fs::metadata(&self.path)
+            .with_context(|| format!("failed to read PDF permissions: {}", self.path.display()))?
+            .permissions();
+        let expected_highlights = highlight_count(&self.document)?;
+        let expected_page_count = self.page_bounds.len();
+        let named_temp = TempFileBuilder::new()
+            .prefix(".lunapdf-")
+            .suffix(".pdf")
+            .tempfile_in(parent)
+            .with_context(|| format!("failed to create temporary PDF in {}", parent.display()))?;
+        let temp_path = named_temp.into_temp_path();
+
+        if let Err(error) = fs::set_permissions(&temp_path, original_permissions)
+            .with_context(|| format!("failed to preserve permissions on {}", temp_path.display()))
+        {
+            return Err(cleanup_temp_after_error(temp_path, error));
+        }
+        let temp_name = match temp_path.to_str() {
+            Some(name) => name.to_owned(),
+            None => {
+                return Err(cleanup_temp_after_error(
+                    temp_path,
+                    anyhow!("MuPDF cannot save a temporary path that is not valid Unicode"),
+                ));
+            }
+        };
+        let mut options = PdfWriteOptions::default();
+        options
+            .set_incremental(false)
+            // The temp path already carries the source file permissions. Keep
+            // the PDF encryption too; the writer default would remove it.
+            .set_encryption(Encryption::Keep);
+
+        if let Err(error) = self
+            .document
+            .save_with_options(&temp_name, options)
+            .with_context(|| format!("failed to write temporary PDF: {temp_name}"))
+        {
+            return Err(cleanup_temp_after_error(temp_path, error));
+        }
+        if let Err(error) = sync_file(&temp_path) {
+            return Err(cleanup_temp_after_error(temp_path, error));
         }
 
+        let temporary_document = match PdfDocument::open(&temp_name)
+            .context("temporary PDF could not be reopened for verification")
+        {
+            Ok(document) => document,
+            Err(error) => return Err(cleanup_temp_after_error(temp_path, error)),
+        };
+        if let Err(error) = verify_saved_document(
+            &temporary_document,
+            expected_page_count,
+            expected_highlights,
+            &self.pending_highlights,
+        ) {
+            return Err(cleanup_temp_after_error(temp_path, error));
+        }
+        drop(temporary_document);
+
+        // MuPDF's path-backed document may retain an ordinary FILE* handle.
+        // On Windows that handle can deny the replacement even after Rust drops
+        // its wrapper, so build a handle-free recovery document from the
+        // verified bytes before releasing the original handle. The transient
+        // whole-file copy is limited to this rare path and preserves the user's
+        // in-memory edits if the atomic replacement itself fails.
+        let temporary_bytes = match fs::read(&temp_path)
+            .with_context(|| format!("failed to read verified temporary PDF: {temp_name}"))
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(cleanup_temp_after_error(temp_path, error)),
+        };
+        let recovery_document = match PdfDocument::from_bytes(&temporary_bytes)
+            .context("verified temporary PDF could not be opened from memory")
+        {
+            Ok(document) => document,
+            Err(error) => return Err(cleanup_temp_after_error(temp_path, error)),
+        };
+        if let Err(error) = verify_saved_document(
+            &recovery_document,
+            expected_page_count,
+            expected_highlights,
+            &self.pending_highlights,
+        ) {
+            return Err(cleanup_temp_after_error(temp_path, error));
+        }
+
+        let destination = self.path.clone();
+        let expected_version = self.version;
+        let mut recovery_document = Some(recovery_document);
+        persist_temp_if_current(temp_path, &destination, expected_version, || {
+            let replacement = recovery_document
+                .take()
+                .expect("recovery document callback executes at most once");
+            let previous = std::mem::replace(&mut self.document, replacement);
+            drop(previous);
+            self.display_list = None;
+            self.incremental_association_lost = true;
+        })?;
+
+        let file_name = self
+            .path
+            .to_str()
+            .context("MuPDF cannot reopen a replaced path that is not valid Unicode")?;
+        let reopened = PdfDocument::open(file_name).map_err(|error| {
+            anyhow!(
+                "replacement completed but verification failed: saved PDF could not be reopened: {error}"
+            )
+        })?;
+        let (verified_highlights, page_bounds) = verify_saved_document(
+            &reopened,
+            expected_page_count,
+            expected_highlights,
+            &self.pending_highlights,
+        )
+        .map_err(|error| anyhow!("replacement completed but verification failed: {error:#}"))?;
+        self.update_after_save(reopened, page_bounds)
+            .map_err(|error| anyhow!("replacement completed but verification failed: {error:#}"))?;
+        Ok(verified_highlights)
+    }
+
+    fn update_after_save(
+        &mut self,
+        reopened: PdfDocument,
+        page_bounds: Vec<PageRect>,
+    ) -> Result<()> {
         let highlight_capability = determine_highlight_capability(&reopened, &self.path)?;
+        let version = read_document_version(&self.path)?;
         self.document = reopened;
         self.page_bounds = page_bounds;
         self.highlight_capability = highlight_capability;
-        self.version = read_document_version(&self.path)?;
+        self.version = version;
         self.pending_highlights.clear();
+        self.display_list = None;
+        self.incremental_association_lost = false;
         self.revision += 1;
-        Ok(verified_highlights)
+        Ok(())
+    }
+}
+
+fn ensure_current_version(path: &Path, expected: DocumentVersion) -> Result<()> {
+    let current_version = read_document_version(path)?;
+    ensure!(
+        current_version == expected,
+        "the PDF changed outside LunaPDF; refusing to overwrite it"
+    );
+    Ok(())
+}
+
+/// Replaces the original only while it still matches the version opened by this worker.
+///
+/// The comparison cannot make the rename a filesystem compare-and-swap, but keeping it
+/// adjacent to `persist` minimizes the unavoidable race and centralizes cleanup on every
+/// pre-replacement failure.
+fn persist_temp_if_current(
+    temp_path: TempPath,
+    destination: &Path,
+    expected_version: DocumentVersion,
+    release_original_handle: impl FnOnce(),
+) -> Result<()> {
+    if let Err(error) = ensure_current_version(destination, expected_version) {
+        return Err(cleanup_temp_after_error(temp_path, error));
+    }
+    release_original_handle();
+    if let Err(error) = temp_path.persist(destination) {
+        let tempfile::PathPersistError { error, path } = error;
+        return Err(cleanup_temp_after_error(
+            path,
+            anyhow!(
+                "failed to atomically replace {}: {error}",
+                destination.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_saved_document(
+    document: &PdfDocument,
+    expected_page_count: usize,
+    expected_highlights: usize,
+    pending_highlights: &[HighlightRequest],
+) -> Result<(usize, Vec<PageRect>)> {
+    let verified_highlights = highlight_count(document)?;
+    ensure!(
+        verified_highlights == expected_highlights,
+        "saved PDF Highlight count changed during verification"
+    );
+    let page_bounds = load_page_bounds(document)?;
+    ensure!(
+        page_bounds.len() == expected_page_count,
+        "saved PDF page count changed during verification"
+    );
+    for expected in pending_highlights {
+        ensure!(
+            contains_highlight(document, expected)?,
+            "saved PDF does not contain the Highlight created on page {}",
+            expected.page_index + 1
+        );
+    }
+    Ok((verified_highlights, page_bounds))
+}
+
+fn sync_file(path: &Path) -> Result<()> {
+    // Windows FlushFileBuffers requires a write-capable handle even though no
+    // bytes are changed here; a read-only handle makes every full rewrite fail.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "failed to reopen temporary PDF for syncing: {}",
+                path.display()
+            )
+        })?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync temporary PDF: {}", path.display()))?;
+    Ok(())
+}
+
+fn cleanup_temp_after_error(temp_path: TempPath, error: anyhow::Error) -> anyhow::Error {
+    match temp_path.close() {
+        Ok(()) => error,
+        Err(cleanup_error) => {
+            anyhow!("{error:#}; additionally failed to remove temporary PDF: {cleanup_error}")
+        }
     }
 }
 
@@ -553,7 +783,6 @@ fn determine_highlight_capability(
         file_is_read_only,
         annotation_allowed,
         has_signed_signature,
-        document.can_be_saved_incrementally(),
     ))
 }
 
@@ -561,19 +790,16 @@ fn highlight_capability_from_constraints(
     file_is_read_only: bool,
     annotation_allowed: bool,
     has_signed_signature: bool,
-    can_save_incrementally: bool,
 ) -> HighlightCapability {
     // These checks are ordered by the restriction the user can act on most
-    // directly. No full-rewrite fallback is inferred while that design choice
-    // remains explicitly unresolved.
+    // directly. A non-incremental document remains editable because the save
+    // strategy now verifies and atomically replaces a full-file temporary.
     if file_is_read_only {
         HighlightCapability::ReadOnlyFile
     } else if !annotation_allowed {
         HighlightCapability::AnnotationPermissionDenied
     } else if has_signed_signature {
         HighlightCapability::SignedDocument
-    } else if !can_save_incrementally {
-        HighlightCapability::RequiresFullRewrite
     } else {
         HighlightCapability::Allowed
     }
@@ -765,6 +991,9 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
     use mupdf::pdf::{Encryption, PdfObject};
     use mupdf::shape::{Shape, TextOptions};
     use mupdf::{DestinationKind, Size};
@@ -907,23 +1136,19 @@ mod tests {
     #[test]
     fn highlight_capability_reports_each_persistence_restriction() {
         assert_eq!(
-            highlight_capability_from_constraints(true, true, false, true),
+            highlight_capability_from_constraints(true, true, false),
             HighlightCapability::ReadOnlyFile
         );
         assert_eq!(
-            highlight_capability_from_constraints(false, false, false, true),
+            highlight_capability_from_constraints(false, false, false),
             HighlightCapability::AnnotationPermissionDenied
         );
         assert_eq!(
-            highlight_capability_from_constraints(false, true, true, true),
+            highlight_capability_from_constraints(false, true, true),
             HighlightCapability::SignedDocument
         );
         assert_eq!(
-            highlight_capability_from_constraints(false, true, false, false),
-            HighlightCapability::RequiresFullRewrite
-        );
-        assert_eq!(
-            highlight_capability_from_constraints(false, true, false, true),
+            highlight_capability_from_constraints(false, true, false),
             HighlightCapability::Allowed
         );
     }
@@ -970,11 +1195,89 @@ mod tests {
             .unwrap();
         assert_ne!(annotated_page.pixels_rgba, unannotated_pixels);
 
-        let verified_highlights = backend.save_incrementally().unwrap();
+        let verified_highlights = backend.save().unwrap();
         let saved = backend.info().unwrap();
         assert_eq!(verified_highlights, 1);
         assert_eq!(saved.highlight_count, 1);
         assert!(!saved.dirty);
+    }
+
+    #[test]
+    fn redacted_pdf_accepts_highlight_and_is_saved_by_full_rewrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("redacted.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            document.save(path_text).unwrap();
+        }
+
+        let original_mode = fs::metadata(&path).unwrap().permissions();
+        let mut backend = MuPdfBackend::open(path.clone()).unwrap();
+        let mut page = backend.document.load_pdf_page(0).unwrap();
+        page.add_redact_annotation(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .unwrap();
+        assert!(page.apply_redactions().unwrap());
+        assert!(!backend.document.can_be_saved_incrementally());
+        assert_eq!(
+            backend.info().unwrap().highlight_capability,
+            HighlightCapability::Allowed
+        );
+        backend
+            .create_highlight(
+                0,
+                &[PageQuad {
+                    upper_left: PagePoint::new(20.0, 20.0),
+                    upper_right: PagePoint::new(80.0, 20.0),
+                    lower_left: PagePoint::new(20.0, 40.0),
+                    lower_right: PagePoint::new(80.0, 40.0),
+                }],
+            )
+            .unwrap();
+        assert!(backend.info().unwrap().dirty);
+
+        assert_eq!(backend.save().unwrap(), 1);
+        let saved = backend.info().unwrap();
+        assert_eq!(saved.page_bounds.len(), 1);
+        assert_eq!(saved.highlight_count, 1);
+        assert!(!saved.dirty);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().readonly(),
+            original_mode.readonly()
+        );
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path).unwrap().mode(), original_mode.mode());
+        assert!(!fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lunapdf-")
+        }));
+
+        let reopened = PdfDocument::open(path_text).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 1);
+        assert_eq!(highlight_count(&reopened).unwrap(), 1);
+    }
+
+    #[test]
+    fn recovery_state_forces_full_rewrite_even_when_mupdf_reports_incremental() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memory-recovery.pdf");
+        write_blank_pdf_for_test(&path);
+        let bytes = fs::read(&path).unwrap();
+        let recovery = PdfDocument::from_bytes(&bytes).unwrap();
+        let mut backend = MuPdfBackend::open(path).unwrap();
+
+        // MuPDF may report a byte-backed document as incrementally writable;
+        // the backend therefore tracks path association explicitly instead of
+        // trusting this value for a recovery retry.
+        assert!(recovery.can_be_saved_incrementally());
+        backend.document = recovery;
+        backend.incremental_association_lost = true;
+        assert!(!backend.should_save_incrementally());
+        assert!(!backend.info().unwrap().can_save_incrementally);
     }
 
     #[test]
@@ -1002,10 +1305,101 @@ mod tests {
         let external_bytes = b"%PDF-1.7\n% external replacement is intentionally distinct\n";
         fs::write(&path, external_bytes).unwrap();
 
-        let error = backend.save_incrementally().unwrap_err();
+        let error = backend.save().unwrap_err();
 
         assert!(error.to_string().contains("changed outside LunaPDF"));
         assert_eq!(fs::read(path).unwrap(), external_bytes);
+    }
+
+    #[test]
+    fn version_check_before_replace_preserves_external_bytes_and_cleans_temp() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("external-before-replace.pdf");
+        write_blank_pdf_for_test(&path);
+        let backend = MuPdfBackend::open(path.clone()).unwrap();
+        let expected_version = backend.version;
+        let named_temp = TempFileBuilder::new()
+            .prefix(".lunapdf-")
+            .suffix(".pdf")
+            .tempfile_in(directory.path())
+            .unwrap();
+        let temp_path = named_temp.into_temp_path();
+        fs::write(&temp_path, b"candidate bytes").unwrap();
+        let external_bytes = b"external replacement before atomic replace";
+        fs::write(&path, external_bytes).unwrap();
+
+        let mut callback_called = false;
+        let error = persist_temp_if_current(temp_path, &path, expected_version, || {
+            callback_called = true;
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed outside LunaPDF"));
+        assert!(!callback_called);
+        assert_eq!(fs::read(&path).unwrap(), external_bytes);
+        assert!(!fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lunapdf-")
+        }));
+    }
+
+    #[test]
+    fn persist_callback_runs_only_after_current_version_check_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("callback.pdf");
+        write_blank_pdf_for_test(&path);
+        let expected_version = read_document_version(&path).unwrap();
+        let named_temp = TempFileBuilder::new()
+            .prefix(".lunapdf-")
+            .suffix(".pdf")
+            .tempfile_in(directory.path())
+            .unwrap();
+        let temp_path = named_temp.into_temp_path();
+        write_blank_pdf_for_test(&temp_path);
+        let mut callback_called = false;
+        persist_temp_if_current(temp_path, &path, expected_version, || {
+            callback_called = true;
+        })
+        .unwrap();
+        assert!(callback_called);
+        assert_eq!(
+            PdfDocument::open(path.to_str().unwrap())
+                .unwrap()
+                .page_count()
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn pre_replace_verification_failure_keeps_original_and_cleans_temp() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verification-failure.pdf");
+        write_blank_pdf_for_test(&path);
+        let original_bytes = fs::read(&path).unwrap();
+        let named_temp = TempFileBuilder::new()
+            .prefix(".lunapdf-")
+            .suffix(".pdf")
+            .tempfile_in(directory.path())
+            .unwrap();
+        let temp_path = named_temp.into_temp_path();
+        write_blank_pdf_for_test(&temp_path);
+        let temporary_document = PdfDocument::open(temp_path.to_str().unwrap()).unwrap();
+
+        let error = verify_saved_document(&temporary_document, 1, 1, &[]).unwrap_err();
+        assert!(error.to_string().contains("Highlight count changed"));
+        drop(temporary_document);
+        temp_path.close().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert!(!fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lunapdf-")
+        }));
     }
 
     #[test]

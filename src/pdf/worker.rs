@@ -397,7 +397,7 @@ fn run_worker(
                     });
                 }
             },
-            DocumentCommand::Save => match backend.save_incrementally() {
+            DocumentCommand::Save => match backend.save() {
                 Ok(highlight_count) => {
                     let _ = event_sender.send(DocumentEvent::Status(format!(
                         "Saved and reopened successfully ({highlight_count} Highlight annotations)"

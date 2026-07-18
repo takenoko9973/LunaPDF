@@ -99,7 +99,6 @@ pub(crate) enum HighlightCapability {
     ReadOnlyFile,
     AnnotationPermissionDenied,
     SignedDocument,
-    RequiresFullRewrite,
 }
 
 impl HighlightCapability {
@@ -117,9 +116,6 @@ impl HighlightCapability {
                 Some("the PDF security permissions do not allow annotations")
             }
             Self::SignedDocument => Some("the PDF contains a signed signature field"),
-            Self::RequiresFullRewrite => {
-                Some("the PDF requires a full-file rewrite, which is not enabled")
-            }
         }
     }
 }
