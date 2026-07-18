@@ -49,7 +49,7 @@ pdftoppm -png -f 1 -singlefile -r 150 \
 
 ## SumatraPDFによるWindows表示確認
 
-2026-07-19にWindows 11上のSumatraPDF 3.6.1でfixtureを開いた。一時appdataを指定して通常設定とセッションを変更せず、1ページ目をfit pageで表示した。
+2026-07-19にWindows 10（OS build 19045.7548）上のSumatraPDF 3.6.1でfixtureを開いた。一時appdataを指定して通常設定とセッションを変更せず、1ページ目をfit pageで表示した。
 
 ウィンドウ単体の画面キャプチャでは、文字列`LunaPDF external viewer highlight`と同じ位置に黄色のHighlightが表示された。ページ表示は`1 / 1`で、LinuxのPoppler描画と位置、色、ページが一致した。閲覧後のfixture SHA-256は生成時と同じ`A8D038192389075277FFCF63B02B5FD116533E3DD2F80D7689A9AF079607C48C`であり、表示確認ではPDFを変更していない。
 
