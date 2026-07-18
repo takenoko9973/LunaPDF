@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt as _;
 #[cfg(windows)]
-use std::os::windows::fs::MetadataExt as _;
+use std::os::windows::io::AsRawHandle as _;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use mupdf::color::AnnotationColor;
@@ -22,7 +22,9 @@ use mupdf::{
 };
 use tempfile::{Builder as TempFileBuilder, TempPath};
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, ReplaceFileW,
+};
 
 use crate::domain::document::{
     DocumentInfo, DocumentVersion, HighlightCapability, HighlightRequest, OutlineItem, PageRect,
@@ -796,7 +798,7 @@ fn read_document_version(path: &Path) -> Result<DocumentVersion> {
     let metadata = file
         .metadata()
         .with_context(|| format!("failed to read PDF metadata: {}", path.display()))?;
-    let (identity_primary, identity_secondary) = file_identity(&metadata)?;
+    let (identity_primary, identity_secondary) = file_identity(&file, &metadata)?;
     Ok(DocumentVersion {
         identity_primary,
         identity_secondary,
@@ -856,19 +858,27 @@ fn tile_clip(page_bounds: IRect, spec: TileSpec) -> Result<IRect> {
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> Result<(u64, u64)> {
+fn file_identity(_file: &fs::File, metadata: &fs::Metadata) -> Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(windows)]
-fn file_identity(metadata: &fs::Metadata) -> Result<(u64, u64)> {
-    let volume_serial_number = metadata
-        .volume_serial_number()
-        .context("Windows did not provide the PDF volume serial number")?;
-    let file_index = metadata
-        .file_index()
-        .context("Windows did not provide the PDF file index")?;
-    Ok((u64::from(volume_serial_number), file_index))
+fn file_identity(file: &fs::File, _metadata: &fs::Metadata) -> Result<(u64, u64)> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a valid open handle and `information` remains writable
+    // for the duration of this synchronous Windows API call.
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    ensure!(
+        succeeded != 0,
+        "failed to query the Windows PDF file identity: {}",
+        std::io::Error::last_os_error()
+    );
+
+    // Windows splits the persistent 64-bit file index into two DWORDs; keep
+    // the complete value so a same-size path replacement is still detected.
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((u64::from(information.dwVolumeSerialNumber), file_index))
 }
 
 fn load_page_bounds(document: &PdfDocument) -> Result<Vec<PageRect>> {
@@ -1169,6 +1179,26 @@ mod tests {
         assert!(error.to_string().contains("got 1 components"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_is_stable_across_file_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.pdf");
+        fs::write(&path, b"file identity fixture").unwrap();
+        let first_identity = {
+            let first = fs::File::open(&path).unwrap();
+            let first_metadata = first.metadata().unwrap();
+            file_identity(&first, &first_metadata).unwrap()
+        };
+        let second = fs::File::open(&path).unwrap();
+        let second_metadata = second.metadata().unwrap();
+
+        assert_eq!(
+            first_identity,
+            file_identity(&second, &second_metadata).unwrap()
+        );
+    }
+
     #[test]
     fn document_change_during_open_is_rejected() {
         let before = DocumentVersion {
@@ -1409,6 +1439,10 @@ mod tests {
         page.add_redact_annotation(Rect::new(0.0, 0.0, 10.0, 10.0))
             .unwrap();
         assert!(page.apply_redactions().unwrap());
+        // Production commands never retain a page outside one backend call.
+        // Drop this test-only handle before ReplaceFileW so the test exercises
+        // the backend's actual ownership boundary on Windows.
+        drop(page);
         assert!(!backend.document.can_be_saved_incrementally());
         assert_eq!(
             backend.info().unwrap().highlight_capability,
