@@ -1,0 +1,1902 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crossbeam_channel::TryRecvError;
+use eframe::egui::{
+    self, Color32, Id, Key, Modifiers, Pos2, Rect, TextureHandle, TextureOptions, UiBuilder, Vec2,
+    ViewportCommand,
+};
+
+use crate::domain::document::{
+    DocumentInfo, HighlightRequest, RenderPriority, RenderedTile, TileRequest, TileSpec,
+};
+use crate::domain::selection::{PagePoint, SelectionSnapshot};
+use crate::domain::tabs::{OpenTabResult, TabState};
+use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService};
+use crate::render::cache::WeightedLruCache;
+use crate::render::layout::{ContinuousLayout, PAGE_GAP, PageAnchor};
+use crate::render::tiles::TileGrid;
+use crate::ui::viewport::PageViewport;
+
+// These bounds cover detailed inspection and overview use without allowing an
+// accidental wheel gesture to request an unbounded raster allocation.
+const MIN_ZOOM: f32 = 0.25;
+const MAX_ZOOM: f32 = 4.0;
+
+// Fit modes can change by sub-pixel rounding as panel sizes settle. Ignoring a
+// difference below one tenth of a percent avoids invalidating every page on
+// visually identical consecutive frames.
+const ZOOM_CHANGE_EPSILON: f32 = 0.001;
+
+// The design budget is shared across all tabs so the active document can use
+// available GPU memory instead of receiving one twentieth of a fixed split.
+const GPU_TILE_BUDGET_BYTES: usize = 192 * 1_024 * 1_024;
+
+// N-05 sets 512 MiB as the stable 20-tab process target. Suspension is only
+// allowed after crossing that limit; ordinary tab switches retain documents.
+const RESIDENT_MEMORY_SUSPEND_THRESHOLD_BYTES: usize = 512 * 1_024 * 1_024;
+
+pub(crate) struct PrototypeApp {
+    tabs: TabState,
+    documents: Vec<DocumentTab>,
+    viewport: PageViewport,
+    status: String,
+    error: Option<String>,
+    close_confirmation: Option<CloseConfirmation>,
+    approved_window_documents: HashSet<PathBuf>,
+    allow_window_close: bool,
+    window_close_pending: bool,
+    saved_tab_to_close: Option<PathBuf>,
+    next_document_id: u64,
+    activity_sequence: u64,
+    gpu_lru: WeightedLruCache<TileCacheKey, ()>,
+}
+
+struct DocumentTab {
+    document_id: u64,
+    service: Option<DocumentService>,
+    state: DocumentState,
+    last_selected_sequence: u64,
+    info: Option<DocumentInfo>,
+    error: Option<String>,
+    tiles: HashMap<TileCacheKey, CachedTile>,
+    pending_tiles: HashMap<TileCacheKey, TileRequest>,
+    wanted_tiles: HashSet<TileCacheKey>,
+    selection: Option<SelectionSnapshot>,
+    selection_generation: u64,
+    pending_highlights: usize,
+    save_in_flight: bool,
+    view: ViewState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DocumentState {
+    Opening,
+    ReadyClean,
+    ReadyDirty,
+    Saving,
+    Suspended,
+    Error,
+}
+
+struct CachedTile {
+    tile: RenderedTile,
+    texture: TextureHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TileCacheKey {
+    document_id: u64,
+    page_index: usize,
+    zoom_bits: u32,
+    pixels_per_point_bits: u32,
+    rotation_quarter_turns: u8,
+    spec: TileSpec,
+    revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseScope {
+    Tab,
+    Window,
+}
+
+struct CloseConfirmation {
+    scope: CloseScope,
+    path: PathBuf,
+    save_in_flight: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CloseDecision {
+    Save,
+    Discard,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisplayMode {
+    Continuous,
+    SinglePage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ZoomMode {
+    Fixed,
+    FitWidth,
+    FitPage,
+}
+
+struct ViewState {
+    display_mode: DisplayMode,
+    zoom_mode: ZoomMode,
+    zoom: f32,
+    current_page: usize,
+    scroll_to_page: Option<usize>,
+    center_anchor: Option<PageAnchor>,
+    restore_anchor: Option<PageAnchor>,
+    single_center_anchor: Option<Vec2>,
+    restore_single_anchor: Option<Vec2>,
+    generation: u64,
+}
+
+impl PrototypeApp {
+    /// Creates the application and opens each command-line PDF up to the cap.
+    pub(crate) fn new(
+        _creation_context: &eframe::CreationContext<'_>,
+        paths: Vec<PathBuf>,
+    ) -> Self {
+        let mut app = Self {
+            tabs: TabState::new(),
+            documents: Vec::new(),
+            viewport: PageViewport::default(),
+            status: "Drop a PDF into the window to open it".to_owned(),
+            error: None,
+            close_confirmation: None,
+            approved_window_documents: HashSet::new(),
+            allow_window_close: false,
+            window_close_pending: false,
+            saved_tab_to_close: None,
+            next_document_id: 1,
+            activity_sequence: 0,
+            gpu_lru: WeightedLruCache::new(GPU_TILE_BUDGET_BYTES),
+        };
+        for path in paths {
+            app.open_document(path);
+        }
+        app
+    }
+
+    fn open_document(&mut self, path: PathBuf) {
+        if !is_pdf_path(&path) {
+            self.error = Some(format!("not a PDF file: {}", path.display()));
+            return;
+        }
+
+        let previously_active = self.active_index();
+        match self.tabs.open(&path) {
+            Ok(OpenTabResult::Opened(index)) => {
+                let canonical_path = self.tabs.tabs()[index].path().to_path_buf();
+                let document_id = self.next_document_id;
+                self.next_document_id = self
+                    .next_document_id
+                    .checked_add(1)
+                    .expect("twenty-tab document IDs cannot exhaust u64");
+                let activity_sequence = self.next_activity_sequence();
+                self.documents.push(DocumentTab::new(
+                    document_id,
+                    canonical_path,
+                    activity_sequence,
+                ));
+                self.activate_document(index, previously_active);
+                self.status = format!("Opening {}…", path.display());
+                self.error = None;
+            }
+            Ok(OpenTabResult::SelectedExisting(index)) => {
+                self.activate_document(index, previously_active);
+                self.status = format!("Selected existing tab: {}", path.display());
+                self.error = None;
+            }
+            Ok(OpenTabResult::LimitReached) => {
+                self.error = Some("tab limit reached (20); no existing tab was closed".to_owned());
+            }
+            Err(error) => {
+                self.error = Some(format!("open {}: {error}", path.display()));
+            }
+        }
+    }
+
+    fn receive_document_events(&mut self, context: &egui::Context) {
+        for index in 0..self.documents.len() {
+            while let Some(event) = self.documents[index]
+                .service
+                .as_ref()
+                .map(DocumentService::try_recv)
+            {
+                match event {
+                    Ok(DocumentEvent::Opened(info)) => {
+                        self.status = format!("Opened {}", info.path.display());
+                        self.documents[index].state = if info.dirty {
+                            DocumentState::ReadyDirty
+                        } else {
+                            DocumentState::ReadyClean
+                        };
+                        self.documents[index].error = None;
+                        self.documents[index].info = Some(info);
+                    }
+                    Ok(DocumentEvent::DocumentChanged(info)) => {
+                        let saved_path = (!info.dirty).then(|| info.path.clone());
+                        let tab = &mut self.documents[index];
+                        if info.dirty {
+                            tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
+                            tab.state = state_after_document_info(tab.state, true);
+                        } else {
+                            tab.save_in_flight = false;
+                            tab.state = state_after_document_info(tab.state, false);
+                        }
+                        tab.info = Some(info);
+                        tab.invalidate_rendering();
+                        if let Some(path) = saved_path {
+                            self.finish_save_for_close(&path, context);
+                        }
+                    }
+                    Ok(DocumentEvent::TileRendered(mut tile)) => {
+                        let is_active = self.active_index() == Some(index);
+                        let key = TileCacheKey::from_tile(self.documents[index].document_id, &tile);
+                        let tab = &mut self.documents[index];
+                        tab.pending_tiles.remove(&key);
+                        let current_revision = tab.info.as_ref().map(|info| info.revision);
+                        let result_is_current = tile_result_is_current(
+                            is_active,
+                            key,
+                            tile.generation,
+                            tab.view.generation,
+                            current_revision,
+                            &tab.wanted_tiles,
+                        );
+                        if !result_is_current {
+                            continue;
+                        }
+                        // Texture upload trusts both byte count and page-relative
+                        // dimensions, so validate the worker snapshot first.
+                        let bounds_match = tab
+                            .info
+                            .as_ref()
+                            .and_then(|info| info.page_bounds.get(tile.page_index))
+                            .is_some_and(|bounds| *bounds == tile.bounds);
+                        let payload_is_valid = tile.spec.rgba_bytes()
+                            == Some(tile.pixels_rgba.len())
+                            && tile.page_pixel_width > 0
+                            && tile.page_pixel_height > 0
+                            && bounds_match;
+                        if !payload_is_valid {
+                            tab.error = Some(
+                                "render: document worker returned an invalid tile payload"
+                                    .to_owned(),
+                            );
+                            continue;
+                        }
+
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [
+                                tile.spec.pixel_width as usize,
+                                tile.spec.pixel_height as usize,
+                            ],
+                            &tile.pixels_rgba,
+                        );
+                        let texture = context.load_texture(
+                            format!(
+                                "pdf-{}-page-{}-tile-{}-{}-revision-{}",
+                                tab.document_id,
+                                tile.page_index,
+                                tile.spec.pixel_x,
+                                tile.spec.pixel_y,
+                                tile.revision
+                            ),
+                            image,
+                            TextureOptions::LINEAR,
+                        );
+                        // Texture storage owns the upload copy; retaining the
+                        // transfer buffer would double-count the page cache.
+                        tile.pixels_rgba.clear();
+                        let weight = tile
+                            .spec
+                            .rgba_bytes()
+                            .expect("validated tile dimensions fit in memory");
+                        tab.tiles.insert(key, CachedTile { tile, texture });
+                        let outcome = self.gpu_lru.insert(key, (), weight);
+                        if !outcome.inserted {
+                            self.documents[index].tiles.remove(&key);
+                        }
+                        self.remove_evicted_gpu_tiles(outcome.evicted);
+                    }
+                    Ok(DocumentEvent::SelectionReady(selection)) => {
+                        let tab = &mut self.documents[index];
+                        if selection.generation == tab.selection_generation {
+                            tab.selection = Some(selection);
+                            self.status = "Selection Quad baseline updated".to_owned();
+                        }
+                    }
+                    Ok(DocumentEvent::Status(status)) => {
+                        self.status = status;
+                        self.documents[index].error = None;
+                    }
+                    Ok(DocumentEvent::Failed { operation, message }) => {
+                        self.documents[index].error = Some(format!("{operation}: {message}"));
+                        if operation == "highlight" {
+                            let tab = &mut self.documents[index];
+                            tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
+                            if !tab.has_unsaved_changes() && !tab.is_saving() {
+                                tab.state = DocumentState::ReadyClean;
+                            }
+                        }
+                        if operation == "highlight-state" {
+                            let tab = &mut self.documents[index];
+                            tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
+                            // MuPDF already created the annotation; only the
+                            // follow-up snapshot failed, so remain dirty.
+                            tab.state = DocumentState::ReadyDirty;
+                        }
+                        if operation == "save" {
+                            self.documents[index].save_in_flight = false;
+                            self.documents[index].state = DocumentState::ReadyDirty;
+                            let failed_path = self.tabs.tabs()[index].path();
+                            if let Some(confirmation) = &mut self.close_confirmation
+                                && confirmation.path == failed_path
+                            {
+                                confirmation.save_in_flight = false;
+                            }
+                        } else if operation == "open"
+                            || operation == "resume"
+                            || operation == "document-info"
+                        {
+                            self.documents[index].state = DocumentState::Error;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        let tab = &mut self.documents[index];
+                        tab.save_in_flight = false;
+                        if tab.state != DocumentState::Error {
+                            tab.error = Some("document worker terminated".to_owned());
+                            tab.state = DocumentState::Error;
+                        }
+                        tab.service = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Removing a tab while iterating its event queue would shift the vector
+        // and could skip the next document. Deferred close runs after all queues.
+        if let Some(path) = self.saved_tab_to_close.take() {
+            self.close_tab_by_path(&path);
+        }
+        if self.window_close_pending
+            && self.close_confirmation.is_none()
+            && !self.documents.iter().any(DocumentTab::is_saving)
+        {
+            self.prompt_next_window_document(context);
+        }
+    }
+
+    fn handle_dropped_files(&mut self, context: &egui::Context) {
+        let dropped_files = context.input(|input| input.raw.dropped_files.clone());
+        for file in dropped_files {
+            if let Some(path) = file.path {
+                self.open_document(path);
+            }
+        }
+    }
+
+    fn handle_shortcuts(&mut self, context: &egui::Context) {
+        let next_tab = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Tab));
+        if next_tab {
+            self.select_next_tab();
+        }
+
+        let page_up = context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::PageUp));
+        if page_up {
+            self.move_page(-1);
+        }
+        let page_down =
+            context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::PageDown));
+        if page_down {
+            self.move_page(1);
+        }
+
+        let zoom_delta = context.input(|input| input.zoom_delta());
+        if (zoom_delta - 1.0).abs() > f32::EPSILON {
+            self.zoom_by(zoom_delta);
+        }
+
+        let close_flow_active = self.window_close_pending || self.close_confirmation.is_some();
+        let save_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::S));
+        if save_pressed && !close_flow_active {
+            self.save();
+        }
+        let highlight_pressed =
+            context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::H));
+        if highlight_pressed && !close_flow_active {
+            self.create_highlight();
+        }
+        let copy_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::C));
+        if copy_pressed {
+            self.copy_selection(context);
+        }
+    }
+
+    fn active_index(&self) -> Option<usize> {
+        self.tabs.selected_index()
+    }
+
+    fn next_activity_sequence(&mut self) -> u64 {
+        self.activity_sequence = self.activity_sequence.wrapping_add(1);
+        self.activity_sequence
+    }
+
+    fn activate_document(&mut self, index: usize, previous: Option<usize>) {
+        if let Some(previous) = previous.filter(|previous| *previous != index) {
+            // Pending work is invalidated immediately. Completed textures remain
+            // reusable only while the shared byte-budget LRU can retain them.
+            self.documents[previous].invalidate_rendering();
+        }
+
+        let sequence = self.next_activity_sequence();
+        self.documents[index].last_selected_sequence = sequence;
+        if self.documents[index].state == DocumentState::Suspended {
+            let path = self.tabs.tabs()[index].path().to_path_buf();
+            self.documents[index].resume(path);
+            self.status = "Reopening suspended PDF after external-change check…".to_owned();
+        }
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        let previous = self.active_index();
+        if !self.tabs.select(index) {
+            return;
+        }
+        self.activate_document(index, previous);
+    }
+
+    fn maybe_suspend_inactive_document(&mut self) {
+        let Some(memory) = memory_stats::memory_stats() else {
+            return;
+        };
+        if memory.physical_mem <= RESIDENT_MEMORY_SUSPEND_THRESHOLD_BYTES {
+            return;
+        }
+
+        let states = self
+            .documents
+            .iter()
+            .map(|document| (document.state, document.last_selected_sequence))
+            .collect::<Vec<_>>();
+        let Some(index) = oldest_suspendable_index(self.active_index(), &states) else {
+            return;
+        };
+        if !self.documents[index].is_suspendable() {
+            return;
+        }
+
+        let keys = self.documents[index]
+            .tiles
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.gpu_lru.remove(&key);
+        }
+        self.documents[index].suspend();
+        self.status = format!(
+            "Suspended inactive tab to reduce resident memory ({:.1} MiB)",
+            memory.physical_mem as f64 / 1_048_576.0
+        );
+    }
+
+    fn select_next_tab(&mut self) {
+        if self.documents.is_empty() {
+            return;
+        }
+        let next = self
+            .active_index()
+            .map(|index| (index + 1) % self.documents.len())
+            .unwrap_or(0);
+        self.select_tab(next);
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        let Some(document) = self.documents.get(index) else {
+            return;
+        };
+        // A queued incremental save precedes Shutdown on the worker command
+        // queue, so Discard cannot honestly cancel it. Wait for completion.
+        if document.is_saving() {
+            self.status = "Waiting for the current save before closing…".to_owned();
+            return;
+        }
+        if document.has_unsaved_changes() {
+            self.close_confirmation = Some(CloseConfirmation {
+                scope: CloseScope::Tab,
+                path: self.tabs.tabs()[index].path().to_path_buf(),
+                save_in_flight: false,
+            });
+            return;
+        }
+        self.close_tab_now(index);
+    }
+
+    fn close_tab_now(&mut self, index: usize) {
+        if self.tabs.close(index).is_some() {
+            for key in self.documents[index].tiles.keys() {
+                self.gpu_lru.remove(key);
+            }
+            self.documents.remove(index);
+            self.status = "Tab closed".to_owned();
+        }
+    }
+
+    fn remove_evicted_gpu_tiles(&mut self, evicted: Vec<(TileCacheKey, ())>) {
+        for (key, ()) in evicted {
+            if let Some(document) = self
+                .documents
+                .iter_mut()
+                .find(|document| document.document_id == key.document_id)
+            {
+                document.tiles.remove(&key);
+            }
+        }
+    }
+
+    fn close_tab_by_path(&mut self, path: &Path) {
+        let index = self.tabs.tabs().iter().position(|tab| tab.path() == path);
+        if let Some(index) = index {
+            self.close_tab_now(index);
+        }
+    }
+
+    fn handle_window_close(&mut self, context: &egui::Context) {
+        let close_requested = context.input(|input| input.viewport().close_requested());
+        if !close_requested || self.allow_window_close {
+            return;
+        }
+
+        // eframe closes the native window unless cancellation is sent during
+        // the same frame in which the OS close request is observed.
+        context.send_viewport_cmd(ViewportCommand::CancelClose);
+        self.window_close_pending = true;
+        if self.close_confirmation.is_none() {
+            self.prompt_next_window_document(context);
+        }
+    }
+
+    fn prompt_next_window_document(&mut self, context: &egui::Context) {
+        if self.documents.iter().any(DocumentTab::is_saving) {
+            self.status = "Waiting for the current save before closing…".to_owned();
+            return;
+        }
+
+        let next_path = self
+            .documents
+            .iter()
+            .enumerate()
+            .find(|(index, document)| {
+                let path = self.tabs.tabs()[*index].path();
+                document.has_unsaved_changes() && !self.approved_window_documents.contains(path)
+            })
+            .map(|(index, _)| self.tabs.tabs()[index].path().to_path_buf());
+
+        if let Some(path) = next_path {
+            self.close_confirmation = Some(CloseConfirmation {
+                scope: CloseScope::Window,
+                path,
+                save_in_flight: false,
+            });
+            return;
+        }
+
+        self.allow_window_close = true;
+        self.window_close_pending = false;
+        self.close_confirmation = None;
+        context.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    fn finish_save_for_close(&mut self, path: &Path, context: &egui::Context) {
+        let Some(confirmation) = &self.close_confirmation else {
+            return;
+        };
+        let save_matches = confirmation.save_in_flight && confirmation.path == path;
+        if !save_matches {
+            return;
+        }
+
+        let scope = confirmation.scope;
+        self.close_confirmation = None;
+        match scope {
+            CloseScope::Tab => self.saved_tab_to_close = Some(path.to_path_buf()),
+            CloseScope::Window => {
+                self.approved_window_documents.insert(path.to_path_buf());
+                self.prompt_next_window_document(context);
+            }
+        }
+    }
+
+    fn apply_close_decision(&mut self, decision: CloseDecision, context: &egui::Context) {
+        let Some(confirmation) = &self.close_confirmation else {
+            return;
+        };
+        let scope = confirmation.scope;
+        let path = confirmation.path.clone();
+
+        match decision {
+            CloseDecision::Save => {
+                let Some(index) = self
+                    .tabs
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.path() == path.as_path())
+                else {
+                    self.close_confirmation = None;
+                    return;
+                };
+                if self.documents[index].is_saving() {
+                    self.status = "Waiting for the current save before closing…".to_owned();
+                    return;
+                }
+                let queued = self.documents[index].send(DocumentCommand::Save);
+                if queued {
+                    self.documents[index].save_in_flight = true;
+                    self.documents[index].state = DocumentState::Saving;
+                    if let Some(confirmation) = &mut self.close_confirmation {
+                        confirmation.save_in_flight = true;
+                    }
+                    self.status = "Saving before close…".to_owned();
+                } else {
+                    self.error = Some("save: document worker is unavailable".to_owned());
+                }
+            }
+            CloseDecision::Discard => {
+                self.close_confirmation = None;
+                match scope {
+                    CloseScope::Tab => self.close_tab_by_path(&path),
+                    CloseScope::Window => {
+                        self.approved_window_documents.insert(path);
+                        self.prompt_next_window_document(context);
+                    }
+                }
+            }
+            CloseDecision::Cancel => {
+                self.close_confirmation = None;
+                self.approved_window_documents.clear();
+                self.allow_window_close = false;
+                self.window_close_pending = false;
+                self.status = "Close canceled".to_owned();
+            }
+        }
+    }
+
+    fn close_confirmation_dialog(&mut self, context: &egui::Context) {
+        let Some(confirmation) = &self.close_confirmation else {
+            return;
+        };
+        let file_name = confirmation
+            .path
+            .file_name()
+            .unwrap_or(confirmation.path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        let save_in_flight = confirmation.save_in_flight;
+
+        let modal = egui::Modal::new(Id::new("unsaved-document-close")).show(context, |ui| {
+            ui.heading("Unsaved Highlight annotations");
+            ui.label(format!("Save changes to {file_name}?"));
+            ui.horizontal(|ui| {
+                let save = ui
+                    .add_enabled(!save_in_flight, egui::Button::new("Save"))
+                    .clicked()
+                    .then_some(CloseDecision::Save);
+                let discard = ui
+                    .add_enabled(!save_in_flight, egui::Button::new("Discard"))
+                    .clicked()
+                    .then_some(CloseDecision::Discard);
+                let cancel = ui
+                    .button(if save_in_flight {
+                        "Keep open"
+                    } else {
+                        "Cancel"
+                    })
+                    .clicked()
+                    .then_some(CloseDecision::Cancel);
+                save.or(discard).or(cancel)
+            })
+            .inner
+        });
+
+        if let Some(decision) = modal.inner {
+            self.apply_close_decision(decision, context);
+        } else if modal.should_close() && !save_in_flight {
+            self.apply_close_decision(CloseDecision::Cancel, context);
+        }
+    }
+
+    fn move_page(&mut self, delta: isize) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        let Some(page_count) = tab.info.as_ref().map(|info| info.page_bounds.len()) else {
+            return;
+        };
+        let last_page = page_count.saturating_sub(1);
+        let target = tab
+            .view
+            .current_page
+            .saturating_add_signed(delta)
+            .min(last_page);
+        tab.view.current_page = target;
+        tab.view.scroll_to_page = Some(target);
+        tab.view.restore_anchor = None;
+    }
+
+    fn zoom_by(&mut self, factor: f32) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        let zoom = (tab.view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        tab.set_zoom(zoom, ZoomMode::Fixed);
+    }
+
+    fn copy_selection(&mut self, context: &egui::Context) {
+        let Some(selection) = self.active_tab_mut().and_then(|tab| tab.selection.as_ref()) else {
+            return;
+        };
+        context.copy_text(selection.text.clone());
+        self.status = "Selected text copied".to_owned();
+    }
+
+    fn create_highlight(&mut self) {
+        if self.window_close_pending || self.close_confirmation.is_some() {
+            return;
+        }
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        let can_save = tab
+            .info
+            .as_ref()
+            .is_some_and(|info| info.can_save_incrementally);
+        // Safe full-file replacement is not implemented yet. Editing a PDF
+        // that cannot use incremental save would create an unsavable state.
+        if !can_save {
+            self.error = Some(
+                "highlight: this PDF cannot be saved incrementally; editing is disabled".to_owned(),
+            );
+            return;
+        }
+        let Some(selection) = &tab.selection else {
+            self.error = Some("highlight: select text before creating a Highlight".to_owned());
+            return;
+        };
+        if selection.quads.is_empty() {
+            self.error = Some("highlight: MuPDF returned no selection Quads".to_owned());
+            return;
+        }
+
+        let request = HighlightRequest {
+            page_index: selection.page_index,
+            quads: selection.quads.clone(),
+        };
+        if tab.send(DocumentCommand::CreateHighlight(request)) {
+            // This local pending count closes the race before MuPDF reports its
+            // dirty flag back from the document worker.
+            tab.pending_highlights += 1;
+            tab.state = DocumentState::ReadyDirty;
+            self.status = "Creating PDF Highlight annotation…".to_owned();
+        } else {
+            self.error = Some("highlight: document worker is unavailable".to_owned());
+        }
+    }
+
+    fn save(&mut self) {
+        if self.window_close_pending || self.close_confirmation.is_some() {
+            return;
+        }
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        if tab.is_saving() {
+            self.status = "A save is already in progress".to_owned();
+            return;
+        }
+        let Some(info) = &tab.info else {
+            return;
+        };
+        if !info.dirty && tab.pending_highlights == 0 {
+            self.status = "No unsaved Highlight annotations".to_owned();
+            return;
+        }
+
+        if tab.send(DocumentCommand::Save) {
+            tab.save_in_flight = true;
+            tab.state = DocumentState::Saving;
+            self.status = "Saving incrementally and reopening for verification…".to_owned();
+        } else {
+            self.error = Some("save: document worker is unavailable".to_owned());
+        }
+    }
+
+    fn active_tab_mut(&mut self) -> Option<&mut DocumentTab> {
+        let index = self.active_index()?;
+        self.documents.get_mut(index)
+    }
+
+    fn tab_bar(&mut self, root_ui: &mut egui::Ui) {
+        let selected_index = self.active_index();
+        let mut select_request = None;
+        let mut close_request = None;
+        egui::Panel::top("tabs").show(root_ui, |ui| {
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, tab) in self.tabs.tabs().iter().enumerate() {
+                        let dirty = self.documents[index].has_unsaved_changes();
+                        let marker = if dirty { "● " } else { "" };
+                        let title = tab
+                            .path()
+                            .file_name()
+                            .map(|name| name.to_string_lossy())
+                            .unwrap_or_else(|| tab.path().as_os_str().to_string_lossy());
+                        if ui
+                            .selectable_label(
+                                selected_index == Some(index),
+                                format!("{marker}{title}"),
+                            )
+                            .clicked()
+                        {
+                            select_request = Some(index);
+                        }
+                        if ui.small_button("×").clicked() {
+                            close_request = Some(index);
+                        }
+                        ui.separator();
+                    }
+                });
+            });
+        });
+        if let Some(index) = select_request {
+            self.select_tab(index);
+        }
+        if let Some(index) = close_request {
+            self.close_tab(index);
+        }
+    }
+
+    fn toolbar(&mut self, root_ui: &mut egui::Ui) {
+        egui::Panel::top("toolbar").show(root_ui, |ui| {
+            let Some(index) = self.active_index() else {
+                ui.label("Drop PDF files here (maximum 20 tabs)");
+                return;
+            };
+            let page_count = self.documents[index]
+                .info
+                .as_ref()
+                .map(|info| info.page_bounds.len())
+                .unwrap_or(0);
+            let current_page = self.documents[index].view.current_page;
+            let can_highlight = self.documents[index]
+                .info
+                .as_ref()
+                .is_some_and(|info| info.can_save_incrementally)
+                && self.documents[index]
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| !selection.quads.is_empty());
+
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("◀").clicked() {
+                    self.move_page(-1);
+                }
+                ui.label(format!("{} / {}", current_page + 1, page_count));
+                if ui.button("▶").clicked() {
+                    self.move_page(1);
+                }
+                ui.separator();
+                if ui.button("−").clicked() {
+                    self.zoom_by(1.0 / 1.1);
+                }
+                ui.label(format!("{:.0}%", self.documents[index].view.zoom * 100.0));
+                if ui.button("+").clicked() {
+                    self.zoom_by(1.1);
+                }
+                if ui.button("Fit width").clicked() {
+                    self.documents[index].view.zoom_mode = ZoomMode::FitWidth;
+                }
+                if ui.button("Fit page").clicked() {
+                    self.documents[index].view.zoom_mode = ZoomMode::FitPage;
+                }
+                ui.separator();
+                let continuous = self.documents[index].view.display_mode == DisplayMode::Continuous;
+                if ui.selectable_label(continuous, "Continuous").clicked() {
+                    self.documents[index].set_display_mode(DisplayMode::Continuous);
+                }
+                if ui.selectable_label(!continuous, "Single page").clicked() {
+                    self.documents[index].set_display_mode(DisplayMode::SinglePage);
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(can_highlight, egui::Button::new("Highlight (H)"))
+                    .clicked()
+                {
+                    self.create_highlight();
+                }
+                if ui.button("Save (Ctrl+S)").clicked() {
+                    self.save();
+                }
+            });
+        });
+    }
+
+    fn status_panel(&self, root_ui: &mut egui::Ui) {
+        egui::Panel::bottom("status")
+            .resizable(true)
+            .default_size(105.0)
+            .show(root_ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&self.status);
+                    if let Some(index) = self.active_index() {
+                        let tab = &self.documents[index];
+                        if let Some(info) = &tab.info {
+                            ui.separator();
+                            ui.label(format!("open {:.1} ms", milliseconds(info.open_time)));
+                            ui.label(format!("Highlights: {}", info.highlight_count));
+                            // LunaPDF must expose the MuPDF capability directly; it does not
+                            // substitute a full rewrite when incremental save is unavailable.
+                            if info.can_save_incrementally {
+                                ui.label("incremental save");
+                            }
+                            if let Some(memory) = info.physical_memory_bytes {
+                                ui.label(format_memory(memory));
+                            }
+                        }
+                        let current_tile = tab
+                            .tiles
+                            .values()
+                            .find(|cached| cached.tile.page_index == tab.view.current_page);
+                        if let Some(cached) = current_tile {
+                            ui.label(format!(
+                                "render {:.1} ms @ {:.2}x",
+                                milliseconds(cached.tile.render_time),
+                                cached.tile.scale
+                            ));
+                            if let Some(memory) = cached.tile.physical_memory_bytes {
+                                ui.label(format_memory(memory));
+                            }
+                        }
+                        if let Some(selection) = &tab.selection {
+                            ui.label(format!(
+                                "text {:.1} ms",
+                                milliseconds(selection.extraction_time)
+                            ));
+                        }
+                    }
+                    ui.separator();
+                    if self.gpu_lru.is_empty() {
+                        ui.label("GPU tiles: empty");
+                    } else {
+                        ui.label(format!(
+                            "GPU tiles: {} ({:.1}/{:.0} MiB)",
+                            self.gpu_lru.len(),
+                            self.gpu_lru.current_bytes() as f64 / 1_048_576.0,
+                            self.gpu_lru.budget() as f64 / 1_048_576.0,
+                        ));
+                    }
+                });
+                if let Some(error) = &self.error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                if let Some(error) = self
+                    .active_index()
+                    .and_then(|index| self.documents[index].error.as_deref())
+                {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                ui.separator();
+                ui.strong("Logical selection / Ctrl+C");
+                let selection_text = self
+                    .active_index()
+                    .and_then(|index| self.documents[index].selection.as_ref())
+                    .map(|selection| selection.text.as_str())
+                    .unwrap_or("Drag across page text to inspect MuPDF selection Quads.");
+                ui.label(selection_text);
+            });
+    }
+
+    fn central_panel(&mut self, root_ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            let Some(index) = self.active_index() else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Drop one or more PDF files into this window");
+                });
+                return;
+            };
+            if self.documents[index].state == DocumentState::Opening {
+                ui.centered_and_justified(|ui| ui.spinner());
+                return;
+            }
+            if self.documents[index].state == DocumentState::Error {
+                ui.centered_and_justified(|ui| {
+                    ui.colored_label(
+                        Color32::LIGHT_RED,
+                        self.documents[index]
+                            .error
+                            .as_deref()
+                            .unwrap_or("The PDF worker stopped"),
+                    );
+                });
+                return;
+            }
+            if self.documents[index].info.is_none() {
+                return;
+            }
+
+            self.update_fit_zoom(index, ui.available_size());
+            match self.documents[index].view.display_mode {
+                DisplayMode::Continuous => self.continuous_view(ui, index),
+                DisplayMode::SinglePage => self.single_page_view(ui, index),
+            }
+        });
+    }
+
+    fn update_fit_zoom(&mut self, index: usize, available: Vec2) {
+        let tab = &mut self.documents[index];
+        let Some(info) = &tab.info else {
+            return;
+        };
+        let Some(bounds) = info.page_bounds.get(tab.view.current_page) else {
+            return;
+        };
+        let usable_width = (available.x - PAGE_GAP * 2.0).max(1.0);
+        let usable_height = (available.y - PAGE_GAP * 2.0).max(1.0);
+        let desired = match tab.view.zoom_mode {
+            ZoomMode::Fixed => return,
+            ZoomMode::FitWidth => usable_width / bounds.width(),
+            ZoomMode::FitPage => {
+                (usable_width / bounds.width()).min(usable_height / bounds.height())
+            }
+        }
+        .clamp(MIN_ZOOM, MAX_ZOOM);
+
+        if (tab.view.zoom - desired).abs() > ZOOM_CHANGE_EPSILON {
+            let mode = tab.view.zoom_mode;
+            tab.set_zoom(desired, mode);
+        }
+    }
+
+    fn continuous_view(&mut self, ui: &mut egui::Ui, index: usize) {
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let viewport_size = ui.available_size();
+        let viewport = &mut self.viewport;
+        let gpu_lru = &mut self.gpu_lru;
+        let tab = &mut self.documents[index];
+        let info = tab.info.as_ref().expect("checked before drawing");
+        let path = info.path.clone();
+        let page_bounds = info.page_bounds.clone();
+        let widest_page = page_bounds
+            .iter()
+            .map(|bounds| bounds.width() * tab.view.zoom)
+            .fold(0.0_f32, f32::max);
+        let content_width = viewport_size.x.max(widest_page + PAGE_GAP * 2.0);
+        let layout = ContinuousLayout::new(&page_bounds, tab.view.zoom, content_width);
+        let jump_offset = if let Some(page) = tab.view.scroll_to_page.take() {
+            tab.view.restore_anchor = None;
+            layout
+                .placement(page)
+                .map(|placement| Vec2::new(0.0, placement.y))
+        } else {
+            tab.view.restore_anchor.take().and_then(|anchor| {
+                layout
+                    .centered_offset(anchor, viewport_size.x, viewport_size.y)
+                    .map(|(x, y)| Vec2::new(x, y))
+            })
+        };
+        let mut scroll_area = egui::ScrollArea::both()
+            .id_salt(("continuous-pdf", path))
+            .auto_shrink([false, false]);
+        if let Some(offset) = jump_offset {
+            scroll_area = scroll_area.scroll_offset(offset);
+        }
+
+        let mut completed_drag = None;
+        let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
+            ui.set_min_size(Vec2::new(content_width, layout.total_height()));
+            // One viewport of prefetch keeps ordinary wheel scrolling smooth
+            // while the shared byte LRU supplies the hard memory bound.
+            let wanted_pages = layout.visible_pages(
+                visible_viewport.min.y..visible_viewport.max.y,
+                visible_viewport.height(),
+            );
+            let mut requests = Vec::new();
+            for page_index in wanted_pages.clone() {
+                let Some(placement) = layout.placement(page_index) else {
+                    continue;
+                };
+                let page_content_rect = Rect::from_min_size(
+                    Pos2::new(placement.x, placement.y),
+                    Vec2::new(placement.width, placement.height),
+                );
+                let Some(mut page_requests) = tile_requests_for_page(
+                    tab,
+                    page_index,
+                    page_bounds[page_index],
+                    page_content_rect,
+                    visible_viewport,
+                    pixels_per_point,
+                ) else {
+                    continue;
+                };
+                requests.append(&mut page_requests);
+            }
+            tab.prepare_tiles(requests);
+
+            for page_index in wanted_pages {
+                let Some(placement) = layout.placement(page_index) else {
+                    continue;
+                };
+                let screen_rect = Rect::from_min_size(
+                    ui.max_rect().min + Vec2::new(placement.x, placement.y),
+                    Vec2::new(placement.width, placement.height),
+                );
+                paint_page_tiles(ui, screen_rect, page_index, tab, gpu_lru);
+                let response = ui
+                    .scope_builder(UiBuilder::new().max_rect(screen_rect), |page_ui| {
+                        viewport.interact_at(
+                            page_ui,
+                            screen_rect,
+                            page_index,
+                            page_bounds[page_index],
+                            tab.selection.as_ref(),
+                        )
+                    })
+                    .inner;
+                if response.is_some() {
+                    completed_drag = response;
+                }
+            }
+        });
+
+        if let Some(page) = layout.page_at_y(output.state.offset.y + 1.0) {
+            tab.view.current_page = page;
+        }
+        let viewport_center = output.state.offset + output.inner_rect.size() / 2.0;
+        tab.view.center_anchor = layout.anchor_at(viewport_center.x, viewport_center.y);
+        if let Some((page_index, start, end)) = completed_drag {
+            tab.request_selection(page_index, start, end);
+            self.status = "Resolving selection on the document worker…".to_owned();
+        }
+    }
+
+    fn single_page_view(&mut self, ui: &mut egui::Ui, index: usize) {
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let viewport = &mut self.viewport;
+        let gpu_lru = &mut self.gpu_lru;
+        let tab = &mut self.documents[index];
+        let info = tab.info.as_ref().expect("checked before drawing");
+        let path = info.path.clone();
+        let page_index = tab.view.current_page;
+        let bounds = info.page_bounds[page_index];
+        let display_size = Vec2::new(
+            bounds.width() * tab.view.zoom,
+            bounds.height() * tab.view.zoom,
+        );
+        let viewport_size = ui.available_size();
+        let content_size = Vec2::new(
+            viewport_size.x.max(display_size.x + PAGE_GAP * 2.0),
+            viewport_size.y.max(display_size.y + PAGE_GAP * 2.0),
+        );
+        let page_x = ((content_size.x - display_size.x) / 2.0).max(PAGE_GAP);
+        let page_y = ((content_size.y - display_size.y) / 2.0).max(PAGE_GAP);
+        let page_content_rect = Rect::from_min_size(Pos2::new(page_x, page_y), display_size);
+        let restored_offset = tab.view.restore_single_anchor.take().map(|anchor| {
+            single_page_centered_offset(page_content_rect, anchor, viewport_size, content_size)
+        });
+        let mut completed_drag = None;
+        let mut scroll_area = egui::ScrollArea::both()
+            .id_salt(("single-pdf", path))
+            .auto_shrink([false, false]);
+        if let Some(offset) = restored_offset {
+            scroll_area = scroll_area.scroll_offset(offset);
+        }
+        let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
+            ui.set_min_size(content_size);
+            let screen_rect = Rect::from_min_size(
+                ui.max_rect().min + page_content_rect.min.to_vec2(),
+                display_size,
+            );
+            let requests = tile_requests_for_page(
+                tab,
+                page_index,
+                bounds,
+                page_content_rect,
+                visible_viewport,
+                pixels_per_point,
+            )
+            .unwrap_or_default();
+            tab.prepare_tiles(requests);
+            paint_page_tiles(ui, screen_rect, page_index, tab, gpu_lru);
+            completed_drag = ui
+                .scope_builder(UiBuilder::new().max_rect(screen_rect), |page_ui| {
+                    viewport.interact_at(
+                        page_ui,
+                        screen_rect,
+                        page_index,
+                        bounds,
+                        tab.selection.as_ref(),
+                    )
+                })
+                .inner;
+        });
+
+        let viewport_center = output.state.offset + output.inner_rect.size() / 2.0;
+        tab.view.single_center_anchor = Some(normalized_page_point(
+            page_content_rect,
+            viewport_center.to_pos2(),
+        ));
+
+        if let Some((page_index, start, end)) = completed_drag {
+            tab.request_selection(page_index, start, end);
+            self.status = "Resolving selection on the document worker…".to_owned();
+        }
+    }
+}
+
+impl TileCacheKey {
+    fn from_request(document_id: u64, request: &TileRequest) -> Self {
+        Self {
+            document_id,
+            page_index: request.page_index,
+            zoom_bits: request.zoom.to_bits(),
+            pixels_per_point_bits: request.pixels_per_point.to_bits(),
+            rotation_quarter_turns: 0,
+            spec: request.spec,
+            revision: request.expected_revision,
+        }
+    }
+
+    fn from_tile(document_id: u64, tile: &RenderedTile) -> Self {
+        Self {
+            document_id,
+            page_index: tile.page_index,
+            zoom_bits: tile.zoom.to_bits(),
+            pixels_per_point_bits: tile.pixels_per_point.to_bits(),
+            rotation_quarter_turns: 0,
+            spec: tile.spec,
+            revision: tile.revision,
+        }
+    }
+}
+
+/// Enumerates the raster tiles needed for one page and assigns view priority.
+fn tile_requests_for_page(
+    tab: &DocumentTab,
+    page_index: usize,
+    bounds: crate::domain::document::PageRect,
+    page_screen_rect: Rect,
+    visible_viewport: Rect,
+    pixels_per_point: f32,
+) -> Option<Vec<TileRequest>> {
+    let scale = tab.view.zoom * pixels_per_point;
+    let grid = TileGrid::new(bounds, scale)?;
+    let prioritized_specs = prioritized_tile_specs(grid, page_screen_rect, visible_viewport)?;
+    let revision = tab.info.as_ref()?.revision;
+    let mut requests = Vec::with_capacity(prioritized_specs.len());
+    for (spec, priority) in prioritized_specs {
+        requests.push(TileRequest {
+            page_index,
+            zoom: tab.view.zoom,
+            pixels_per_point,
+            scale,
+            generation: tab.view.generation,
+            expected_revision: revision,
+            spec,
+            priority,
+        });
+    }
+    Some(requests)
+}
+
+/// Limits raster work to the visible area and exactly one viewport around it.
+fn prioritized_tile_specs(
+    grid: TileGrid,
+    page_rect: Rect,
+    visible_viewport: Rect,
+) -> Option<Vec<(TileSpec, RenderPriority)>> {
+    let margin = visible_viewport.size();
+    let request_viewport =
+        Rect::from_min_max(visible_viewport.min - margin, visible_viewport.max + margin);
+    let requested_page_rect = page_rect.intersect(request_viewport);
+    if !requested_page_rect.is_positive() {
+        return Some(Vec::new());
+    }
+    let min_x = logical_edge_to_pixel(
+        requested_page_rect.left(),
+        page_rect.left(),
+        page_rect.width(),
+        grid.pixel_width(),
+        false,
+    )?;
+    let min_y = logical_edge_to_pixel(
+        requested_page_rect.top(),
+        page_rect.top(),
+        page_rect.height(),
+        grid.pixel_height(),
+        false,
+    )?;
+    let max_x = logical_edge_to_pixel(
+        requested_page_rect.right(),
+        page_rect.left(),
+        page_rect.width(),
+        grid.pixel_width(),
+        true,
+    )?;
+    let max_y = logical_edge_to_pixel(
+        requested_page_rect.bottom(),
+        page_rect.top(),
+        page_rect.height(),
+        grid.pixel_height(),
+        true,
+    )?;
+    let specs = grid.specs_in_pixel_rect(min_x, min_y, max_x, max_y)?;
+    let mut prioritized = Vec::new();
+    for spec in specs {
+        let tile_rect = logical_tile_rect(page_rect, grid, spec);
+        if tile_rect.intersects(request_viewport) {
+            prioritized.push((spec, tile_priority(tile_rect, visible_viewport)));
+        }
+    }
+    Some(prioritized)
+}
+
+/// Maps a logical page edge to a bounded page-local device pixel edge.
+fn logical_edge_to_pixel(
+    value: f32,
+    page_start: f32,
+    logical_extent: f32,
+    pixel_extent: u32,
+    round_up: bool,
+) -> Option<u32> {
+    if !value.is_finite() || !page_start.is_finite() || logical_extent <= 0.0 {
+        return None;
+    }
+    let scaled = (value - page_start) / logical_extent * pixel_extent as f32;
+    if !scaled.is_finite() {
+        return None;
+    }
+    // Outward rounding includes every edge pixel touched by the logical
+    // prefetch rectangle, including partial right and bottom tiles.
+    let rounded = if round_up {
+        scaled.ceil()
+    } else {
+        scaled.floor()
+    };
+    Some(rounded.clamp(0.0, pixel_extent as f32) as u32)
+}
+
+fn logical_tile_rect(page_rect: Rect, grid: TileGrid, spec: TileSpec) -> Rect {
+    let width = grid.pixel_width() as f32;
+    let height = grid.pixel_height() as f32;
+    let left = page_rect.left() + page_rect.width() * spec.pixel_x as f32 / width;
+    let top = page_rect.top() + page_rect.height() * spec.pixel_y as f32 / height;
+    let right =
+        page_rect.left() + page_rect.width() * (spec.pixel_x + spec.pixel_width) as f32 / width;
+    let bottom =
+        page_rect.top() + page_rect.height() * (spec.pixel_y + spec.pixel_height) as f32 / height;
+    Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom))
+}
+
+fn tile_priority(tile_rect: Rect, visible_viewport: Rect) -> RenderPriority {
+    if tile_rect.intersects(visible_viewport) {
+        return RenderPriority::Visible;
+    }
+    // Right/below is the usual forward reading direction for both continuous
+    // and zoomed single-page scrolling; left/above is retained as lower rank.
+    if tile_rect.top() >= visible_viewport.bottom() || tile_rect.left() >= visible_viewport.right()
+    {
+        RenderPriority::NextViewport
+    } else {
+        RenderPriority::PreviousViewport
+    }
+}
+
+/// Converts the viewport center into a page-relative coordinate for zoom restore.
+fn normalized_page_point(page_rect: Rect, point: Pos2) -> Vec2 {
+    Vec2::new(
+        ((point.x - page_rect.left()) / page_rect.width()).clamp(0.0, 1.0),
+        ((point.y - page_rect.top()) / page_rect.height()).clamp(0.0, 1.0),
+    )
+}
+
+/// Centers a normalized PDF page point while respecting both scroll extents.
+fn single_page_centered_offset(
+    page_rect: Rect,
+    normalized_anchor: Vec2,
+    viewport_size: Vec2,
+    content_size: Vec2,
+) -> Vec2 {
+    let anchor = Pos2::new(
+        page_rect.left() + page_rect.width() * normalized_anchor.x,
+        page_rect.top() + page_rect.height() * normalized_anchor.y,
+    );
+    let desired = anchor.to_vec2() - viewport_size / 2.0;
+    let maximum = (content_size - viewport_size).max(Vec2::ZERO);
+    Vec2::new(
+        desired.x.clamp(0.0, maximum.x),
+        desired.y.clamp(0.0, maximum.y),
+    )
+}
+
+fn paint_page_tiles(
+    ui: &egui::Ui,
+    screen_rect: Rect,
+    page_index: usize,
+    tab: &DocumentTab,
+    gpu_lru: &mut WeightedLruCache<TileCacheKey, ()>,
+) {
+    ui.painter()
+        .rect_filled(screen_rect, 2.0, Color32::from_gray(245));
+    let mut keys = tab
+        .wanted_tiles
+        .iter()
+        .filter(|key| key.page_index == page_index)
+        .copied()
+        .collect::<Vec<_>>();
+    keys.sort_by_key(|key| (key.spec.pixel_y, key.spec.pixel_x));
+
+    let mut painted_any = false;
+    for key in keys {
+        let retained = gpu_lru.get(&key).is_some();
+        if retained && let Some(cached) = tab.tiles.get(&key) {
+            PageViewport::paint_tile(ui, screen_rect, &cached.texture, &cached.tile);
+            painted_any = true;
+        }
+    }
+    if !painted_any {
+        ui.painter().text(
+            screen_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("Rendering page {}…", page_index + 1),
+            egui::TextStyle::Body.resolve(ui.style()),
+            Color32::DARK_GRAY,
+        );
+    }
+}
+
+impl DocumentTab {
+    fn new(document_id: u64, path: PathBuf, last_selected_sequence: u64) -> Self {
+        Self {
+            document_id,
+            service: Some(DocumentService::spawn(path)),
+            state: DocumentState::Opening,
+            last_selected_sequence,
+            info: None,
+            error: None,
+            tiles: HashMap::new(),
+            pending_tiles: HashMap::new(),
+            wanted_tiles: HashSet::new(),
+            selection: None,
+            selection_generation: 0,
+            pending_highlights: 0,
+            save_in_flight: false,
+            view: ViewState {
+                display_mode: DisplayMode::Continuous,
+                zoom_mode: ZoomMode::FitWidth,
+                zoom: 1.0,
+                current_page: 0,
+                scroll_to_page: Some(0),
+                center_anchor: None,
+                restore_anchor: None,
+                single_center_anchor: None,
+                restore_single_anchor: None,
+                generation: 1,
+            },
+        }
+    }
+
+    fn send(&self, command: DocumentCommand) -> bool {
+        self.service
+            .as_ref()
+            .is_some_and(|service| service.send(command))
+    }
+
+    fn cancel_render(&self, request: &TileRequest) {
+        if let Some(service) = &self.service {
+            service.cancel_render(request);
+        }
+    }
+
+    fn is_saving(&self) -> bool {
+        document_save_blocks_close(self.save_in_flight)
+    }
+
+    fn is_suspendable(&self) -> bool {
+        self.state == DocumentState::ReadyClean && !self.has_unsaved_changes()
+    }
+
+    fn suspend(&mut self) {
+        self.invalidate_rendering();
+        self.tiles.clear();
+        self.service = None;
+        self.state = DocumentState::Suspended;
+    }
+
+    fn resume(&mut self, path: PathBuf) {
+        let expected_version = self
+            .info
+            .as_ref()
+            .expect("only an opened clean document can be suspended")
+            .version;
+        self.service = Some(DocumentService::resume(path, expected_version));
+        self.state = DocumentState::Opening;
+        self.invalidate_rendering();
+    }
+
+    fn set_zoom(&mut self, zoom: f32, mode: ZoomMode) {
+        match self.view.display_mode {
+            DisplayMode::Continuous => self.view.restore_anchor = self.view.center_anchor,
+            DisplayMode::SinglePage => {
+                self.view.restore_single_anchor = self.view.single_center_anchor
+            }
+        }
+        self.view.zoom = zoom;
+        self.view.zoom_mode = mode;
+        self.invalidate_rendering();
+    }
+
+    fn set_display_mode(&mut self, mode: DisplayMode) {
+        if self.view.switch_display_mode(mode) {
+            self.invalidate_rendering();
+        }
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.state == DocumentState::ReadyDirty
+            || self.pending_highlights > 0
+            || self.info.as_ref().is_some_and(|info| info.dirty)
+    }
+
+    fn invalidate_rendering(&mut self) {
+        self.view.generation = self.view.generation.wrapping_add(1);
+        let pending = self
+            .pending_tiles
+            .drain()
+            .map(|(_, request)| request)
+            .collect::<Vec<_>>();
+        for request in pending {
+            self.cancel_render(&request);
+        }
+        self.wanted_tiles.clear();
+    }
+
+    fn prepare_tiles(&mut self, requests: Vec<TileRequest>) {
+        let wanted_tiles = requests
+            .iter()
+            .map(|request| TileCacheKey::from_request(self.document_id, request))
+            .collect::<HashSet<_>>();
+        let canceled_keys = self
+            .pending_tiles
+            .keys()
+            .filter(|key| !wanted_tiles.contains(key))
+            .copied()
+            .collect::<Vec<_>>();
+        for key in canceled_keys {
+            if let Some(request) = self.pending_tiles.remove(&key) {
+                self.cancel_render(&request);
+            }
+        }
+        self.wanted_tiles = wanted_tiles;
+
+        for request in requests {
+            let key = TileCacheKey::from_request(self.document_id, &request);
+            if self.tiles.contains_key(&key) {
+                continue;
+            }
+            // A lower enum rank is a stronger priority. Requeue only when the
+            // same tile has moved into a more urgent viewport class.
+            if let Some(pending) = self.pending_tiles.get(&key)
+                && request.priority >= pending.priority
+            {
+                continue;
+            }
+            let queued = self.send(DocumentCommand::RenderTile(request));
+            if queued {
+                self.pending_tiles.insert(key, request);
+            }
+        }
+    }
+
+    fn request_selection(&mut self, page_index: usize, start: PagePoint, end: PagePoint) {
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        let _queued = self.send(DocumentCommand::Select {
+            page_index,
+            generation: self.selection_generation,
+            start,
+            end,
+        });
+    }
+}
+
+impl ViewState {
+    /// Transfers the centered PDF coordinate between the two display modes.
+    fn switch_display_mode(&mut self, mode: DisplayMode) -> bool {
+        if self.display_mode == mode {
+            return false;
+        }
+
+        match (self.display_mode, mode) {
+            (DisplayMode::Continuous, DisplayMode::SinglePage) => {
+                let anchor = self.center_anchor.unwrap_or(PageAnchor {
+                    page_index: self.current_page,
+                    page_x_fraction: 0.5,
+                    page_y_fraction: 0.5,
+                });
+                self.current_page = anchor.page_index;
+                let normalized = Vec2::new(anchor.page_x_fraction, anchor.page_y_fraction);
+                self.single_center_anchor = Some(normalized);
+                self.restore_single_anchor = Some(normalized);
+                self.scroll_to_page = None;
+            }
+            (DisplayMode::SinglePage, DisplayMode::Continuous) => {
+                let normalized = self.single_center_anchor.unwrap_or(Vec2::splat(0.5));
+                let anchor = PageAnchor {
+                    page_index: self.current_page,
+                    page_x_fraction: normalized.x,
+                    page_y_fraction: normalized.y,
+                };
+                self.center_anchor = Some(anchor);
+                self.restore_anchor = Some(anchor);
+                self.scroll_to_page = None;
+            }
+            _ => unreachable!("LunaPDF has exactly two display modes"),
+        }
+        self.display_mode = mode;
+        true
+    }
+}
+
+impl eframe::App for PrototypeApp {
+    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.receive_document_events(context);
+        self.maybe_suspend_inactive_document();
+        self.handle_dropped_files(context);
+        self.handle_shortcuts(context);
+        self.handle_window_close(context);
+        context.request_repaint_after(Duration::from_millis(33));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.tab_bar(ui);
+        self.toolbar(ui);
+        self.status_panel(ui);
+        self.central_panel(ui);
+        self.close_confirmation_dialog(ui.ctx());
+    }
+}
+
+/// Picks the longest-unused clean document and never selects the active tab.
+fn oldest_suspendable_index(
+    active_index: Option<usize>,
+    states: &[(DocumentState, u64)],
+) -> Option<usize> {
+    states
+        .iter()
+        .enumerate()
+        .filter(|(index, (state, _))| {
+            Some(*index) != active_index && *state == DocumentState::ReadyClean
+        })
+        .min_by_key(|(_, (_, last_selected))| *last_selected)
+        .map(|(index, _)| index)
+}
+
+fn document_save_blocks_close(save_in_flight: bool) -> bool {
+    save_in_flight
+}
+
+/// A dirty Highlight event can precede the completion of an already queued Save.
+fn state_after_document_info(current: DocumentState, dirty: bool) -> DocumentState {
+    if dirty && current == DocumentState::Saving {
+        DocumentState::Saving
+    } else if dirty {
+        DocumentState::ReadyDirty
+    } else {
+        DocumentState::ReadyClean
+    }
+}
+
+/// Accepts a raster only when it still belongs to the visible document state.
+///
+/// The worker cannot cancel an in-progress MuPDF render, so all four identity
+/// dimensions are checked before the result allocates a GPU texture.
+fn tile_result_is_current(
+    is_active: bool,
+    key: TileCacheKey,
+    result_generation: u64,
+    current_generation: u64,
+    current_revision: Option<u64>,
+    wanted_tiles: &HashSet<TileCacheKey>,
+) -> bool {
+    is_active
+        && result_generation == current_generation
+        && current_revision == Some(key.revision)
+        && wanted_tiles.contains(&key)
+}
+
+fn is_pdf_path(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn format_memory(bytes: usize) -> String {
+    format!("resident memory: {:.1} MiB", bytes as f64 / 1_048_576.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_result_requires_active_tab_and_current_document_state() {
+        let key = TileCacheKey {
+            document_id: 1,
+            page_index: 3,
+            zoom_bits: 1.0_f32.to_bits(),
+            pixels_per_point_bits: 1.0_f32.to_bits(),
+            rotation_quarter_turns: 0,
+            spec: TileSpec {
+                pixel_x: 0,
+                pixel_y: 0,
+                pixel_width: 512,
+                pixel_height: 512,
+            },
+            revision: 4,
+        };
+        let wanted = HashSet::from([key]);
+
+        assert!(tile_result_is_current(true, key, 8, 8, Some(4), &wanted));
+        assert!(!tile_result_is_current(false, key, 8, 8, Some(4), &wanted));
+        assert!(!tile_result_is_current(true, key, 7, 8, Some(4), &wanted));
+    }
+
+    #[test]
+    fn huge_page_requests_stay_bounded_to_three_viewports() {
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 10_000.0,
+            y1: 10_000_000.0,
+        };
+        let grid = TileGrid::new(bounds, 16.0).unwrap();
+        let page_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(10_000.0, 10_000_000.0));
+        let visible = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 800.0));
+
+        let requested = prioritized_tile_specs(grid, page_rect, visible).unwrap();
+
+        assert_eq!(requested.len(), 63 * 50);
+    }
+
+    #[test]
+    fn prefetched_tile_becomes_visible_when_viewport_reaches_it() {
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 100.0,
+            y1: 2_000.0,
+        };
+        let grid = TileGrid::new(bounds, 1.0).unwrap();
+        let page_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 2_000.0));
+        let first_view = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 400.0));
+        let later_view = Rect::from_min_size(Pos2::new(0.0, 500.0), Vec2::new(100.0, 400.0));
+
+        let first = prioritized_tile_specs(grid, page_rect, first_view).unwrap();
+        let later = prioritized_tile_specs(grid, page_rect, later_view).unwrap();
+        let target = TileSpec {
+            pixel_x: 0,
+            pixel_y: 512,
+            pixel_width: 100,
+            pixel_height: 512,
+        };
+
+        assert_eq!(
+            first.iter().find(|(spec, _)| *spec == target).unwrap().1,
+            RenderPriority::NextViewport
+        );
+        assert_eq!(
+            later.iter().find(|(spec, _)| *spec == target).unwrap().1,
+            RenderPriority::Visible
+        );
+    }
+
+    #[test]
+    fn single_page_zoom_keeps_two_dimensional_page_anchor() {
+        let viewport_size = Vec2::new(500.0, 400.0);
+        let page_rect = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(2_000.0, 3_000.0));
+        let content_size = page_rect.size() + Vec2::splat(40.0);
+        let expected_anchor = Vec2::new(0.7, 0.6);
+
+        let offset =
+            single_page_centered_offset(page_rect, expected_anchor, viewport_size, content_size);
+        let restored_anchor =
+            normalized_page_point(page_rect, (offset + viewport_size / 2.0).to_pos2());
+
+        assert!((restored_anchor.x - expected_anchor.x).abs() < f32::EPSILON);
+        assert!((restored_anchor.y - expected_anchor.y).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn display_mode_roundtrip_preserves_page_and_normalized_position() {
+        let expected = PageAnchor {
+            page_index: 4,
+            page_x_fraction: 0.7,
+            page_y_fraction: 0.75,
+        };
+        let mut view = ViewState {
+            display_mode: DisplayMode::Continuous,
+            zoom_mode: ZoomMode::Fixed,
+            zoom: 2.0,
+            current_page: 3,
+            scroll_to_page: None,
+            center_anchor: Some(expected),
+            restore_anchor: None,
+            single_center_anchor: None,
+            restore_single_anchor: None,
+            generation: 1,
+        };
+
+        assert!(view.switch_display_mode(DisplayMode::SinglePage));
+        assert_eq!(view.current_page, expected.page_index);
+        assert_eq!(
+            view.restore_single_anchor,
+            Some(Vec2::new(
+                expected.page_x_fraction,
+                expected.page_y_fraction
+            ))
+        );
+
+        assert!(view.switch_display_mode(DisplayMode::Continuous));
+        assert_eq!(view.restore_anchor, Some(expected));
+    }
+
+    #[test]
+    fn suspension_chooses_oldest_inactive_clean_document() {
+        let states = [
+            (DocumentState::ReadyClean, 2),
+            (DocumentState::ReadyDirty, 1),
+            (DocumentState::ReadyClean, 3),
+            (DocumentState::Saving, 0),
+        ];
+
+        assert_eq!(oldest_suspendable_index(Some(0), &states), Some(2));
+        assert_eq!(oldest_suspendable_index(Some(2), &states), Some(0));
+    }
+
+    #[test]
+    fn queued_save_blocks_close_until_document_returns_clean() {
+        let after_highlight_event = state_after_document_info(DocumentState::Saving, true);
+        let save_in_flight = true;
+        assert_eq!(after_highlight_event, DocumentState::Saving);
+        assert!(document_save_blocks_close(save_in_flight));
+
+        let after_info_failure = DocumentState::Error;
+        assert_eq!(after_info_failure, DocumentState::Error);
+        assert!(document_save_blocks_close(save_in_flight));
+
+        let after_save_event = state_after_document_info(after_highlight_event, false);
+        assert_eq!(after_save_event, DocumentState::ReadyClean);
+        assert!(!document_save_blocks_close(false));
+    }
+}

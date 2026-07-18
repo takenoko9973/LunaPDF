@@ -1,0 +1,759 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt as _;
+
+use anyhow::{Context, Result, ensure};
+use mupdf::color::AnnotationColor;
+use mupdf::pdf::{AnnotationQuadPoints, PdfAnnotationType, PdfDocument, PdfWriteOptions};
+use mupdf::{
+    Colorspace, Device, DisplayList, IRect, Matrix, Pixmap, Point, Quad, Rect, TextBlockContent,
+    TextPage, TextPageFlags,
+};
+
+use crate::domain::document::{
+    DocumentInfo, DocumentVersion, HighlightRequest, PageRect, RenderedTile, TileRequest, TileSpec,
+};
+use crate::domain::selection::{
+    GlyphSnapshot, PagePoint, PageQuad, SelectionSnapshot, selected_text,
+};
+
+// A one-page selection needs a finite output buffer because the high-level
+// MuPDF API fills caller-owned Quad slots. 4096 lines is deliberately above
+// the target technical documents' per-page line count while still turning a
+// malformed result into an explicit error instead of unbounded allocation.
+const SELECTION_QUAD_CAPACITY: usize = 4_096;
+
+// PDF numeric objects can round coordinates while serializing an incremental
+// update. One hundredth of a PDF point is below display-pixel precision at the
+// supported zoom range while still detecting a materially different Quad.
+const PDF_COORDINATE_TOLERANCE: f32 = 0.01;
+
+pub(super) struct MuPdfBackend {
+    path: PathBuf,
+    document: PdfDocument,
+    page_bounds: Vec<PageRect>,
+    version: DocumentVersion,
+    open_time: Duration,
+    revision: u64,
+    pending_highlights: Vec<HighlightRequest>,
+    display_list: Option<CachedDisplayList>,
+}
+
+struct CachedDisplayList {
+    page_index: usize,
+    revision: u64,
+    list: DisplayList,
+}
+
+impl MuPdfBackend {
+    /// Opens the PDF and reads lightweight page geometry on the owner worker.
+    pub(super) fn open(path: PathBuf) -> Result<Self> {
+        let version_before_open = read_document_version(&path)?;
+        let mupdf_path = path
+            .to_str()
+            .context("MuPDF requires a Unicode path on Windows")?;
+        let open_started = Instant::now();
+        let document = PdfDocument::open(mupdf_path)
+            .with_context(|| format!("failed to open PDF: {}", path.display()))?;
+        let page_bounds = load_page_bounds(&document)?;
+        ensure!(!page_bounds.is_empty(), "PDF contains no pages");
+        let version_after_open = read_document_version(&path)?;
+        let version = stable_open_version(version_before_open, version_after_open)?;
+        let open_time = open_started.elapsed();
+
+        Ok(Self {
+            path,
+            document,
+            page_bounds,
+            version,
+            open_time,
+            revision: 0,
+            pending_highlights: Vec::new(),
+            display_list: None,
+        })
+    }
+
+    pub(super) fn info(&self) -> Result<DocumentInfo> {
+        Ok(DocumentInfo {
+            path: self.path.clone(),
+            page_bounds: self.page_bounds.clone(),
+            highlight_count: highlight_count(&self.document)?,
+            can_save_incrementally: self.document.can_be_saved_incrementally(),
+            dirty: self.document.has_unsaved_changes(),
+            revision: self.revision,
+            open_time: self.open_time,
+            physical_memory_bytes: physical_memory_bytes(),
+            version: self.version,
+        })
+    }
+
+    pub(super) fn render_tile(&mut self, request: TileRequest) -> Result<Option<RenderedTile>> {
+        // A non-finite or non-positive matrix produces meaningless dimensions
+        // in MuPDF, so invalid zoom state is rejected at the adapter boundary.
+        ensure!(
+            request.scale.is_finite() && request.scale > 0.0,
+            "render scale must be finite and positive"
+        );
+        ensure!(
+            request.spec.pixel_width > 0 && request.spec.pixel_height > 0,
+            "tile dimensions must be positive"
+        );
+        page_number(request.page_index, self.page_bounds.len())?;
+        // A mutation can overtake queued prefetch work. Stale tiles are normal
+        // cancellation, not a document error that should be shown to the user.
+        if request.expected_revision != self.revision {
+            return Ok(None);
+        }
+
+        let bounds = self.page_bounds[request.page_index];
+        let render_started = Instant::now();
+        let transform = Matrix::new_scale(request.scale, request.scale);
+        let page_pixel_bounds = Rect::new(bounds.x0, bounds.y0, bounds.x1, bounds.y1)
+            .transform(&transform)
+            .round();
+        let page_pixel_width = u32::try_from(page_pixel_bounds.x1 - page_pixel_bounds.x0)
+            .context("MuPDF returned a negative page pixel width")?;
+        let page_pixel_height = u32::try_from(page_pixel_bounds.y1 - page_pixel_bounds.y0)
+            .context("MuPDF returned a negative page pixel height")?;
+        let clip = tile_clip(page_pixel_bounds, request.spec)?;
+        let mut pixmap = Pixmap::new_with_rect(&Colorspace::device_rgb(), clip, false)?;
+        // MuPDF does not initialize a newly allocated pixmap. Opaque white is
+        // the PDF page background expected outside painted content.
+        pixmap.clear_with(255)?;
+        let device = Device::from_pixmap_with_clip(&pixmap, clip)?;
+        let display_list = self.display_list(request.page_index)?;
+        display_list.run(&device, &transform, Rect::from(clip))?;
+        drop(device);
+
+        let pixel_width = usize::try_from(pixmap.width())?;
+        let pixel_height = usize::try_from(pixmap.height())?;
+        let component_count = usize::from(pixmap.n());
+        let stride =
+            usize::try_from(pixmap.stride()).context("MuPDF returned a negative pixmap stride")?;
+        let pixels_rgba = pixmap_samples_to_rgba(
+            pixmap.samples(),
+            pixel_width,
+            pixel_height,
+            stride,
+            component_count,
+        )?;
+
+        let pixel_x = u32::try_from(pixmap.x() - page_pixel_bounds.x0)
+            .context("MuPDF returned a tile origin before the page")?;
+        let pixel_y = u32::try_from(pixmap.y() - page_pixel_bounds.y0)
+            .context("MuPDF returned a tile origin before the page")?;
+        Ok(Some(RenderedTile {
+            page_index: request.page_index,
+            zoom: request.zoom,
+            pixels_per_point: request.pixels_per_point,
+            scale: request.scale,
+            generation: request.generation,
+            revision: self.revision,
+            spec: TileSpec {
+                pixel_x,
+                pixel_y,
+                pixel_width: pixmap.width(),
+                pixel_height: pixmap.height(),
+            },
+            page_pixel_width,
+            page_pixel_height,
+            pixels_rgba,
+            bounds,
+            render_time: render_started.elapsed(),
+            physical_memory_bytes: physical_memory_bytes(),
+        }))
+    }
+
+    fn display_list(&mut self, page_index: usize) -> Result<&DisplayList> {
+        let cache_is_current = self.display_list.as_ref().is_some_and(|cached| {
+            cached.page_index == page_index && cached.revision == self.revision
+        });
+        if !cache_is_current {
+            let page_number = page_number(page_index, self.page_bounds.len())?;
+            let page = self.document.load_pdf_page(page_number)?;
+            let list = page.to_display_list(true)?;
+            self.display_list = Some(CachedDisplayList {
+                page_index,
+                revision: self.revision,
+                list,
+            });
+        }
+        Ok(&self
+            .display_list
+            .as_ref()
+            .expect("display list was populated above")
+            .list)
+    }
+
+    pub(super) fn select(
+        &self,
+        page_index: usize,
+        generation: u64,
+        start: PagePoint,
+        end: PagePoint,
+    ) -> Result<SelectionSnapshot> {
+        let (mut text_page, glyphs, extraction_time) =
+            load_text_snapshot(&self.document, page_index, self.page_bounds.len())?;
+        let placeholder = Quad::from(Rect::default());
+        let mut selection_quads = vec![placeholder; SELECTION_QUAD_CAPACITY];
+        let quad_count = text_page.highlight_selection(
+            Point::new(start.x, start.y),
+            Point::new(end.x, end.y),
+            &selection_quads,
+        )?;
+        ensure!(
+            quad_count >= 0,
+            "MuPDF returned a negative selection Quad count"
+        );
+        let quad_count = usize::try_from(quad_count)?;
+        ensure!(
+            quad_count <= selection_quads.len(),
+            "selection exceeds the validation limit of {SELECTION_QUAD_CAPACITY} Quads"
+        );
+        selection_quads.truncate(quad_count);
+
+        Ok(SelectionSnapshot {
+            page_index,
+            generation,
+            text: selected_text(&glyphs, start, end),
+            quads: selection_quads.iter().map(page_quad_from_mupdf).collect(),
+            extraction_time,
+        })
+    }
+
+    pub(super) fn create_highlight(&mut self, page_index: usize, quads: &[PageQuad]) -> Result<()> {
+        ensure!(!quads.is_empty(), "cannot highlight an empty selection");
+        let page_number = page_number(page_index, self.page_bounds.len())?;
+        let annotation_quads = quads.iter().map(mupdf_quad_from_page).collect::<Vec<_>>();
+        let mut page = self.document.load_pdf_page(page_number)?;
+        let mut annotation =
+            page.add_highlight_annotation(AnnotationQuadPoints::new(annotation_quads))?;
+        annotation.set_color(AnnotationColor::Rgb {
+            red: 1.0,
+            green: 1.0,
+            blue: 0.0,
+        })?;
+        annotation.update()?;
+        page.update()?;
+        self.pending_highlights.push(HighlightRequest {
+            page_index,
+            quads: quads.to_vec(),
+        });
+        self.display_list = None;
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// Saves incrementally and reopens the file before reporting it as clean.
+    ///
+    /// Full-file replacement is intentionally deferred: the design requires a
+    /// same-directory temporary file and atomic platform replacement. A PDF
+    /// that cannot be saved incrementally fails visibly in this phase.
+    pub(super) fn save_incrementally(&mut self) -> Result<usize> {
+        let current_version = read_document_version(&self.path)?;
+        ensure!(
+            current_version == self.version,
+            "the PDF changed outside LunaPDF; refusing to overwrite it"
+        );
+        ensure!(
+            self.document.can_be_saved_incrementally(),
+            "this PDF cannot be saved incrementally in the current milestone"
+        );
+
+        let file_name = self
+            .path
+            .to_str()
+            .context("MuPDF cannot save a path that is not valid Unicode")?;
+        let expected_highlights = highlight_count(&self.document)?;
+        let expected_page_count = self.page_bounds.len();
+        let mut options = PdfWriteOptions::default();
+        options.set_incremental(true);
+        self.document
+            .save_with_options(file_name, options)
+            .with_context(|| format!("failed to save PDF: {}", self.path.display()))?;
+
+        let reopened = PdfDocument::open(file_name)
+            .context("saved PDF could not be reopened for verification")?;
+        let verified_highlights = highlight_count(&reopened)?;
+        ensure!(
+            verified_highlights == expected_highlights,
+            "saved PDF Highlight count changed during verification"
+        );
+        let page_bounds = load_page_bounds(&reopened)?;
+        ensure!(
+            page_bounds.len() == expected_page_count,
+            "saved PDF page count changed during verification"
+        );
+        for expected in &self.pending_highlights {
+            ensure!(
+                contains_highlight(&reopened, expected)?,
+                "saved PDF does not contain the Highlight created on page {}",
+                expected.page_index + 1
+            );
+        }
+
+        self.document = reopened;
+        self.page_bounds = page_bounds;
+        self.version = read_document_version(&self.path)?;
+        self.pending_highlights.clear();
+        self.revision += 1;
+        Ok(verified_highlights)
+    }
+}
+
+fn read_document_version(path: &Path) -> Result<DocumentVersion> {
+    // Handle-based metadata supplies Windows volume/file IDs; path-only
+    // metadata may omit them and cannot detect same-size path replacement.
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open PDF metadata: {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to read PDF metadata: {}", path.display()))?;
+    let (identity_primary, identity_secondary) = file_identity(&metadata)?;
+    Ok(DocumentVersion {
+        identity_primary,
+        identity_secondary,
+        length: metadata.len(),
+        modified: metadata
+            .modified()
+            .with_context(|| format!("failed to read PDF modification time: {}", path.display()))?,
+    })
+}
+
+/// Rejects a path replacement or in-place write racing MuPDF's open/read pass.
+fn stable_open_version(before: DocumentVersion, after: DocumentVersion) -> Result<DocumentVersion> {
+    ensure!(
+        before == after,
+        "the PDF changed while LunaPDF was opening it"
+    );
+    Ok(after)
+}
+
+/// Converts a page-local tile request into MuPDF device coordinates.
+///
+/// The final intersection tolerates a one-pixel edge difference between the
+/// Rust layout calculation and MuPDF's rectangle rounding, but rejects a tile
+/// that does not overlap the page at all.
+fn tile_clip(page_bounds: IRect, spec: TileSpec) -> Result<IRect> {
+    let local_x0 = i32::try_from(spec.pixel_x).context("tile x exceeds MuPDF's range")?;
+    let local_y0 = i32::try_from(spec.pixel_y).context("tile y exceeds MuPDF's range")?;
+    let width = i32::try_from(spec.pixel_width).context("tile width exceeds MuPDF's range")?;
+    let height = i32::try_from(spec.pixel_height).context("tile height exceeds MuPDF's range")?;
+    let local_x1 = local_x0
+        .checked_add(width)
+        .context("tile right edge overflowed")?;
+    let local_y1 = local_y0
+        .checked_add(height)
+        .context("tile bottom edge overflowed")?;
+    let requested = IRect::new(
+        page_bounds
+            .x0
+            .checked_add(local_x0)
+            .context("tile device x overflowed")?,
+        page_bounds
+            .y0
+            .checked_add(local_y0)
+            .context("tile device y overflowed")?,
+        page_bounds
+            .x0
+            .checked_add(local_x1)
+            .context("tile device right edge overflowed")?,
+        page_bounds
+            .y0
+            .checked_add(local_y1)
+            .context("tile device bottom edge overflowed")?,
+    );
+    let clip = requested.intersect(&page_bounds);
+    ensure!(!clip.is_empty(), "tile does not intersect the PDF page");
+    Ok(clip)
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Result<(u64, u64)> {
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(metadata: &fs::Metadata) -> Result<(u64, u64)> {
+    let volume_serial_number = metadata
+        .volume_serial_number()
+        .context("Windows did not provide the PDF volume serial number")?;
+    let file_index = metadata
+        .file_index()
+        .context("Windows did not provide the PDF file index")?;
+    Ok((u64::from(volume_serial_number), file_index))
+}
+
+fn load_page_bounds(document: &PdfDocument) -> Result<Vec<PageRect>> {
+    let page_count =
+        usize::try_from(document.page_count()?).context("MuPDF returned a negative page count")?;
+    let mut page_bounds = Vec::with_capacity(page_count);
+    for page_index in 0..page_count {
+        let page = document.load_pdf_page(page_number(page_index, page_count)?)?;
+        let bounds = page.bounds()?;
+        page_bounds.push(PageRect {
+            x0: bounds.x0,
+            y0: bounds.y0,
+            x1: bounds.x1,
+            y1: bounds.y1,
+        });
+    }
+    Ok(page_bounds)
+}
+
+fn load_text_snapshot(
+    document: &PdfDocument,
+    page_index: usize,
+    page_count: usize,
+) -> Result<(TextPage, Vec<GlyphSnapshot>, Duration)> {
+    let page = document.load_pdf_page(page_number(page_index, page_count)?)?;
+    let extraction_started = Instant::now();
+    // Empty flags record MuPDF's standard extraction baseline. Typst-specific
+    // bounding-box adjustments require the documented comparison first.
+    let text_page = page.to_text_page(TextPageFlags::empty())?;
+    let structured = text_page.structured();
+    let mut glyphs = Vec::new();
+    let mut line_index = 0;
+
+    for block in structured.blocks {
+        let TextBlockContent::Text { lines } = block.content else {
+            continue;
+        };
+        for line in lines {
+            glyphs.extend(line.chars.into_iter().map(|character| GlyphSnapshot {
+                character: character.ch,
+                quad: page_quad_from_mupdf(&character.quad),
+                line_index,
+            }));
+            line_index += 1;
+        }
+    }
+
+    Ok((text_page, glyphs, extraction_started.elapsed()))
+}
+
+fn pixmap_samples_to_rgba(
+    samples: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    component_count: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        component_count == 3 || component_count == 4,
+        "expected an RGB or RGBA MuPDF pixmap, got {component_count} components"
+    );
+    let row_bytes = width
+        .checked_mul(component_count)
+        .context("pixmap row byte count overflowed")?;
+    ensure!(
+        stride >= row_bytes,
+        "MuPDF pixmap stride is shorter than one row"
+    );
+    let required_bytes = stride
+        .checked_mul(height)
+        .context("pixmap byte count overflowed")?;
+    ensure!(
+        samples.len() >= required_bytes,
+        "MuPDF pixmap sample buffer is shorter than its dimensions"
+    );
+
+    let output_capacity = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("RGBA output byte count overflowed")?;
+    let mut rgba = Vec::with_capacity(output_capacity);
+    for row in samples.chunks(stride).take(height) {
+        for pixel in row[..row_bytes].chunks_exact(component_count) {
+            rgba.extend_from_slice(&pixel[..3]);
+            rgba.push(if component_count == 4 { pixel[3] } else { 255 });
+        }
+    }
+    Ok(rgba)
+}
+
+fn highlight_count(document: &PdfDocument) -> Result<usize> {
+    let page_count =
+        usize::try_from(document.page_count()?).context("MuPDF returned a negative page count")?;
+    let mut count = 0;
+    for page_index in 0..page_count {
+        let page = document.load_pdf_page(page_number(page_index, page_count)?)?;
+        for annotation in page.annotations() {
+            if annotation.r#type()? == PdfAnnotationType::Highlight {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn contains_highlight(document: &PdfDocument, expected: &HighlightRequest) -> Result<bool> {
+    let page_count =
+        usize::try_from(document.page_count()?).context("MuPDF returned a negative page count")?;
+    let page = document.load_pdf_page(page_number(expected.page_index, page_count)?)?;
+    for annotation in page.annotations() {
+        if annotation.r#type()? != PdfAnnotationType::Highlight {
+            continue;
+        }
+        let actual_quads = annotation.quad_points()?;
+        if actual_quads.len() != expected.quads.len() {
+            continue;
+        }
+        let all_quads_match = actual_quads
+            .iter()
+            .zip(&expected.quads)
+            .all(|(actual, expected)| quad_matches(actual, expected));
+        if all_quads_match {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn quad_matches(actual: &Quad, expected: &PageQuad) -> bool {
+    point_matches(&actual.ul, expected.upper_left)
+        && point_matches(&actual.ur, expected.upper_right)
+        && point_matches(&actual.ll, expected.lower_left)
+        && point_matches(&actual.lr, expected.lower_right)
+}
+
+fn point_matches(actual: &Point, expected: PagePoint) -> bool {
+    (actual.x - expected.x).abs() <= PDF_COORDINATE_TOLERANCE
+        && (actual.y - expected.y).abs() <= PDF_COORDINATE_TOLERANCE
+}
+
+fn page_number(page_index: usize, page_count: usize) -> Result<i32> {
+    ensure!(
+        page_index < page_count,
+        "page index {page_index} is outside the document's {page_count} pages"
+    );
+    i32::try_from(page_index).context("page index exceeds MuPDF's supported range")
+}
+
+fn physical_memory_bytes() -> Option<usize> {
+    memory_stats::memory_stats().map(|stats| stats.physical_mem)
+}
+
+fn page_quad_from_mupdf(quad: &Quad) -> PageQuad {
+    PageQuad {
+        upper_left: PagePoint::new(quad.ul.x, quad.ul.y),
+        upper_right: PagePoint::new(quad.ur.x, quad.ur.y),
+        lower_left: PagePoint::new(quad.ll.x, quad.ll.y),
+        lower_right: PagePoint::new(quad.lr.x, quad.lr.y),
+    }
+}
+
+fn mupdf_quad_from_page(quad: &PageQuad) -> Quad {
+    Quad::new(
+        Point::new(quad.upper_left.x, quad.upper_left.y),
+        Point::new(quad.upper_right.x, quad.upper_right.y),
+        Point::new(quad.lower_left.x, quad.lower_left.y),
+        Point::new(quad.lower_right.x, quad.lower_right.y),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    use mupdf::Size;
+    use mupdf::pdf::PdfObject;
+
+    fn tile_request(page_index: usize, scale: f32, generation: u64, revision: u64) -> TileRequest {
+        tile_request_with_spec(
+            page_index,
+            scale,
+            generation,
+            revision,
+            TileSpec {
+                pixel_x: 0,
+                pixel_y: 0,
+                pixel_width: 400,
+                pixel_height: 300,
+            },
+        )
+    }
+
+    fn tile_request_with_spec(
+        page_index: usize,
+        scale: f32,
+        generation: u64,
+        revision: u64,
+        spec: TileSpec,
+    ) -> TileRequest {
+        TileRequest {
+            page_index,
+            zoom: scale,
+            pixels_per_point: 1.0,
+            scale,
+            generation,
+            expected_revision: revision,
+            spec,
+            priority: crate::domain::document::RenderPriority::Visible,
+        }
+    }
+
+    #[test]
+    fn rgb_rows_with_padding_are_converted_to_rgba() {
+        let samples = [10, 20, 30, 40, 50, 60, 0, 0];
+
+        let rgba = pixmap_samples_to_rgba(&samples, 2, 1, 8, 3).unwrap();
+
+        assert_eq!(rgba, [10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn unexpected_pixmap_components_fail_explicitly() {
+        let error = pixmap_samples_to_rgba(&[128], 1, 1, 1, 1).unwrap_err();
+
+        assert!(error.to_string().contains("got 1 components"));
+    }
+
+    #[test]
+    fn document_change_during_open_is_rejected() {
+        let before = DocumentVersion {
+            identity_primary: 1,
+            identity_secondary: 2,
+            length: 100,
+            modified: SystemTime::UNIX_EPOCH,
+        };
+        let after = DocumentVersion {
+            length: 101,
+            ..before
+        };
+
+        assert!(stable_open_version(before, before).is_ok());
+        assert!(stable_open_version(before, after).is_err());
+    }
+
+    #[test]
+    fn second_page_highlight_is_incrementally_saved_and_verified() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("highlight-roundtrip.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let _first_page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let _second_page = document.new_page(Size::new(400.0, 300.0)).unwrap();
+            document.save(path_text).unwrap();
+        }
+
+        let mut backend = MuPdfBackend::open(path).unwrap();
+        let initial = backend.info().unwrap();
+        assert_eq!(initial.page_bounds.len(), 2);
+        let second_page = backend
+            .render_tile(tile_request(1, 1.0, 7, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_page.page_index, 1);
+        assert_eq!(second_page.generation, 7);
+        assert!(second_page.page_pixel_width > second_page.page_pixel_height);
+        let unannotated_pixels = second_page.pixels_rgba;
+
+        backend
+            .create_highlight(
+                1,
+                &[PageQuad {
+                    upper_left: PagePoint::new(40.0, 40.0),
+                    upper_right: PagePoint::new(180.0, 40.0),
+                    lower_left: PagePoint::new(40.0, 60.0),
+                    lower_right: PagePoint::new(180.0, 60.0),
+                }],
+            )
+            .unwrap();
+        assert!(backend.info().unwrap().dirty);
+        let annotated_page = backend
+            .render_tile(tile_request(1, 1.0, 8, 1))
+            .unwrap()
+            .unwrap();
+        assert_ne!(annotated_page.pixels_rgba, unannotated_pixels);
+
+        let verified_highlights = backend.save_incrementally().unwrap();
+        let saved = backend.info().unwrap();
+        assert_eq!(verified_highlights, 1);
+        assert_eq!(saved.highlight_count, 1);
+        assert!(!saved.dirty);
+    }
+
+    #[test]
+    fn invalid_page_or_scale_is_rejected_at_adapter_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounds.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            document.save(path_text).unwrap();
+        }
+        let mut backend = MuPdfBackend::open(path).unwrap();
+
+        assert!(backend.render_tile(tile_request(1, 1.0, 0, 0)).is_err());
+        assert!(backend.render_tile(tile_request(0, 0.0, 0, 0)).is_err());
+        assert!(
+            backend
+                .render_tile(tile_request(0, 1.0, 0, 99))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nonzero_pdf_boxes_render_internal_and_right_bottom_edge_tiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nonzero-boxes.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(1_400.0, 1_300.0)).unwrap();
+            let mut media_box = document.new_array_with_capacity(4).unwrap();
+            for coordinate in [100.0, 200.0, 1_300.0, 1_100.0] {
+                media_box
+                    .array_push(PdfObject::new_real(coordinate).unwrap())
+                    .unwrap();
+            }
+            page.object().dict_put("MediaBox", media_box).unwrap();
+            page.set_crop_box(Rect::new(100.0, 200.0, 1_300.0, 1_100.0))
+                .unwrap();
+            document.save(path_text).unwrap();
+        }
+
+        let mut backend = MuPdfBackend::open(path).unwrap();
+        let bounds = backend.info().unwrap().page_bounds[0];
+        assert_eq!((bounds.width(), bounds.height()), (1_200.0, 700.0));
+        let specs = [
+            TileSpec {
+                pixel_x: 512,
+                pixel_y: 0,
+                pixel_width: 512,
+                pixel_height: 512,
+            },
+            TileSpec {
+                pixel_x: 1_024,
+                pixel_y: 0,
+                pixel_width: 176,
+                pixel_height: 512,
+            },
+            TileSpec {
+                pixel_x: 0,
+                pixel_y: 512,
+                pixel_width: 512,
+                pixel_height: 188,
+            },
+        ];
+
+        for spec in specs {
+            let tile = backend
+                .render_tile(tile_request_with_spec(0, 1.0, 1, 0, spec))
+                .unwrap()
+                .unwrap();
+            assert_eq!(tile.spec, spec);
+            assert_eq!(tile.pixels_rgba.len(), spec.rgba_bytes().unwrap());
+        }
+    }
+}
