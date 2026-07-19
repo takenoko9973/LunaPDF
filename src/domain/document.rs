@@ -46,6 +46,7 @@ impl TileSpec {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RenderPriority {
     Visible,
+    CurrentViewport,
     NextViewport,
     PreviousViewport,
 }

@@ -80,8 +80,10 @@ pub(crate) enum DocumentEvent {
 
 pub(crate) struct DocumentService {
     foreground_sender: Sender<DocumentCommand>,
+    current_viewport_sender: Sender<DocumentCommand>,
     next_viewport_sender: Sender<DocumentCommand>,
     previous_viewport_sender: Sender<DocumentCommand>,
+    background_sender: Sender<DocumentCommand>,
     text_snapshot_wake_sender: Sender<()>,
     scheduled_tiles: Arc<Mutex<HashMap<WorkerTileKey, RenderPriority>>>,
     scheduled_text_snapshots: Arc<Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>>,
@@ -107,10 +109,12 @@ struct WorkerTextKey {
 
 struct WorkerChannels {
     foreground: Receiver<DocumentCommand>,
-    text_snapshot_wake: Receiver<()>,
-    text_snapshot_wake_sender: Sender<()>,
+    current_viewport: Receiver<DocumentCommand>,
     next_viewport: Receiver<DocumentCommand>,
     previous_viewport: Receiver<DocumentCommand>,
+    background: Receiver<DocumentCommand>,
+    text_snapshot_wake: Receiver<()>,
+    text_snapshot_wake_sender: Sender<()>,
     scheduled_text_snapshots: Arc<Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>>,
 }
 
@@ -159,8 +163,10 @@ impl DocumentService {
 
     fn spawn_with_version(path: PathBuf, expected_version: Option<DocumentVersion>) -> Self {
         let (foreground_sender, foreground_receiver) = unbounded();
+        let (current_viewport_sender, current_viewport_receiver) = unbounded();
         let (next_viewport_sender, next_viewport_receiver) = unbounded();
         let (previous_viewport_sender, previous_viewport_receiver) = unbounded();
+        let (background_sender, background_receiver) = unbounded();
         let (text_snapshot_wake_sender, text_snapshot_wake_receiver) = bounded(1);
         let (event_sender, event_receiver) = bounded(BUFFERED_EVENT_CAPACITY);
         let scheduled_tiles = Arc::new(Mutex::new(HashMap::new()));
@@ -170,10 +176,12 @@ impl DocumentService {
         let worker_text_snapshot_wake_sender = text_snapshot_wake_sender.clone();
         let worker_channels = WorkerChannels {
             foreground: foreground_receiver,
-            text_snapshot_wake: text_snapshot_wake_receiver,
-            text_snapshot_wake_sender: worker_text_snapshot_wake_sender,
+            current_viewport: current_viewport_receiver,
             next_viewport: next_viewport_receiver,
             previous_viewport: previous_viewport_receiver,
+            background: background_receiver,
+            text_snapshot_wake: text_snapshot_wake_receiver,
+            text_snapshot_wake_sender: worker_text_snapshot_wake_sender,
             scheduled_text_snapshots: worker_scheduled_text_snapshots,
         };
         thread::Builder::new()
@@ -191,8 +199,10 @@ impl DocumentService {
 
         Self {
             foreground_sender,
+            current_viewport_sender,
             next_viewport_sender,
             previous_viewport_sender,
+            background_sender,
             text_snapshot_wake_sender,
             scheduled_tiles,
             scheduled_text_snapshots,
@@ -206,7 +216,7 @@ impl DocumentService {
             DocumentCommand::RenderTile(request) => self.queue_render(request),
             DocumentCommand::LoadTextSnapshot(request) => self.queue_text_snapshot(request),
             DocumentCommand::SearchPage { .. } | DocumentCommand::LoadThumbnail(_) => {
-                self.previous_viewport_sender.send(command).is_ok()
+                self.background_sender.send(command).is_ok()
             }
             command => self.foreground_sender.send(command).is_ok(),
         }
@@ -267,6 +277,10 @@ impl DocumentService {
                 .foreground_sender
                 .send(DocumentCommand::RenderTile(request))
                 .is_ok(),
+            RenderPriority::CurrentViewport => self
+                .current_viewport_sender
+                .send(DocumentCommand::RenderTile(request))
+                .is_ok(),
             RenderPriority::NextViewport => self
                 .next_viewport_sender
                 .send(DocumentCommand::RenderTile(request))
@@ -317,10 +331,12 @@ fn run_worker(
 
     while let Some(command) = next_worker_command(
         &channels.foreground,
-        &channels.text_snapshot_wake,
-        &channels.text_snapshot_wake_sender,
+        &channels.current_viewport,
         &channels.next_viewport,
         &channels.previous_viewport,
+        &channels.text_snapshot_wake,
+        &channels.text_snapshot_wake_sender,
+        &channels.background,
         &channels.scheduled_text_snapshots,
     ) {
         match command {
@@ -465,17 +481,27 @@ fn take_scheduled_render(
 
 fn next_worker_command(
     foreground: &Receiver<DocumentCommand>,
-    text_snapshot_wake: &Receiver<()>,
-    text_snapshot_wake_sender: &Sender<()>,
+    current_viewport: &Receiver<DocumentCommand>,
     next_viewport: &Receiver<DocumentCommand>,
     previous_viewport: &Receiver<DocumentCommand>,
+    text_snapshot_wake: &Receiver<()>,
+    text_snapshot_wake_sender: &Sender<()>,
+    background: &Receiver<DocumentCommand>,
     scheduled_text_snapshots: &Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>,
 ) -> Option<DocumentCommand> {
     loop {
-        // Rendering and interactive commands remain preemptive between any two
-        // MuPDF operations. A bounded wake channel prevents offscreen text work
-        // from accumulating channel messages.
+        // Each non-blocking probe preserves the documented render tiers even
+        // when several queues become ready between two MuPDF operations.
         if let Ok(command) = foreground.try_recv() {
+            return Some(command);
+        }
+        if let Ok(command) = current_viewport.try_recv() {
+            return Some(command);
+        }
+        if let Ok(command) = next_viewport.try_recv() {
+            return Some(command);
+        }
+        if let Ok(command) = previous_viewport.try_recv() {
             return Some(command);
         }
         if text_snapshot_wake.try_recv().is_ok() {
@@ -486,12 +512,15 @@ fn next_worker_command(
             }
             continue;
         }
-        if let Ok(command) = next_viewport.try_recv() {
+        if let Ok(command) = background.try_recv() {
             return Some(command);
         }
 
         select_biased! {
             recv(foreground) -> command => return command.ok(),
+            recv(current_viewport) -> command => return command.ok(),
+            recv(next_viewport) -> command => return command.ok(),
+            recv(previous_viewport) -> command => return command.ok(),
             recv(text_snapshot_wake) -> signal => {
                 signal.ok()?;
                 if let Some(request) = take_scheduled_text_snapshot(
@@ -501,8 +530,7 @@ fn next_worker_command(
                     return Some(DocumentCommand::LoadTextSnapshot(request));
                 }
             },
-            recv(next_viewport) -> command => return command.ok(),
-            recv(previous_viewport) -> command => return command.ok(),
+            recv(background) -> command => return command.ok(),
         }
     }
 }
@@ -543,8 +571,10 @@ fn cancel_scheduled_text_snapshot(
 #[cfg(test)]
 fn next_command(
     foreground: &Receiver<DocumentCommand>,
+    current_viewport: &Receiver<DocumentCommand>,
     next_viewport: &Receiver<DocumentCommand>,
     previous_viewport: &Receiver<DocumentCommand>,
+    background: &Receiver<DocumentCommand>,
 ) -> Option<DocumentCommand> {
     // A ready visible/interactive command always wins before the worker starts
     // another prefetch tile. An in-progress MuPDF tile is not interrupted.
@@ -553,8 +583,10 @@ fn next_command(
     }
     select_biased! {
         recv(foreground) -> command => command.ok(),
+        recv(current_viewport) -> command => command.ok(),
         recv(next_viewport) -> command => command.ok(),
         recv(previous_viewport) -> command => command.ok(),
+        recv(background) -> command => command.ok(),
     }
 }
 
@@ -641,8 +673,10 @@ mod tests {
     #[test]
     fn foreground_command_precedes_queued_prefetch() {
         let (foreground_sender, foreground_receiver) = unbounded();
+        let (_current_sender, current_receiver) = unbounded();
         let (next_sender, next_receiver) = unbounded();
         let (_previous_sender, previous_receiver) = unbounded();
+        let (_background_sender, background_receiver) = unbounded();
         next_sender
             .send(prefetch_tile(RenderPriority::NextViewport))
             .unwrap();
@@ -655,8 +689,14 @@ mod tests {
             })
             .unwrap();
 
-        let command =
-            next_command(&foreground_receiver, &next_receiver, &previous_receiver).unwrap();
+        let command = next_command(
+            &foreground_receiver,
+            &current_receiver,
+            &next_receiver,
+            &previous_receiver,
+            &background_receiver,
+        )
+        .unwrap();
 
         assert!(matches!(command, DocumentCommand::Select { .. }));
     }
@@ -664,8 +704,10 @@ mod tests {
     #[test]
     fn next_viewport_precedes_queued_previous_viewport() {
         let (_foreground_sender, foreground_receiver) = unbounded();
+        let (_current_sender, current_receiver) = unbounded();
         let (next_sender, next_receiver) = unbounded();
         let (previous_sender, previous_receiver) = unbounded();
+        let (_background_sender, background_receiver) = unbounded();
         previous_sender
             .send(prefetch_tile(RenderPriority::PreviousViewport))
             .unwrap();
@@ -673,8 +715,14 @@ mod tests {
             .send(prefetch_tile(RenderPriority::NextViewport))
             .unwrap();
 
-        let command =
-            next_command(&foreground_receiver, &next_receiver, &previous_receiver).unwrap();
+        let command = next_command(
+            &foreground_receiver,
+            &current_receiver,
+            &next_receiver,
+            &previous_receiver,
+            &background_receiver,
+        )
+        .unwrap();
 
         assert!(matches!(
             command,
@@ -683,6 +731,75 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn current_viewport_precedes_adjacent_and_background_work() {
+        let (_foreground_sender, foreground_receiver) = unbounded();
+        let (current_sender, current_receiver) = unbounded();
+        let (next_sender, next_receiver) = unbounded();
+        let (_previous_sender, previous_receiver) = unbounded();
+        let (background_sender, background_receiver) = unbounded();
+        background_sender
+            .send(DocumentCommand::SearchPage {
+                page_index: 0,
+                query: Arc::from("needle"),
+                generation: 1,
+            })
+            .unwrap();
+        next_sender
+            .send(prefetch_tile(RenderPriority::NextViewport))
+            .unwrap();
+        current_sender
+            .send(prefetch_tile(RenderPriority::CurrentViewport))
+            .unwrap();
+
+        let command = next_command(
+            &foreground_receiver,
+            &current_receiver,
+            &next_receiver,
+            &previous_receiver,
+            &background_receiver,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            DocumentCommand::RenderTile(TileRequest {
+                priority: RenderPriority::CurrentViewport,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn previous_viewport_precedes_background_search() {
+        let (_foreground_sender, foreground_receiver) = unbounded();
+        let (_current_sender, current_receiver) = unbounded();
+        let (_next_sender, next_receiver) = unbounded();
+        let (previous_sender, previous_receiver) = unbounded();
+        let (background_sender, background_receiver) = unbounded();
+        background_sender
+            .send(DocumentCommand::SearchPage {
+                page_index: 0,
+                query: Arc::from("needle"),
+                generation: 1,
+            })
+            .unwrap();
+        previous_sender
+            .send(prefetch_tile(RenderPriority::PreviousViewport))
+            .unwrap();
+
+        let command = next_command(
+            &foreground_receiver,
+            &current_receiver,
+            &next_receiver,
+            &previous_receiver,
+            &background_receiver,
+        )
+        .unwrap();
+
+        assert!(matches!(command, DocumentCommand::RenderTile(_)));
     }
 
     #[test]
@@ -700,7 +817,9 @@ mod tests {
     #[test]
     fn visible_render_precedes_queued_search_page() {
         let (foreground_sender, foreground_receiver) = unbounded();
+        let (_current_sender, current_receiver) = unbounded();
         let (_next_sender, next_receiver) = unbounded();
+        let (_previous_sender, previous_receiver) = unbounded();
         let (background_sender, background_receiver) = unbounded();
         background_sender
             .send(DocumentCommand::SearchPage {
@@ -715,8 +834,14 @@ mod tests {
             )))
             .unwrap();
 
-        let command =
-            next_command(&foreground_receiver, &next_receiver, &background_receiver).unwrap();
+        let command = next_command(
+            &foreground_receiver,
+            &current_receiver,
+            &next_receiver,
+            &previous_receiver,
+            &background_receiver,
+        )
+        .unwrap();
 
         assert!(matches!(command, DocumentCommand::RenderTile(_)));
     }
@@ -724,16 +849,18 @@ mod tests {
     #[test]
     fn visible_text_snapshot_is_below_render_and_above_search() {
         let (foreground_sender, foreground_receiver) = unbounded();
+        let (_current_sender, current_receiver) = unbounded();
         let (text_wake_sender, text_wake_receiver) = bounded(1);
         let (_next_sender, next_receiver) = unbounded();
-        let (search_sender, search_receiver) = unbounded();
+        let (_previous_sender, previous_receiver) = unbounded();
+        let (background_sender, background_receiver) = unbounded();
         let request = TextSnapshotRequest {
             page_index: 0,
             expected_revision: 0,
         };
         let key = WorkerTextKey::from_request(&request);
         let scheduled_text = Mutex::new(HashMap::from([(key, request)]));
-        search_sender
+        background_sender
             .send(DocumentCommand::SearchPage {
                 page_index: 0,
                 query: Arc::from("needle"),
@@ -749,19 +876,23 @@ mod tests {
 
         let first = next_worker_command(
             &foreground_receiver,
+            &current_receiver,
+            &next_receiver,
+            &previous_receiver,
             &text_wake_receiver,
             &text_wake_sender,
-            &next_receiver,
-            &search_receiver,
+            &background_receiver,
             &scheduled_text,
         )
         .unwrap();
         let second = next_worker_command(
             &foreground_receiver,
+            &current_receiver,
+            &next_receiver,
+            &previous_receiver,
             &text_wake_receiver,
             &text_wake_sender,
-            &next_receiver,
-            &search_receiver,
+            &background_receiver,
             &scheduled_text,
         )
         .unwrap();

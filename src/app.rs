@@ -279,6 +279,7 @@ struct ViewState {
     restore_single_anchor: Option<Vec2>,
     single_wheel: SinglePageWheelState,
     autoscroll: Option<AutoscrollState>,
+    render_pixels_per_point_bits: Option<u32>,
     generation: u64,
 }
 
@@ -295,6 +296,12 @@ struct AutoscrollState {
     anchor: Pos2,
     requested_offset: Option<Vec2>,
     last_page_change_time: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SinglePageGeometry {
+    content_size: Vec2,
+    page_rect: Rect,
 }
 
 impl PrototypeApp {
@@ -1114,9 +1121,9 @@ impl PrototypeApp {
     fn activate_document(&mut self, index: usize, previous: Option<usize>) {
         if let Some(previous) = previous.filter(|previous| *previous != index) {
             self.documents[previous].view.stop_autoscroll();
-            // Pending work is invalidated immediately. Completed textures remain
-            // reusable only while the shared byte-budget LRU can retain them.
-            self.documents[previous].invalidate_rendering();
+            // A tab switch changes request ownership, not tile identity. Cancel
+            // queued work without discarding the generation or reusable textures.
+            self.documents[previous].cancel_rendering_requests();
             self.documents[previous].invalidate_text_snapshots();
             self.documents[previous].search.generation =
                 self.documents[previous].search.generation.wrapping_add(1);
@@ -2594,6 +2601,13 @@ impl PrototypeApp {
                 return;
             }
 
+            let pixels_per_point = ui.ctx().pixels_per_point();
+            let density_changed = self.documents[index]
+                .view
+                .update_render_density(pixels_per_point);
+            if density_changed {
+                self.documents[index].invalidate_rendering();
+            }
             self.update_fit_zoom(index, ui.available_size());
             match self.documents[index].view.display_mode {
                 DisplayMode::Continuous => self.continuous_view(ui, index),
@@ -2775,21 +2789,14 @@ impl PrototypeApp {
         let info = tab.info.as_ref().expect("checked before drawing");
         let path = info.path.clone();
         let revision = info.revision;
-        let page_count = info.page_bounds.len();
+        let page_bounds = info.page_bounds.clone();
+        let page_count = page_bounds.len();
         let page_index = tab.view.current_page;
-        let bounds = info.page_bounds[page_index];
-        let display_size = Vec2::new(
-            bounds.width() * tab.view.zoom,
-            bounds.height() * tab.view.zoom,
-        );
+        let bounds = page_bounds[page_index];
         let viewport_size = ui.available_size();
-        let content_size = Vec2::new(
-            viewport_size.x.max(display_size.x + PAGE_GAP * 2.0),
-            viewport_size.y.max(display_size.y + PAGE_GAP * 2.0),
-        );
-        let page_x = ((content_size.x - display_size.x) / 2.0).max(PAGE_GAP);
-        let page_y = ((content_size.y - display_size.y) / 2.0).max(PAGE_GAP);
-        let page_content_rect = Rect::from_min_size(Pos2::new(page_x, page_y), display_size);
+        let geometry = single_page_geometry(bounds, tab.view.zoom, viewport_size);
+        let content_size = geometry.content_size;
+        let page_content_rect = geometry.page_rect;
         let restored_offset = tab.view.restore_single_anchor.take().map(|anchor| {
             single_page_centered_offset(page_content_rect, anchor, viewport_size, content_size)
         });
@@ -2820,17 +2827,17 @@ impl PrototypeApp {
             tab.prepare_text_snapshots(std::iter::once(page_index), revision);
             let screen_rect = Rect::from_min_size(
                 ui.max_rect().min + page_content_rect.min.to_vec2(),
-                display_size,
+                page_content_rect.size(),
             );
-            let requests = tile_requests_for_page(
+            let requests = single_page_tile_requests(
                 tab,
+                &page_bounds,
                 page_index,
-                bounds,
                 page_content_rect,
                 visible_viewport,
+                viewport_size,
                 pixels_per_point,
-            )
-            .unwrap_or_default();
+            );
             tab.prepare_tiles(requests);
             paint_page_tiles(ui, screen_rect, page_index, tab, gpu_lru);
             if let Some(matches) = tab.search.pages.get(&page_index) {
@@ -3051,6 +3058,110 @@ fn tile_requests_for_page(
     Some(requests)
 }
 
+/// Orders the current page and its two transition views without rasterizing an
+/// enlarged adjacent page outside the range that appears after navigation.
+fn single_page_tile_requests(
+    tab: &DocumentTab,
+    page_bounds: &[crate::domain::document::PageRect],
+    page_index: usize,
+    current_page_rect: Rect,
+    visible_viewport: Rect,
+    viewport_size: Vec2,
+    pixels_per_point: f32,
+) -> Vec<TileRequest> {
+    let Some(current_bounds) = page_bounds.get(page_index).copied() else {
+        return Vec::new();
+    };
+    let mut requests = tile_requests_for_page(
+        tab,
+        page_index,
+        current_bounds,
+        current_page_rect,
+        visible_viewport,
+        pixels_per_point,
+    )
+    .unwrap_or_default();
+    for request in &mut requests {
+        if request.priority != RenderPriority::Visible {
+            // The current page's one-viewport margin must finish before either
+            // adjacent transition range, regardless of scroll direction.
+            request.priority = RenderPriority::CurrentViewport;
+        }
+    }
+
+    let horizontal_anchor = tab.view.single_center_anchor.unwrap_or(Vec2::splat(0.5)).x;
+    if let Some(next_page) = page_index.checked_add(1)
+        && let Some(bounds) = page_bounds.get(next_page).copied()
+    {
+        let mut next_requests = transition_tile_requests_for_page(
+            tab,
+            next_page,
+            bounds,
+            viewport_size,
+            Vec2::new(horizontal_anchor, 0.0),
+            pixels_per_point,
+            RenderPriority::NextViewport,
+        )
+        .unwrap_or_default();
+        requests.append(&mut next_requests);
+    }
+    if let Some(previous_page) = page_index.checked_sub(1)
+        && let Some(bounds) = page_bounds.get(previous_page).copied()
+    {
+        let mut previous_requests = transition_tile_requests_for_page(
+            tab,
+            previous_page,
+            bounds,
+            viewport_size,
+            Vec2::new(horizontal_anchor, 1.0),
+            pixels_per_point,
+            RenderPriority::PreviousViewport,
+        )
+        .unwrap_or_default();
+        requests.append(&mut previous_requests);
+    }
+    requests
+}
+
+/// Requests only the page area visible immediately after an edge transition.
+fn transition_tile_requests_for_page(
+    tab: &DocumentTab,
+    page_index: usize,
+    bounds: crate::domain::document::PageRect,
+    viewport_size: Vec2,
+    transition_anchor: Vec2,
+    pixels_per_point: f32,
+    priority: RenderPriority,
+) -> Option<Vec<TileRequest>> {
+    let geometry = single_page_geometry(bounds, tab.view.zoom, viewport_size);
+    let offset = single_page_centered_offset(
+        geometry.page_rect,
+        transition_anchor,
+        viewport_size,
+        geometry.content_size,
+    );
+    let transition_viewport = Rect::from_min_size(offset.to_pos2(), viewport_size);
+    let scale = tab.view.zoom * pixels_per_point;
+    let grid = TileGrid::new(bounds, scale)?;
+    let specs = tile_specs_intersecting_viewport(grid, geometry.page_rect, transition_viewport)?;
+    let revision = tab.info.as_ref()?.revision;
+    Some(
+        specs
+            .into_iter()
+            .map(|spec| TileRequest {
+                page_index,
+                zoom: tab.view.zoom,
+                pixels_per_point,
+                scale,
+                generation: tab.view.generation,
+                expected_revision: revision,
+                spec,
+                priority,
+            })
+            .collect(),
+    )
+}
+
 /// Limits raster work to the visible area and exactly one viewport around it.
 fn prioritized_tile_specs(
     grid: TileGrid,
@@ -3060,6 +3171,24 @@ fn prioritized_tile_specs(
     let margin = visible_viewport.size();
     let request_viewport =
         Rect::from_min_max(visible_viewport.min - margin, visible_viewport.max + margin);
+    let specs = tile_specs_intersecting_viewport(grid, page_rect, request_viewport)?;
+    Some(
+        specs
+            .into_iter()
+            .map(|spec| {
+                let tile_rect = logical_tile_rect(page_rect, grid, spec);
+                (spec, tile_priority(tile_rect, visible_viewport))
+            })
+            .collect(),
+    )
+}
+
+/// Enumerates only tiles intersecting the requested logical page region.
+fn tile_specs_intersecting_viewport(
+    grid: TileGrid,
+    page_rect: Rect,
+    request_viewport: Rect,
+) -> Option<Vec<TileSpec>> {
     let requested_page_rect = page_rect.intersect(request_viewport);
     if !requested_page_rect.is_positive() {
         return Some(Vec::new());
@@ -3093,14 +3222,12 @@ fn prioritized_tile_specs(
         true,
     )?;
     let specs = grid.specs_in_pixel_rect(min_x, min_y, max_x, max_y)?;
-    let mut prioritized = Vec::new();
-    for spec in specs {
-        let tile_rect = logical_tile_rect(page_rect, grid, spec);
-        if tile_rect.intersects(request_viewport) {
-            prioritized.push((spec, tile_priority(tile_rect, visible_viewport)));
-        }
-    }
-    Some(prioritized)
+    Some(
+        specs
+            .into_iter()
+            .filter(|spec| logical_tile_rect(page_rect, grid, *spec).intersects(request_viewport))
+            .collect(),
+    )
 }
 
 /// Maps a logical page edge to a bounded page-local device pixel edge.
@@ -3383,6 +3510,25 @@ fn paint_autoscroll_marker(ui: &egui::Ui, view_rect: Rect, anchor: Pos2) {
     painter.circle_filled(anchor, 2.0, stroke.color);
 }
 
+/// Builds the same centered ScrollArea coordinates for current and prefetched pages.
+fn single_page_geometry(
+    bounds: crate::domain::document::PageRect,
+    zoom: f32,
+    viewport_size: Vec2,
+) -> SinglePageGeometry {
+    let display_size = Vec2::new(bounds.width() * zoom, bounds.height() * zoom);
+    let content_size = Vec2::new(
+        viewport_size.x.max(display_size.x + PAGE_GAP * 2.0),
+        viewport_size.y.max(display_size.y + PAGE_GAP * 2.0),
+    );
+    let page_x = ((content_size.x - display_size.x) / 2.0).max(PAGE_GAP);
+    let page_y = ((content_size.y - display_size.y) / 2.0).max(PAGE_GAP);
+    SinglePageGeometry {
+        content_size,
+        page_rect: Rect::from_min_size(Pos2::new(page_x, page_y), display_size),
+    }
+}
+
 fn single_page_centered_offset(
     page_rect: Rect,
     normalized_anchor: Vec2,
@@ -3623,7 +3769,6 @@ impl DocumentTab {
                 self.view.restore_single_anchor = Some(center);
             }
         }
-        self.invalidate_rendering();
     }
 
     fn jump_to_single_page_edge(&mut self, page_index: usize, anchor: Vec2) {
@@ -3632,7 +3777,6 @@ impl DocumentTab {
         }
         self.view.single_center_anchor = Some(anchor);
         self.view.restore_single_anchor = Some(anchor);
-        self.invalidate_rendering();
     }
 
     fn jump_to_search_match(&mut self, anchor: PageAnchor) {
@@ -3652,7 +3796,6 @@ impl DocumentTab {
                 self.view.restore_single_anchor = Some(center);
             }
         }
-        self.invalidate_rendering();
     }
 
     /// Applies bounds checking and shared page-input state before a caller sets
@@ -3703,6 +3846,10 @@ impl DocumentTab {
 
     fn invalidate_rendering(&mut self) {
         self.view.generation = self.view.generation.wrapping_add(1);
+        self.cancel_rendering_requests();
+    }
+
+    fn cancel_rendering_requests(&mut self) {
         let pending = self
             .pending_tiles
             .drain()
@@ -3815,6 +3962,17 @@ impl DocumentTab {
 }
 
 impl ViewState {
+    /// Records the effective display density and reports whether existing
+    /// render requests use device-pixel coordinates from an older density.
+    fn update_render_density(&mut self, pixels_per_point: f32) -> bool {
+        let current_bits = pixels_per_point.to_bits();
+        let changed = self
+            .render_pixels_per_point_bits
+            .is_some_and(|previous_bits| previous_bits != current_bits);
+        self.render_pixels_per_point_bits = Some(current_bits);
+        changed
+    }
+
     fn stop_autoscroll(&mut self) {
         self.autoscroll = None;
     }
@@ -3832,6 +3990,7 @@ impl ViewState {
             restore_single_anchor: None,
             single_wheel: SinglePageWheelState::default(),
             autoscroll: None,
+            render_pixels_per_point_bits: None,
             generation: 1,
         }
     }
@@ -3867,6 +4026,7 @@ impl ViewState {
                 .then_some(single_anchor),
             single_wheel: SinglePageWheelState::default(),
             autoscroll: None,
+            render_pixels_per_point_bits: None,
             generation: 1,
         }
     }
@@ -4456,6 +4616,16 @@ mod tests {
     }
 
     #[test]
+    fn display_density_invalidates_only_after_the_recorded_value_changes() {
+        let mut view = ViewState::new();
+
+        assert!(!view.update_render_density(1.0));
+        assert!(!view.update_render_density(1.0));
+        assert!(view.update_render_density(1.25));
+        assert!(!view.update_render_density(1.25));
+    }
+
+    #[test]
     fn huge_page_requests_stay_bounded_to_three_viewports() {
         let bounds = crate::domain::document::PageRect {
             x0: 0.0,
@@ -4470,6 +4640,25 @@ mod tests {
         let requested = prioritized_tile_specs(grid, page_rect, visible).unwrap();
 
         assert_eq!(requested.len(), 63 * 50);
+    }
+
+    #[test]
+    fn adjacent_enlarged_page_prefetches_only_the_transition_viewport() {
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 100.0,
+            y1: 10_000.0,
+        };
+        let grid = TileGrid::new(bounds, 1.0).unwrap();
+        let page_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 10_000.0));
+        let transition_viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 400.0));
+
+        let requested =
+            tile_specs_intersecting_viewport(grid, page_rect, transition_viewport).unwrap();
+
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].pixel_y, 0);
     }
 
     #[test]
@@ -4729,6 +4918,41 @@ mod tests {
     }
 
     #[test]
+    fn page_navigation_preserves_the_render_generation() {
+        let path = PathBuf::from("missing.pdf");
+        let mut tab = DocumentTab::new(1, path.clone(), 0, None, false);
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 100.0,
+            y1: 200.0,
+        };
+        tab.info = Some(DocumentInfo {
+            path,
+            page_bounds: vec![bounds; 2],
+            highlight_count: 0,
+            can_save_incrementally: false,
+            highlight_capability: crate::domain::document::HighlightCapability::Allowed,
+            dirty: false,
+            revision: 0,
+            open_time: Duration::ZERO,
+            physical_memory_bytes: None,
+            version: crate::domain::document::DocumentVersion {
+                identity_primary: 0,
+                identity_secondary: 0,
+                length: 0,
+                modified: std::time::SystemTime::UNIX_EPOCH,
+            },
+        });
+        let generation = tab.view.generation;
+
+        tab.jump_to_page(1);
+
+        assert_eq!(tab.view.current_page, 1);
+        assert_eq!(tab.view.generation, generation);
+    }
+
+    #[test]
     fn display_mode_roundtrip_preserves_page_and_normalized_position() {
         let expected = PageAnchor {
             page_index: 4,
@@ -4747,6 +4971,7 @@ mod tests {
             restore_single_anchor: None,
             single_wheel: SinglePageWheelState::default(),
             autoscroll: None,
+            render_pixels_per_point_bits: None,
             generation: 1,
         };
 
