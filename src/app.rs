@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(debug_assertions)]
+use std::time::Instant;
 
 use crossbeam_channel::TryRecvError;
 use eframe::egui::{
@@ -29,7 +31,7 @@ use crate::render::tiles::TileGrid;
 use crate::ui::fonts::install_cjk_fallback;
 use crate::ui::icons::{ToolbarIcon, icon_button};
 use crate::ui::sidebar::{SidebarTab, show_outline};
-use crate::ui::viewport::PageViewport;
+use crate::ui::viewport::{PageViewport, screen_rect_for_tile};
 
 // These bounds cover detailed inspection and overview use without allowing an
 // accidental wheel gesture to request an unbounded raster allocation.
@@ -80,6 +82,11 @@ const AUTOSCROLL_MAX_FRAME_SECONDS: f32 = 0.100;
 const AUTOSCROLL_PAGE_COOLDOWN_SECONDS: f64 = 0.200;
 const AUTOSCROLL_MARKER_RADIUS_POINTS: f32 = 8.0;
 
+// Inputs no more than 250 ms apart are one continuous zoom gesture for debug
+// accounting. This is short enough not to delay rendering the latest scale.
+#[cfg(debug_assertions)]
+const ZOOM_INPUT_GROUP_IDLE_SECONDS: f64 = 0.250;
+
 // N-05 sets 512 MiB as the stable process target. Suspension is only allowed
 // after crossing that limit; ordinary tab switches retain documents.
 const RESIDENT_MEMORY_SUSPEND_THRESHOLD_BYTES: usize = 512 * 1_024 * 1_024;
@@ -120,6 +127,7 @@ struct DocumentTab {
     tiles: HashMap<TileCacheKey, CachedTile>,
     pending_tiles: HashMap<TileCacheKey, TileRequest>,
     wanted_tiles: HashSet<TileCacheKey>,
+    visible_tiles: HashSet<TileCacheKey>,
     text_snapshots: HashMap<TextSnapshotKey, TextPageSnapshot>,
     pending_text_snapshots: HashSet<TextSnapshotKey>,
     failed_text_snapshots: HashSet<TextSnapshotKey>,
@@ -139,6 +147,8 @@ struct DocumentTab {
     page_input: String,
     page_input_error: Option<String>,
     view: ViewState,
+    #[cfg(debug_assertions)]
+    render_performance: RenderPerformance,
     restoring_from_session: bool,
     select_after_restore: bool,
 }
@@ -156,6 +166,8 @@ enum DocumentState {
 struct CachedTile {
     tile: RenderedTile,
     texture: TextureHandle,
+    #[cfg(debug_assertions)]
+    was_prefetched: bool,
 }
 
 struct CachedThumbnail {
@@ -302,6 +314,33 @@ struct AutoscrollState {
 struct SinglePageGeometry {
     content_size: Vec2,
     page_rect: Rect,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct RenderPerformance {
+    page_transition: Option<PageTransitionPerformance>,
+    zoom: Option<ZoomPerformance>,
+}
+
+#[cfg(debug_assertions)]
+struct PageTransitionPerformance {
+    target_page: usize,
+    input_at: Instant,
+    first_exact_tile: Option<Duration>,
+    full_exact_viewport: Option<Duration>,
+    cache_hit: Option<bool>,
+    prefetch_used: Option<bool>,
+}
+
+#[cfg(debug_assertions)]
+struct ZoomPerformance {
+    target_zoom: f32,
+    last_input_at: Instant,
+    provisional_display: Option<Duration>,
+    first_exact_tile: Option<Duration>,
+    full_exact_viewport: Option<Duration>,
+    discarded_intermediate_requests: usize,
 }
 
 impl PrototypeApp {
@@ -577,7 +616,13 @@ impl PrototypeApp {
                         let is_active = self.active_index() == Some(index);
                         let key = TileCacheKey::from_tile(self.documents[index].document_id, &tile);
                         let tab = &mut self.documents[index];
+                        #[cfg(debug_assertions)]
+                        let completed_request = tab.pending_tiles.remove(&key);
+                        #[cfg(not(debug_assertions))]
                         tab.pending_tiles.remove(&key);
+                        #[cfg(debug_assertions)]
+                        let was_prefetched = completed_request
+                            .is_some_and(|request| request.priority != RenderPriority::Visible);
                         let current_revision = tab.info.as_ref().map(|info| info.revision);
                         let result_is_current = tile_result_is_current(
                             is_active,
@@ -633,7 +678,15 @@ impl PrototypeApp {
                             .spec
                             .rgba_bytes()
                             .expect("validated tile dimensions fit in memory");
-                        tab.tiles.insert(key, CachedTile { tile, texture });
+                        tab.tiles.insert(
+                            key,
+                            CachedTile {
+                                tile,
+                                texture,
+                                #[cfg(debug_assertions)]
+                                was_prefetched,
+                            },
+                        );
                         let outcome = self.gpu_lru.insert(key, (), weight);
                         if !outcome.inserted {
                             self.documents[index].tiles.remove(&key);
@@ -2402,6 +2455,28 @@ impl PrototypeApp {
                                     milliseconds(selection.extraction_time)
                                 ));
                             }
+                            if let Some(measurement) = &tab.render_performance.page_transition {
+                                ui.separator();
+                                ui.label(format!(
+                                    "page {}: first {}, full {}, cache {}, prefetch {}",
+                                    measurement.target_page + 1,
+                                    debug_duration(measurement.first_exact_tile),
+                                    debug_duration(measurement.full_exact_viewport),
+                                    debug_yes_no(measurement.cache_hit),
+                                    debug_yes_no(measurement.prefetch_used),
+                                ));
+                            }
+                            if let Some(measurement) = &tab.render_performance.zoom {
+                                ui.separator();
+                                ui.label(format!(
+                                    "zoom {:.0}%: provisional {}, final-input→first {}, full {}, discarded {}",
+                                    measurement.target_zoom * 100.0,
+                                    debug_duration(measurement.provisional_display),
+                                    debug_duration(measurement.first_exact_tile),
+                                    debug_duration(measurement.full_exact_viewport),
+                                    measurement.discarded_intermediate_requests,
+                                ));
+                            }
                         }
                         ui.separator();
                         if self.gpu_lru.is_empty() {
@@ -3547,31 +3622,157 @@ fn single_page_centered_offset(
     )
 }
 
+/// Selects one cached raster identity nearest to the current zoom while keeping
+/// document, page, revision, and rotation exact.
+fn closest_provisional_tile_keys(
+    keys: impl Iterator<Item = TileCacheKey>,
+    document_id: u64,
+    page_index: usize,
+    revision: u64,
+    rotation_quarter_turns: u8,
+    current_zoom: f32,
+    current_pixels_per_point_bits: u32,
+) -> Vec<TileCacheKey> {
+    let current_identity = (current_zoom.to_bits(), current_pixels_per_point_bits);
+    let candidates = keys
+        .filter(|key| {
+            key.document_id == document_id
+                && key.page_index == page_index
+                && key.revision == revision
+                && key.rotation_quarter_turns == rotation_quarter_turns
+                && (key.zoom_bits, key.pixels_per_point_bits) != current_identity
+        })
+        .collect::<Vec<_>>();
+    let current_pixels_per_point = f32::from_bits(current_pixels_per_point_bits);
+    let best_identity = candidates
+        .iter()
+        .map(|key| (key.zoom_bits, key.pixels_per_point_bits))
+        .min_by(|left, right| {
+            let left_zoom = f32::from_bits(left.0);
+            let right_zoom = f32::from_bits(right.0);
+            let left_density = f32::from_bits(left.1);
+            let right_density = f32::from_bits(right.1);
+            // Log ratios make half/double scales equally distant. Zoom is the
+            // primary match; density breaks ties because logical mapping is safe.
+            let left_zoom_distance = (left_zoom / current_zoom).ln().abs();
+            let right_zoom_distance = (right_zoom / current_zoom).ln().abs();
+            let left_density_distance = (left_density / current_pixels_per_point).ln().abs();
+            let right_density_distance = (right_density / current_pixels_per_point).ln().abs();
+            left_zoom_distance
+                .total_cmp(&right_zoom_distance)
+                .then_with(|| left_density_distance.total_cmp(&right_density_distance))
+        });
+    let Some(best_identity) = best_identity else {
+        return Vec::new();
+    };
+    let mut selected = candidates
+        .into_iter()
+        .filter(|key| (key.zoom_bits, key.pixels_per_point_bits) == best_identity)
+        .collect::<Vec<_>>();
+    selected.sort_by_key(|key| (key.spec.pixel_y, key.spec.pixel_x));
+    selected
+}
+
 fn paint_page_tiles(
     ui: &egui::Ui,
     screen_rect: Rect,
     page_index: usize,
-    tab: &DocumentTab,
+    tab: &mut DocumentTab,
     gpu_lru: &mut WeightedLruCache<TileCacheKey, ()>,
 ) {
     ui.painter()
         .rect_filled(screen_rect, 2.0, Color32::from_gray(245));
-    let mut keys = tab
+    let exact_visible_total = tab
+        .visible_tiles
+        .iter()
+        .filter(|key| key.page_index == page_index)
+        .count();
+    let exact_visible_cached = tab
+        .visible_tiles
+        .iter()
+        .filter(|key| key.page_index == page_index && tab.tiles.contains_key(key))
+        .count();
+    let exact_visible_already_complete =
+        exact_visible_total > 0 && exact_visible_cached == exact_visible_total;
+    let provisional_keys = if exact_visible_already_complete {
+        Vec::new()
+    } else {
+        tab.info
+            .as_ref()
+            .map(|info| info.revision)
+            .zip(tab.view.render_pixels_per_point_bits)
+            .map(|(revision, pixels_per_point_bits)| {
+                let clip_rect = ui.clip_rect();
+                let visible_cached_keys = tab.tiles.iter().filter_map(|(key, cached)| {
+                    screen_rect_for_tile(screen_rect, &cached.tile)
+                        .intersects(clip_rect)
+                        .then_some(*key)
+                });
+                closest_provisional_tile_keys(
+                    visible_cached_keys,
+                    tab.document_id,
+                    page_index,
+                    revision,
+                    0,
+                    tab.view.zoom,
+                    pixels_per_point_bits,
+                )
+            })
+            .unwrap_or_default()
+    };
+    let mut provisional_painted = false;
+    for key in provisional_keys {
+        let retained = gpu_lru.get(&key).is_some();
+        if retained && let Some(cached) = tab.tiles.get(&key) {
+            // PageViewport maps device pixels through normalized page space, so
+            // an older DPI is safe here and is replaced by exact tiles below.
+            PageViewport::paint_tile(ui, screen_rect, &cached.texture, &cached.tile);
+            provisional_painted = true;
+        }
+    }
+
+    let mut exact_keys = tab
         .wanted_tiles
         .iter()
         .filter(|key| key.page_index == page_index)
         .copied()
         .collect::<Vec<_>>();
-    keys.sort_by_key(|key| (key.spec.pixel_y, key.spec.pixel_x));
+    exact_keys.sort_by_key(|key| (key.spec.pixel_y, key.spec.pixel_x));
 
-    let mut painted_any = false;
-    for key in keys {
+    #[cfg(debug_assertions)]
+    let mut exact_visible_painted_count = 0;
+    let mut exact_painted = false;
+    for key in exact_keys {
         let retained = gpu_lru.get(&key).is_some();
         if retained && let Some(cached) = tab.tiles.get(&key) {
             PageViewport::paint_tile(ui, screen_rect, &cached.texture, &cached.tile);
-            painted_any = true;
+            exact_painted = true;
+            #[cfg(debug_assertions)]
+            if tab.visible_tiles.contains(&key) {
+                exact_visible_painted_count += 1;
+                // Once a prefetched tile has served its transition, a later
+                // revisit is an ordinary cache hit rather than another prefetch use.
+                if let Some(cached) = tab.tiles.get_mut(&key) {
+                    cached.was_prefetched = false;
+                }
+            }
         }
     }
+    #[cfg(debug_assertions)]
+    {
+        let exact_visible_complete =
+            exact_visible_total > 0 && exact_visible_painted_count == exact_visible_total;
+        tab.render_performance.note_paint(
+            page_index,
+            tab.view.zoom,
+            provisional_painted,
+            exact_visible_painted_count > 0,
+            exact_visible_complete,
+            Instant::now(),
+        );
+    }
+
+    let painted_any = provisional_painted || exact_painted;
     if !painted_any {
         ui.painter().text(
             screen_rect.center(),
@@ -3630,6 +3831,7 @@ impl DocumentTab {
             tiles: HashMap::new(),
             pending_tiles: HashMap::new(),
             wanted_tiles: HashSet::new(),
+            visible_tiles: HashSet::new(),
             text_snapshots: HashMap::new(),
             pending_text_snapshots: HashSet::new(),
             failed_text_snapshots: HashSet::new(),
@@ -3649,6 +3851,8 @@ impl DocumentTab {
             page_input: "1".to_owned(),
             page_input_error: None,
             view: restored_view.map_or_else(ViewState::new, ViewState::from_session),
+            #[cfg(debug_assertions)]
+            render_performance: RenderPerformance::default(),
             restoring_from_session,
             select_after_restore,
         }
@@ -3734,6 +3938,11 @@ impl DocumentTab {
     }
 
     fn set_zoom(&mut self, zoom: f32, mode: ZoomMode) {
+        let scale_changed = self.view.zoom.to_bits() != zoom.to_bits();
+        if !scale_changed {
+            self.view.zoom_mode = mode;
+            return;
+        }
         match self.view.display_mode {
             DisplayMode::Continuous => self.view.restore_anchor = self.view.center_anchor,
             DisplayMode::SinglePage => {
@@ -3742,7 +3951,13 @@ impl DocumentTab {
         }
         self.view.zoom = zoom;
         self.view.zoom_mode = mode;
+        #[cfg(debug_assertions)]
+        let canceled_requests = self.invalidate_rendering();
+        #[cfg(not(debug_assertions))]
         self.invalidate_rendering();
+        #[cfg(debug_assertions)]
+        self.render_performance
+            .begin_zoom(zoom, canceled_requests, Instant::now());
     }
 
     fn set_display_mode(&mut self, mode: DisplayMode) {
@@ -3805,6 +4020,11 @@ impl DocumentTab {
         if page_index >= page_count {
             return false;
         }
+        #[cfg(debug_assertions)]
+        if page_index != self.view.current_page {
+            self.render_performance
+                .begin_page_transition(page_index, Instant::now());
+        }
         self.page_input_error = None;
         self.view.current_page = page_index;
         true
@@ -3844,21 +4064,24 @@ impl DocumentTab {
         keys
     }
 
-    fn invalidate_rendering(&mut self) {
+    fn invalidate_rendering(&mut self) -> usize {
         self.view.generation = self.view.generation.wrapping_add(1);
-        self.cancel_rendering_requests();
+        self.cancel_rendering_requests()
     }
 
-    fn cancel_rendering_requests(&mut self) {
+    fn cancel_rendering_requests(&mut self) -> usize {
         let pending = self
             .pending_tiles
             .drain()
             .map(|(_, request)| request)
             .collect::<Vec<_>>();
+        let canceled_count = pending.len();
         for request in pending {
             self.cancel_render(&request);
         }
         self.wanted_tiles.clear();
+        self.visible_tiles.clear();
+        canceled_count
     }
 
     fn invalidate_text_snapshots(&mut self) {
@@ -3918,6 +4141,11 @@ impl DocumentTab {
             .iter()
             .map(|request| TileCacheKey::from_request(self.document_id, request))
             .collect::<HashSet<_>>();
+        let visible_tiles = requests
+            .iter()
+            .filter(|request| request.priority == RenderPriority::Visible)
+            .map(|request| TileCacheKey::from_request(self.document_id, request))
+            .collect::<HashSet<_>>();
         let canceled_keys = self
             .pending_tiles
             .keys()
@@ -3930,6 +4158,25 @@ impl DocumentTab {
             }
         }
         self.wanted_tiles = wanted_tiles;
+        self.visible_tiles = visible_tiles;
+
+        #[cfg(debug_assertions)]
+        {
+            let cache_hit = self
+                .visible_tiles
+                .iter()
+                .any(|key| self.tiles.contains_key(key));
+            let prefetch_used = self.visible_tiles.iter().any(|key| {
+                self.tiles
+                    .get(key)
+                    .is_some_and(|cached| cached.was_prefetched)
+            });
+            self.render_performance.note_page_cache_state(
+                self.view.current_page,
+                cache_hit,
+                prefetch_used,
+            );
+        }
 
         for request in requests {
             let key = TileCacheKey::from_request(self.document_id, &request);
@@ -4130,6 +4377,101 @@ impl ViewState {
         }
         self.display_mode = mode;
         true
+    }
+}
+
+#[cfg(debug_assertions)]
+impl RenderPerformance {
+    fn begin_page_transition(&mut self, target_page: usize, now: Instant) {
+        self.page_transition = Some(PageTransitionPerformance {
+            target_page,
+            input_at: now,
+            first_exact_tile: None,
+            full_exact_viewport: None,
+            cache_hit: None,
+            prefetch_used: None,
+        });
+    }
+
+    fn note_page_cache_state(&mut self, page_index: usize, cache_hit: bool, prefetch_used: bool) {
+        let Some(measurement) = self
+            .page_transition
+            .as_mut()
+            .filter(|measurement| measurement.target_page == page_index)
+        else {
+            return;
+        };
+        if measurement.cache_hit.is_none() {
+            measurement.cache_hit = Some(cache_hit);
+            measurement.prefetch_used = Some(prefetch_used);
+        }
+    }
+
+    fn begin_zoom(&mut self, target_zoom: f32, canceled_requests: usize, now: Instant) {
+        let continuing_gesture = self.zoom.as_ref().is_some_and(|measurement| {
+            now.saturating_duration_since(measurement.last_input_at)
+                .as_secs_f64()
+                <= ZOOM_INPUT_GROUP_IDLE_SECONDS
+        });
+        let discarded_intermediate_requests = if continuing_gesture {
+            self.zoom
+                .as_ref()
+                .map_or(0, |measurement| measurement.discarded_intermediate_requests)
+                .saturating_add(canceled_requests)
+        } else {
+            // Requests for the stable old zoom are not "intermediate" work;
+            // only a later input in this same gesture makes the prior target stale.
+            0
+        };
+        self.zoom = Some(ZoomPerformance {
+            target_zoom,
+            last_input_at: now,
+            provisional_display: None,
+            first_exact_tile: None,
+            full_exact_viewport: None,
+            discarded_intermediate_requests,
+        });
+    }
+
+    fn note_paint(
+        &mut self,
+        page_index: usize,
+        zoom: f32,
+        provisional_painted: bool,
+        exact_visible_painted: bool,
+        exact_visible_complete: bool,
+        now: Instant,
+    ) {
+        if let Some(measurement) = self
+            .page_transition
+            .as_mut()
+            .filter(|measurement| measurement.target_page == page_index)
+        {
+            let elapsed = now.saturating_duration_since(measurement.input_at);
+            if exact_visible_painted {
+                measurement.first_exact_tile.get_or_insert(elapsed);
+            }
+            if exact_visible_complete {
+                measurement.full_exact_viewport.get_or_insert(elapsed);
+            }
+        }
+
+        if let Some(measurement) = self
+            .zoom
+            .as_mut()
+            .filter(|measurement| measurement.target_zoom.to_bits() == zoom.to_bits())
+        {
+            let elapsed = now.saturating_duration_since(measurement.last_input_at);
+            if provisional_painted {
+                measurement.provisional_display.get_or_insert(elapsed);
+            }
+            if exact_visible_painted {
+                measurement.first_exact_tile.get_or_insert(elapsed);
+            }
+            if exact_visible_complete {
+                measurement.full_exact_viewport.get_or_insert(elapsed);
+            }
+        }
     }
 }
 
@@ -4467,6 +4809,23 @@ fn milliseconds(duration: Duration) -> f64 {
 }
 
 #[cfg(debug_assertions)]
+fn debug_duration(duration: Option<Duration>) -> String {
+    duration.map_or_else(
+        || "pending".to_owned(),
+        |duration| format!("{:.1} ms", milliseconds(duration)),
+    )
+}
+
+#[cfg(debug_assertions)]
+fn debug_yes_no(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "pending",
+    }
+}
+
+#[cfg(debug_assertions)]
 fn format_memory(bytes: usize) -> String {
     format!("resident memory: {:.1} MiB", bytes as f64 / 1_048_576.0)
 }
@@ -4623,6 +4982,126 @@ mod tests {
         assert!(!view.update_render_density(1.0));
         assert!(view.update_render_density(1.25));
         assert!(!view.update_render_density(1.25));
+    }
+
+    #[test]
+    fn provisional_tiles_use_the_closest_zoom_from_the_current_revision() {
+        let spec = TileSpec {
+            pixel_x: 0,
+            pixel_y: 0,
+            pixel_width: 512,
+            pixel_height: 512,
+        };
+        let base = TileCacheKey {
+            document_id: 1,
+            page_index: 2,
+            zoom_bits: 1.0_f32.to_bits(),
+            pixels_per_point_bits: 1.0_f32.to_bits(),
+            rotation_quarter_turns: 0,
+            spec,
+            revision: 4,
+        };
+        let keys = vec![
+            base,
+            TileCacheKey {
+                zoom_bits: 1.4_f32.to_bits(),
+                ..base
+            },
+            TileCacheKey {
+                zoom_bits: 1.4_f32.to_bits(),
+                spec: TileSpec {
+                    pixel_x: 512,
+                    ..spec
+                },
+                ..base
+            },
+            TileCacheKey {
+                zoom_bits: 1.49_f32.to_bits(),
+                revision: 3,
+                ..base
+            },
+        ];
+
+        let selected =
+            closest_provisional_tile_keys(keys.into_iter(), 1, 2, 4, 0, 1.5, 1.0_f32.to_bits());
+
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected
+                .iter()
+                .all(|key| key.zoom_bits == 1.4_f32.to_bits() && key.revision == 4)
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn performance_metrics_group_only_consecutive_zoom_inputs() {
+        let started_at = Instant::now();
+        let mut performance = RenderPerformance::default();
+        performance.begin_zoom(1.1, 7, started_at);
+        performance.begin_zoom(1.2, 3, started_at + Duration::from_millis(100));
+        performance.note_paint(
+            0,
+            1.2,
+            true,
+            true,
+            true,
+            started_at + Duration::from_millis(125),
+        );
+
+        let measurement = performance.zoom.as_ref().unwrap();
+        assert_eq!(measurement.discarded_intermediate_requests, 3);
+        assert_eq!(
+            measurement.provisional_display,
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(
+            measurement.first_exact_tile,
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(
+            measurement.full_exact_viewport,
+            Some(Duration::from_millis(25))
+        );
+
+        performance.begin_zoom(1.3, 4, started_at + Duration::from_millis(500));
+        assert_eq!(
+            performance
+                .zoom
+                .as_ref()
+                .unwrap()
+                .discarded_intermediate_requests,
+            0
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn page_metrics_record_cache_prefetch_and_visible_completion() {
+        let started_at = Instant::now();
+        let mut performance = RenderPerformance::default();
+        performance.begin_page_transition(3, started_at);
+        performance.note_page_cache_state(3, true, true);
+        performance.note_paint(
+            3,
+            1.0,
+            false,
+            true,
+            true,
+            started_at + Duration::from_millis(12),
+        );
+
+        let measurement = performance.page_transition.as_ref().unwrap();
+        assert_eq!(measurement.cache_hit, Some(true));
+        assert_eq!(measurement.prefetch_used, Some(true));
+        assert_eq!(
+            measurement.first_exact_tile,
+            Some(Duration::from_millis(12))
+        );
+        assert_eq!(
+            measurement.full_exact_viewport,
+            Some(Duration::from_millis(12))
+        );
     }
 
     #[test]

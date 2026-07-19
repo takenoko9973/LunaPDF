@@ -153,7 +153,8 @@ impl PageViewport {
     }
 }
 
-fn screen_rect_for_tile(page_screen_rect: Rect, tile: &RenderedTile) -> Rect {
+/// Maps a raster tile's device-pixel window into normalized page-screen coordinates.
+pub(crate) fn screen_rect_for_tile(page_screen_rect: Rect, tile: &RenderedTile) -> Rect {
     let page_pixel_width = tile.page_pixel_width as f32;
     let page_pixel_height = tile.page_pixel_height as f32;
     let x0 = tile.spec.pixel_x as f32 / page_pixel_width;
