@@ -351,6 +351,7 @@ impl PrototypeApp {
         session_store: SessionStore,
     ) -> Self {
         install_cjk_fallback(&creation_context.egui_ctx);
+        egui_extras::install_image_loaders(&creation_context.egui_ctx);
         Self::from_startup(paths, session_store)
     }
 
@@ -2232,17 +2233,6 @@ impl PrototypeApp {
                         .clicked()
                         {
                             self.create_highlight();
-                        }
-                        if icon_button(
-                            ui,
-                            ToolbarIcon::Undo,
-                            self.can_undo(),
-                            false,
-                            "元に戻す (Ctrl+Z)",
-                        )
-                        .clicked()
-                        {
-                            self.undo();
                         }
                         ui.separator();
 
