@@ -1003,6 +1003,9 @@ impl PrototypeApp {
         let escape_pressed =
             context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
         if escape_pressed && let Some(index) = self.active_index() {
+            // Escape is consumed here before the PDF view reads raw input, so
+            // autoscroll must stop in this branch rather than only in its frame update.
+            self.documents[index].view.stop_autoscroll();
             let document_id = self.documents[index].document_id;
             let query_id = search_query_id(document_id);
             let page_id = page_number_id(document_id);
@@ -4905,6 +4908,35 @@ mod tests {
             ordinary_shortcut = consume_highlight_shortcut(ui.ctx(), None);
         });
         assert!(ordinary_shortcut);
+    }
+
+    #[test]
+    fn consumed_escape_still_stops_active_autoscroll() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf_path = directory.path().join("document.pdf");
+        write_blank_pdf(&pdf_path);
+        let session_path = directory.path().join("session.json");
+        let mut app = PrototypeApp::from_startup(vec![pdf_path], SessionStore::new(session_path));
+        app.documents[0].view.autoscroll = Some(AutoscrollState {
+            anchor: Pos2::ZERO,
+            requested_offset: Some(Vec2::ZERO),
+            last_page_change_time: None,
+        });
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+
+        let _output = context.run_ui(input, |ui| app.handle_shortcuts(ui.ctx()));
+
+        assert!(app.documents[0].view.autoscroll.is_none());
     }
 
     fn h_key_input() -> egui::RawInput {
