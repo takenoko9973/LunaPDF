@@ -1961,207 +1961,226 @@ impl PrototypeApp {
         let mut print_requested = false;
 
         egui::Panel::top("toolbar").show(root_ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                open_requested =
-                    icon_button(ui, ToolbarIcon::Open, true, false, "PDFを開く (Ctrl+O)").clicked();
-                let print_enabled = cfg!(windows) && self.can_print();
-                let print_tooltip = if cfg!(windows) {
-                    "印刷 (Ctrl+P)"
-                } else {
-                    "このOSでは印刷に対応していません"
-                };
-                print_requested =
-                    icon_button(ui, ToolbarIcon::Print, print_enabled, false, print_tooltip)
+            // Scrolling preserves one stable row when the window is too narrow;
+            // wrapping would separate controls inside a functional group.
+            egui::ScrollArea::horizontal()
+                .id_salt("toolbar-scroll")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // Keep the sidebar slot stable while no PDF is open so the remaining
+                        // toolbar groups do not shift when the first document is loaded.
+                        let sidebar_enabled = self
+                            .active_index()
+                            .is_some_and(|index| self.documents[index].info.is_some());
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::Sidebar,
+                            sidebar_enabled,
+                            sidebar_enabled && self.sidebar_open,
+                            "サイドバーを表示/非表示",
+                        )
+                        .clicked()
+                        {
+                            self.sidebar_open = !self.sidebar_open;
+                        }
+                        open_requested =
+                            icon_button(ui, ToolbarIcon::Open, true, false, "PDFを開く (Ctrl+O)")
+                                .clicked();
+                        let print_enabled = cfg!(windows) && self.can_print();
+                        let print_tooltip = if cfg!(windows) {
+                            "印刷 (Ctrl+P)"
+                        } else {
+                            "このOSでは印刷に対応していません"
+                        };
+                        print_requested = icon_button(
+                            ui,
+                            ToolbarIcon::Print,
+                            print_enabled,
+                            false,
+                            print_tooltip,
+                        )
                         .clicked();
-                ui.separator();
+                        ui.separator();
 
-                let Some(index) = self.active_index() else {
-                    ui.label("PDFをドロップするか、開くボタンから選択してください");
-                    return;
-                };
-                let document_id = self.documents[index].document_id;
-                let page_count = self.documents[index]
-                    .info
-                    .as_ref()
-                    .map(|info| info.page_bounds.len())
-                    .unwrap_or(0);
-                let current_page = self.documents[index].view.current_page;
+                        let Some(index) = self.active_index() else {
+                            ui.label("PDFをドロップするか、開くボタンから選択してください");
+                            return;
+                        };
+                        let document_id = self.documents[index].document_id;
+                        let page_count = self.documents[index]
+                            .info
+                            .as_ref()
+                            .map(|info| info.page_bounds.len())
+                            .unwrap_or(0);
+                        let current_page = self.documents[index].view.current_page;
 
-                ui.label("ページ:");
-                let page_id = page_number_id(document_id);
-                if !ui.memory(|memory| memory.has_focus(page_id)) {
-                    self.documents[index].page_input = (current_page + 1).to_string();
-                }
-                let page_response = ui.add(
-                    egui::TextEdit::singleline(&mut self.documents[index].page_input)
-                        .id(page_id)
-                        .desired_width(46.0)
-                        .horizontal_align(egui::Align::Center),
-                );
-                let enter_pressed =
-                    page_response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-                if enter_pressed || page_response.lost_focus() {
-                    submitted_page = Some(self.documents[index].page_input.clone());
-                }
-                ui.label(format!("/ {page_count}"));
-                if icon_button(
-                    ui,
-                    ToolbarIcon::Previous,
-                    current_page > 0,
-                    false,
-                    "前のページ (PageUp)",
-                )
-                .clicked()
-                {
-                    page_delta_requested = Some(-1);
-                }
-                if icon_button(
-                    ui,
-                    ToolbarIcon::Next,
-                    current_page + 1 < page_count,
-                    false,
-                    "次のページ (PageDown)",
-                )
-                .clicked()
-                {
-                    page_delta_requested = Some(1);
-                }
-                ui.separator();
-                if icon_button(
-                    ui,
-                    ToolbarIcon::Sidebar,
-                    true,
-                    self.sidebar_open,
-                    "サイドバーを表示/非表示",
-                )
-                .clicked()
-                {
-                    self.sidebar_open = !self.sidebar_open;
-                }
-                if icon_button(ui, ToolbarIcon::ZoomOut, true, false, "縮小").clicked() {
-                    self.zoom_by(1.0 / 1.1);
-                }
-                ui.label(format!("{:.0}%", self.documents[index].view.zoom * 100.0));
-                if icon_button(ui, ToolbarIcon::ZoomIn, true, false, "拡大").clicked() {
-                    self.zoom_by(1.1);
-                }
-                if icon_button(
-                    ui,
-                    ToolbarIcon::FitWidth,
-                    true,
-                    self.documents[index].view.zoom_mode == ZoomMode::FitWidth,
-                    "幅に合わせる",
-                )
-                .clicked()
-                {
-                    self.documents[index].view.zoom_mode = ZoomMode::FitWidth;
-                }
-                if icon_button(
-                    ui,
-                    ToolbarIcon::FitPage,
-                    true,
-                    self.documents[index].view.zoom_mode == ZoomMode::FitPage,
-                    "ページ全体を表示",
-                )
-                .clicked()
-                {
-                    self.documents[index].view.zoom_mode = ZoomMode::FitPage;
-                }
-                ui.separator();
-                let continuous = self.documents[index].view.display_mode == DisplayMode::Continuous;
-                if icon_button(ui, ToolbarIcon::Continuous, true, continuous, "連続表示").clicked()
-                {
-                    self.documents[index].set_display_mode(DisplayMode::Continuous);
-                }
-                if icon_button(
-                    ui,
-                    ToolbarIcon::SinglePage,
-                    true,
-                    !continuous,
-                    "単一ページ表示",
-                )
-                .clicked()
-                {
-                    self.documents[index].set_display_mode(DisplayMode::SinglePage);
-                }
-                let highlight_tooltip = self.documents[index]
-                    .info
-                    .as_ref()
-                    .and_then(|info| info.highlight_capability.restriction())
-                    .unwrap_or("選択範囲をハイライト (H)");
-                if icon_button(
-                    ui,
-                    ToolbarIcon::Highlight,
-                    self.can_create_highlight(),
-                    false,
-                    highlight_tooltip,
-                )
-                .clicked()
-                {
-                    self.create_highlight();
-                }
-                if icon_button(
-                    ui,
-                    ToolbarIcon::Undo,
-                    self.can_undo(),
-                    false,
-                    "元に戻す (Ctrl+Z)",
-                )
-                .clicked()
-                {
-                    self.undo();
-                }
-                ui.separator();
+                        ui.label("ページ:");
+                        let page_id = page_number_id(document_id);
+                        if !ui.memory(|memory| memory.has_focus(page_id)) {
+                            self.documents[index].page_input = (current_page + 1).to_string();
+                        }
+                        let page_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.documents[index].page_input)
+                                .id(page_id)
+                                .desired_width(46.0)
+                                .horizontal_align(egui::Align::Center),
+                        );
+                        let enter_pressed = page_response.has_focus()
+                            && ui.input(|input| input.key_pressed(Key::Enter));
+                        if enter_pressed || page_response.lost_focus() {
+                            submitted_page = Some(self.documents[index].page_input.clone());
+                        }
+                        ui.label(format!("/ {page_count}"));
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::Previous,
+                            current_page > 0,
+                            false,
+                            "前のページ (PageUp)",
+                        )
+                        .clicked()
+                        {
+                            page_delta_requested = Some(-1);
+                        }
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::Next,
+                            current_page + 1 < page_count,
+                            false,
+                            "次のページ (PageDown)",
+                        )
+                        .clicked()
+                        {
+                            page_delta_requested = Some(1);
+                        }
+                        ui.separator();
+                        if icon_button(ui, ToolbarIcon::ZoomOut, true, false, "縮小").clicked() {
+                            self.zoom_by(1.0 / 1.1);
+                        }
+                        ui.label(format!("{:.0}%", self.documents[index].view.zoom * 100.0));
+                        if icon_button(ui, ToolbarIcon::ZoomIn, true, false, "拡大").clicked() {
+                            self.zoom_by(1.1);
+                        }
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::FitWidth,
+                            true,
+                            self.documents[index].view.zoom_mode == ZoomMode::FitWidth,
+                            "幅に合わせる",
+                        )
+                        .clicked()
+                        {
+                            self.documents[index].view.zoom_mode = ZoomMode::FitWidth;
+                        }
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::FitPage,
+                            true,
+                            self.documents[index].view.zoom_mode == ZoomMode::FitPage,
+                            "ページ全体を表示",
+                        )
+                        .clicked()
+                        {
+                            self.documents[index].view.zoom_mode = ZoomMode::FitPage;
+                        }
+                        ui.separator();
+                        let continuous =
+                            self.documents[index].view.display_mode == DisplayMode::Continuous;
+                        if icon_button(ui, ToolbarIcon::Continuous, true, continuous, "連続表示")
+                            .clicked()
+                        {
+                            self.documents[index].set_display_mode(DisplayMode::Continuous);
+                        }
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::SinglePage,
+                            true,
+                            !continuous,
+                            "単一ページ表示",
+                        )
+                        .clicked()
+                        {
+                            self.documents[index].set_display_mode(DisplayMode::SinglePage);
+                        }
+                        let highlight_tooltip = self.documents[index]
+                            .info
+                            .as_ref()
+                            .and_then(|info| info.highlight_capability.restriction())
+                            .unwrap_or("選択範囲をハイライト (H)");
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::Highlight,
+                            self.can_create_highlight(),
+                            false,
+                            highlight_tooltip,
+                        )
+                        .clicked()
+                        {
+                            self.create_highlight();
+                        }
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::Undo,
+                            self.can_undo(),
+                            false,
+                            "元に戻す (Ctrl+Z)",
+                        )
+                        .clicked()
+                        {
+                            self.undo();
+                        }
+                        ui.separator();
 
-                let search = &mut self.documents[index].search;
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut search.query)
-                        .id(search_query_id(document_id))
-                        .desired_width(180.0)
-                        .hint_text("PDF内を検索"),
-                );
-                search_changed = response.changed();
-                let enter = ui.input(|input| input.key_pressed(Key::Enter));
-                if response.has_focus() && enter && !search_changed {
-                    search_navigation = Some(!ui.input(|input| input.modifiers.shift));
-                }
-                let match_count = search.pages.values().map(Vec::len).sum::<usize>();
-                let selected = search
-                    .selected
-                    .and_then(|cursor| search_match_ordinal(&search.pages, cursor));
-                let count = format!("{} / {match_count}", selected.unwrap_or(0));
-                let progress = if search.in_progress {
-                    format!("{count} · {}/{}", search.completed_pages, page_count)
-                } else {
-                    count
-                };
-                ui.label(progress);
-                if search.truncated {
-                    ui.label("上限に到達");
-                }
-                if icon_button(
-                    ui,
-                    ToolbarIcon::Previous,
-                    match_count > 0,
-                    false,
-                    "前の検索結果 (Shift+Enter)",
-                )
-                .clicked()
-                {
-                    search_navigation = Some(false);
-                }
-                if icon_button(
-                    ui,
-                    ToolbarIcon::Next,
-                    match_count > 0,
-                    false,
-                    "次の検索結果 (Enter)",
-                )
-                .clicked()
-                {
-                    search_navigation = Some(true);
-                }
-            });
+                        let search = &mut self.documents[index].search;
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut search.query)
+                                .id(search_query_id(document_id))
+                                .desired_width(180.0)
+                                .hint_text("PDF内を検索"),
+                        );
+                        search_changed = response.changed();
+                        let enter = ui.input(|input| input.key_pressed(Key::Enter));
+                        if response.has_focus() && enter && !search_changed {
+                            search_navigation = Some(!ui.input(|input| input.modifiers.shift));
+                        }
+                        let match_count = search.pages.values().map(Vec::len).sum::<usize>();
+                        let selected = search
+                            .selected
+                            .and_then(|cursor| search_match_ordinal(&search.pages, cursor));
+                        let count = format!("{} / {match_count}", selected.unwrap_or(0));
+                        let progress = if search.in_progress {
+                            format!("{count} · {}/{}", search.completed_pages, page_count)
+                        } else {
+                            count
+                        };
+                        ui.label(progress);
+                        if search.truncated {
+                            ui.label("上限に到達");
+                        }
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::Previous,
+                            match_count > 0,
+                            false,
+                            "前の検索結果 (Shift+Enter)",
+                        )
+                        .clicked()
+                        {
+                            search_navigation = Some(false);
+                        }
+                        if icon_button(
+                            ui,
+                            ToolbarIcon::Next,
+                            match_count > 0,
+                            false,
+                            "次の検索結果 (Enter)",
+                        )
+                        .clicked()
+                        {
+                            search_navigation = Some(true);
+                        }
+                    });
+                });
         });
 
         if open_requested {

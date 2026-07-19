@@ -68,10 +68,11 @@ fn cjk_font_candidates() -> Vec<PathBuf> {
     CJK_FONT_PATHS.iter().map(PathBuf::from).collect()
 }
 
-/// Installs the first readable system CJK font as the lowest-priority egui fallback.
+/// Installs the first readable system CJK font for the proportional UI family.
 ///
-/// The default egui fonts remain first so Latin text keeps its existing appearance. A
-/// missing or unreadable system font is deliberately non-fatal: PDF viewing must still
+/// The selected CJK font is preferred for proportional text so Japanese and ASCII in one
+/// label share the same metrics. Monospace keeps the existing lowest-priority behavior.
+/// A missing or unreadable system font is deliberately non-fatal: PDF viewing must still
 /// start when the host has no Japanese font installed.
 pub(crate) fn install_cjk_fallback(ctx: &egui::Context) {
     for path in cjk_font_candidates() {
@@ -100,7 +101,9 @@ pub(crate) fn install_cjk_fallback(ctx: &egui::Context) {
             vec![
                 InsertFontFamily {
                     family: FontFamily::Proportional,
-                    priority: FontPriority::Lowest,
+                    // Prefer one font for mixed Japanese/Latin labels instead of allowing
+                    // egui to switch back to its default proportional font mid-label.
+                    priority: FontPriority::Highest,
                 },
                 InsertFontFamily {
                     family: FontFamily::Monospace,
