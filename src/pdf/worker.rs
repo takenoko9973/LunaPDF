@@ -329,16 +329,7 @@ fn run_worker(
     }
     let mut active_search_generation = 0;
 
-    while let Some(command) = next_worker_command(
-        &channels.foreground,
-        &channels.current_viewport,
-        &channels.next_viewport,
-        &channels.previous_viewport,
-        &channels.text_snapshot_wake,
-        &channels.text_snapshot_wake_sender,
-        &channels.background,
-        &channels.scheduled_text_snapshots,
-    ) {
+    while let Some(command) = next_worker_command(&channels) {
         match command {
             DocumentCommand::RenderTile(request) => {
                 if !take_scheduled_render(&scheduled_tiles, &request) {
@@ -479,58 +470,50 @@ fn take_scheduled_render(
     request_is_current
 }
 
-fn next_worker_command(
-    foreground: &Receiver<DocumentCommand>,
-    current_viewport: &Receiver<DocumentCommand>,
-    next_viewport: &Receiver<DocumentCommand>,
-    previous_viewport: &Receiver<DocumentCommand>,
-    text_snapshot_wake: &Receiver<()>,
-    text_snapshot_wake_sender: &Sender<()>,
-    background: &Receiver<DocumentCommand>,
-    scheduled_text_snapshots: &Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>,
-) -> Option<DocumentCommand> {
+fn next_worker_command(channels: &WorkerChannels) -> Option<DocumentCommand> {
     loop {
         // Each non-blocking probe preserves the documented render tiers even
         // when several queues become ready between two MuPDF operations.
-        if let Ok(command) = foreground.try_recv() {
+        if let Ok(command) = channels.foreground.try_recv() {
             return Some(command);
         }
-        if let Ok(command) = current_viewport.try_recv() {
+        if let Ok(command) = channels.current_viewport.try_recv() {
             return Some(command);
         }
-        if let Ok(command) = next_viewport.try_recv() {
+        if let Ok(command) = channels.next_viewport.try_recv() {
             return Some(command);
         }
-        if let Ok(command) = previous_viewport.try_recv() {
+        if let Ok(command) = channels.previous_viewport.try_recv() {
             return Some(command);
         }
-        if text_snapshot_wake.try_recv().is_ok() {
-            if let Some(request) =
-                take_scheduled_text_snapshot(scheduled_text_snapshots, text_snapshot_wake_sender)
-            {
+        if channels.text_snapshot_wake.try_recv().is_ok() {
+            if let Some(request) = take_scheduled_text_snapshot(
+                &channels.scheduled_text_snapshots,
+                &channels.text_snapshot_wake_sender,
+            ) {
                 return Some(DocumentCommand::LoadTextSnapshot(request));
             }
             continue;
         }
-        if let Ok(command) = background.try_recv() {
+        if let Ok(command) = channels.background.try_recv() {
             return Some(command);
         }
 
         select_biased! {
-            recv(foreground) -> command => return command.ok(),
-            recv(current_viewport) -> command => return command.ok(),
-            recv(next_viewport) -> command => return command.ok(),
-            recv(previous_viewport) -> command => return command.ok(),
-            recv(text_snapshot_wake) -> signal => {
+            recv(channels.foreground) -> command => return command.ok(),
+            recv(channels.current_viewport) -> command => return command.ok(),
+            recv(channels.next_viewport) -> command => return command.ok(),
+            recv(channels.previous_viewport) -> command => return command.ok(),
+            recv(channels.text_snapshot_wake) -> signal => {
                 signal.ok()?;
                 if let Some(request) = take_scheduled_text_snapshot(
-                    scheduled_text_snapshots,
-                    text_snapshot_wake_sender,
+                    &channels.scheduled_text_snapshots,
+                    &channels.text_snapshot_wake_sender,
                 ) {
                     return Some(DocumentCommand::LoadTextSnapshot(request));
                 }
             },
-            recv(background) -> command => return command.ok(),
+            recv(channels.background) -> command => return command.ok(),
         }
     }
 }
@@ -859,7 +842,7 @@ mod tests {
             expected_revision: 0,
         };
         let key = WorkerTextKey::from_request(&request);
-        let scheduled_text = Mutex::new(HashMap::from([(key, request)]));
+        let scheduled_text = Arc::new(Mutex::new(HashMap::from([(key, request)])));
         background_sender
             .send(DocumentCommand::SearchPage {
                 page_index: 0,
@@ -874,28 +857,18 @@ mod tests {
             )))
             .unwrap();
 
-        let first = next_worker_command(
-            &foreground_receiver,
-            &current_receiver,
-            &next_receiver,
-            &previous_receiver,
-            &text_wake_receiver,
-            &text_wake_sender,
-            &background_receiver,
-            &scheduled_text,
-        )
-        .unwrap();
-        let second = next_worker_command(
-            &foreground_receiver,
-            &current_receiver,
-            &next_receiver,
-            &previous_receiver,
-            &text_wake_receiver,
-            &text_wake_sender,
-            &background_receiver,
-            &scheduled_text,
-        )
-        .unwrap();
+        let channels = WorkerChannels {
+            foreground: foreground_receiver,
+            current_viewport: current_receiver,
+            next_viewport: next_receiver,
+            previous_viewport: previous_receiver,
+            background: background_receiver,
+            text_snapshot_wake: text_wake_receiver,
+            text_snapshot_wake_sender: text_wake_sender,
+            scheduled_text_snapshots: scheduled_text,
+        };
+        let first = next_worker_command(&channels).unwrap();
+        let second = next_worker_command(&channels).unwrap();
 
         assert!(matches!(first, DocumentCommand::RenderTile(_)));
         assert!(matches!(second, DocumentCommand::LoadTextSnapshot(_)));
