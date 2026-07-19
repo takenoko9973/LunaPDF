@@ -1,5 +1,6 @@
 # Development environment
 
+- コミットメッセージは `<type>: 日本語の要約` の形式に統一する（例: `fix: 印刷処理の終了状態を修正`）。
 - GUIまたは性能の受入検証を行う前に、`.codex/validation-lessons.md`を読む。
 - Source files are stored on the Windows filesystem.
 - Use the Dev Container for Linux builds and tests.
