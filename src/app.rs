@@ -272,7 +272,12 @@ impl PrototypeApp {
     fn from_startup(paths: Vec<PathBuf>, session_store: SessionStore) -> Self {
         let (saved_session, session_load_error) = match session_store.load() {
             Ok(session) => (session, None),
-            Err(error) => (None, Some(format!("session restore skipped: {error}"))),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "前回のセッションを復元できませんでした。今回は復元を省略します。詳細: {error}"
+                )),
+            ),
         };
         let restore_enabled = saved_session
             .as_ref()
@@ -390,7 +395,10 @@ impl PrototypeApp {
         };
         if !is_pdf_path(&path) {
             if report_to_user {
-                self.error = Some(format!("not a PDF file: {}", path.display()));
+                self.error = Some(format!(
+                    "PDFファイルではないため開けません。拡張子が.pdfのファイルを選択してください。対象: {}",
+                    path.display()
+                ));
             }
             return None;
         }
@@ -429,7 +437,10 @@ impl PrototypeApp {
             }
             Err(error) => {
                 if report_to_user {
-                    self.error = Some(format!("open {}: {error}", path.display()));
+                    self.error = Some(format!(
+                        "PDFを開けませんでした。ファイルの場所とアクセス権限を確認してください。対象: {}。詳細: {error}",
+                        path.display()
+                    ));
                 }
                 None
             }
@@ -538,7 +549,7 @@ impl PrototypeApp {
                             && bounds_match;
                         if !payload_is_valid {
                             tab.error = Some(
-                                "render: document worker returned an invalid tile payload"
+                                "ページを表示できませんでした。PDFを開き直してください。詳細: 描画データが不正です。"
                                     .to_owned(),
                             );
                             continue;
@@ -597,7 +608,10 @@ impl PrototypeApp {
                             // A worker response must correspond to the action at the
                             // top of this tab's history; silently reordering would let
                             // a later undo target the wrong annotation identity.
-                            tab.error = Some("undo: 編集履歴の応答順序が一致しません".to_owned());
+                            tab.error = Some(
+                                "編集を元に戻せませんでした。タブを開き直してください。詳細: 編集履歴の応答順序が一致しません。"
+                                    .to_owned(),
+                            );
                         }
                     }
                     Ok(DocumentEvent::TextSnapshotReady(snapshot)) => {
@@ -639,7 +653,9 @@ impl PrototypeApp {
                         );
                         if is_current {
                             tab.failed_text_snapshots.insert(key);
-                            tab.error = Some(format!("text snapshot: {message}"));
+                            tab.error = Some(format!(
+                                "テキスト情報を読み取れませんでした。PDFを開き直してください。詳細: {message}"
+                            ));
                         }
                     }
                     Ok(DocumentEvent::OutlineReady(outline)) => {
@@ -715,7 +731,9 @@ impl PrototypeApp {
                             &mut tab.failed_thumbnails,
                             key,
                         );
-                        tab.error = Some(format!("thumbnail: {message}"));
+                        tab.error = Some(format!(
+                            "サムネイルを表示できませんでした。PDFを開き直してください。詳細: {message}"
+                        ));
                     }
                     #[cfg(windows)]
                     Ok(DocumentEvent::PrintCompleted) => {
@@ -740,7 +758,8 @@ impl PrototypeApp {
                             failed_restored_paths.push(path);
                             break;
                         }
-                        self.documents[index].error = Some(format!("{operation}: {message}"));
+                        self.documents[index].error =
+                            Some(document_failure_message(operation, &message));
                         if operation == "highlight" {
                             let tab = &mut self.documents[index];
                             tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
@@ -790,13 +809,15 @@ impl PrototypeApp {
                             failed_restored_paths.push(path);
                             break;
                         }
-                        let tab = &mut self.documents[index];
-                        tab.save_in_flight = false;
-                        if tab.state != DocumentState::Error {
-                            tab.error = Some("document worker terminated".to_owned());
-                            tab.state = DocumentState::Error;
+                        let failed_path = self.tabs.tabs()[index].path().to_path_buf();
+                        self.documents[index].mark_worker_disconnected();
+                        if let Some(confirmation) = &mut self.close_confirmation
+                            && confirmation.path == failed_path
+                        {
+                            // A dead worker cannot finish the queued save, so the
+                            // dialog must become dismissible instead of waiting forever.
+                            confirmation.save_in_flight = false;
                         }
-                        tab.service = None;
                         break;
                     }
                 }
@@ -990,7 +1011,10 @@ impl PrototypeApp {
         tab.search.in_progress = true;
         if !tab.send(DocumentCommand::SetSearchGeneration(generation)) {
             tab.search.in_progress = false;
-            tab.error = Some("search: document worker is unavailable".to_owned());
+            tab.error = Some(
+                "検索を開始できません。文書処理が停止しているため、タブを開き直してください。"
+                    .to_owned(),
+            );
             return;
         }
         for page_index in search_page_order(current_page, page_count) {
@@ -1082,17 +1106,14 @@ impl PrototypeApp {
             return;
         }
 
-        let states = self
+        let candidates = self
             .documents
             .iter()
-            .map(|document| (document.state, document.last_selected_sequence))
+            .map(|document| (document.is_suspendable(), document.last_selected_sequence))
             .collect::<Vec<_>>();
-        let Some(index) = oldest_suspendable_index(self.active_index(), &states) else {
+        let Some(index) = oldest_suspendable_index(self.active_index(), &candidates) else {
             return;
         };
-        if !self.documents[index].is_suspendable() {
-            return;
-        }
 
         let keys = self.documents[index]
             .tiles
@@ -1336,8 +1357,10 @@ impl PrototypeApp {
     fn finalize_session_and_close(&mut self, context: &egui::Context) {
         let session = self.current_session();
         if let Err(error) = self.session_store.save(&session) {
-            self.session_close_failure = Some(format!("session save failed: {error}"));
-            self.status = "Session could not be saved; choose how to continue".to_owned();
+            self.session_close_failure = Some(format!(
+                "セッションを保存できませんでした。保存先の書き込み権限を確認してください。詳細: {error}"
+            ));
+            self.status = "セッションを保存できませんでした。終了方法を選択してください".to_owned();
             return;
         }
 
@@ -1439,7 +1462,10 @@ impl PrototypeApp {
                     }
                     self.status = "Saving PDF before close…".to_owned();
                 } else {
-                    self.error = Some("save: document worker is unavailable".to_owned());
+                    self.error = Some(
+                        "PDFを保存できませんでした。文書処理が停止しているため、タブを開き直してください。"
+                            .to_owned(),
+                    );
                 }
             }
             CloseDecision::Discard => {
@@ -1625,15 +1651,19 @@ impl PrototypeApp {
         if let Some(restriction) = highlight_capability.restriction() {
             // The adapter reports a concrete restriction; the UI does not
             // invent a save fallback that could leave an unsavable dirty tab.
-            self.error = Some(format!("highlight: {restriction}; editing is disabled"));
+            self.error = Some(format!(
+                "Highlightを作成できません。PDFの編集制限を確認してください。詳細: {restriction}"
+            ));
             return;
         }
         let Some(selection) = &tab.selection else {
-            self.error = Some("highlight: select text before creating a Highlight".to_owned());
+            self.error =
+                Some("Highlightを作成できません。先に本文テキストを選択してください。".to_owned());
             return;
         };
         if selection.quads.is_empty() {
-            self.error = Some("highlight: MuPDF returned no selection Quads".to_owned());
+            self.error =
+                Some("Highlightを作成できません。テキストを選択し直してください。".to_owned());
             return;
         }
 
@@ -1648,7 +1678,10 @@ impl PrototypeApp {
             tab.state = DocumentState::ReadyDirty;
             self.status = "Creating PDF Highlight annotation…".to_owned();
         } else {
-            self.error = Some("highlight: document worker is unavailable".to_owned());
+            self.error = Some(
+                "Highlightを作成できません。文書処理が停止しているため、タブを開き直してください。"
+                    .to_owned(),
+            );
         }
     }
 
@@ -1670,7 +1703,10 @@ impl PrototypeApp {
             tab.undo_in_flight = true;
             self.status = "編集を元に戻しています…".to_owned();
         } else {
-            self.error = Some("undo: document worker is unavailable".to_owned());
+            self.error = Some(
+                "編集を元に戻せません。文書処理が停止しているため、タブを開き直してください。"
+                    .to_owned(),
+            );
         }
     }
 
@@ -1703,7 +1739,10 @@ impl PrototypeApp {
             tab.state = DocumentState::Saving;
             self.status = "Saving PDF and reopening for verification…".to_owned();
         } else {
-            self.error = Some("save: document worker is unavailable".to_owned());
+            self.error = Some(
+                "PDFを保存できませんでした。文書処理が停止しているため、タブを開き直してください。"
+                    .to_owned(),
+            );
         }
     }
 
@@ -3188,6 +3227,22 @@ impl DocumentTab {
         self.print_in_flight
     }
 
+    fn mark_worker_disconnected(&mut self) {
+        // No completion event can arrive after channel disconnection. Clear
+        // every response-waiting flag so close and recovery actions remain usable.
+        self.pending_highlights = 0;
+        self.undo_in_flight = false;
+        self.save_in_flight = false;
+        self.print_in_flight = false;
+        if self.state != DocumentState::Error {
+            self.error = Some(
+                "文書処理が予期せず終了しました。タブを閉じ、PDFを開き直してください。".to_owned(),
+            );
+            self.state = DocumentState::Error;
+        }
+        self.service = None;
+    }
+
     fn is_suspendable(&self) -> bool {
         // Dropping a printing tab would also drop its completion receiver and
         // leave the UI permanently believing the print job is still active.
@@ -3608,19 +3663,43 @@ impl eframe::App for PrototypeApp {
     }
 }
 
-/// Picks the longest-unused clean document and never selects the active tab.
+/// Picks the longest-unused fully suspendable document and skips the active tab.
 fn oldest_suspendable_index(
     active_index: Option<usize>,
-    states: &[(DocumentState, u64)],
+    candidates: &[(bool, u64)],
 ) -> Option<usize> {
-    states
+    candidates
         .iter()
         .enumerate()
-        .filter(|(index, (state, _))| {
-            Some(*index) != active_index && *state == DocumentState::ReadyClean
-        })
+        .filter(|(index, (is_suspendable, _))| Some(*index) != active_index && *is_suspendable)
         .min_by_key(|(_, (_, last_selected))| *last_selected)
         .map(|(index, _)| index)
+}
+
+/// Converts internal worker operation tags into actionable release-UI messages.
+fn document_failure_message(operation: &str, detail: &str) -> String {
+    // Backend detail is retained for diagnosis, but the leading summary always
+    // explains in Japanese what failed and what the user can do next.
+    let guidance = match operation {
+        "open" => "PDFを開けませんでした。ファイルが破損していないか確認してください。",
+        "resume" | "document-info" => {
+            "PDFを再開できませんでした。ファイルの変更を確認し、タブを開き直してください。"
+        }
+        "render" => "ページを表示できませんでした。PDFを開き直してください。",
+        "selection" => "テキストを選択できませんでした。選択し直してください。",
+        "highlight" | "highlight-state" => {
+            "Highlightを作成できませんでした。PDFの編集制限を確認してください。"
+        }
+        "undo" | "undo-state" => {
+            "編集を元に戻せませんでした。PDFを開き直して状態を確認してください。"
+        }
+        "outline" => "目次を読み込めませんでした。PDFを開き直してください。",
+        "search" => "PDF内を検索できませんでした。検索語を確認して再実行してください。",
+        "print" => "PDFを印刷できませんでした。プリンターの状態と設定を確認してください。",
+        "save" => "PDFを保存できませんでした。ファイルの書き込み権限と空き容量を確認してください。",
+        _ => "PDFの処理に失敗しました。タブを開き直してください。",
+    };
+    format!("{guidance} 詳細: {detail}")
 }
 
 fn document_save_blocks_close(save_in_flight: bool) -> bool {
@@ -4189,16 +4268,46 @@ mod tests {
     }
 
     #[test]
-    fn suspension_chooses_oldest_inactive_clean_document() {
-        let states = [
-            (DocumentState::ReadyClean, 2),
-            (DocumentState::ReadyDirty, 1),
-            (DocumentState::ReadyClean, 3),
-            (DocumentState::Saving, 0),
-        ];
+    fn suspension_chooses_oldest_inactive_fully_suspendable_document() {
+        let candidates = [(true, 2), (false, 1), (true, 3), (false, 0)];
 
-        assert_eq!(oldest_suspendable_index(Some(0), &states), Some(2));
-        assert_eq!(oldest_suspendable_index(Some(2), &states), Some(0));
+        assert_eq!(oldest_suspendable_index(Some(0), &candidates), Some(2));
+        assert_eq!(oldest_suspendable_index(Some(2), &candidates), Some(0));
+    }
+
+    #[test]
+    fn suspension_skips_oldest_document_while_it_is_printing() {
+        let candidates = [(false, 0), (true, 1), (true, 2)];
+
+        assert_eq!(oldest_suspendable_index(Some(2), &candidates), Some(1));
+    }
+
+    #[test]
+    fn worker_disconnect_clears_every_close_blocking_operation() {
+        let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None, false);
+        tab.state = DocumentState::Saving;
+        tab.pending_highlights = 1;
+        tab.undo_in_flight = true;
+        tab.save_in_flight = true;
+        tab.print_in_flight = true;
+
+        tab.mark_worker_disconnected();
+
+        assert_eq!(tab.pending_highlights, 0);
+        assert!(!tab.undo_in_flight);
+        assert!(!tab.is_saving());
+        assert!(!tab.is_printing());
+        assert_eq!(tab.state, DocumentState::Error);
+        assert!(tab.service.is_none());
+    }
+
+    #[test]
+    fn worker_errors_have_japanese_guidance_and_keep_diagnostic_detail() {
+        let message = document_failure_message("save", "permission denied");
+
+        assert!(message.starts_with("PDFを保存できませんでした。"));
+        assert!(message.contains("書き込み権限"));
+        assert!(message.ends_with("詳細: permission denied"));
     }
 
     #[test]

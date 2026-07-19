@@ -77,3 +77,13 @@ PDF本文の`QPDF`をポインターでドラッグし、status表示をウィ�
 - LinuxではDnD、連続/単ページ、Outline/Thumbnails、ページ移動、検索、スクロール、選択、Highlight、保存、終了確認、キャッシュ上限到達まで実GUI経路を確認した。
 - Windows/Linuxの関連付けメタデータは構文と非破壊プレビューに合格した。
 - N-01のWindows 11実機、および異なるDPIの複数モニターは現在の環境では最終判定できない。実装はDPIをcache keyへ含め、密度変更時に世代を失効させるテストを持つが、実機受入は別途必要である。
+
+## UI改善後の追補（2026-07-19）
+
+UI再構成、タブ上限撤廃、CJKフォント、ページ入力、常設検索、Single Pageの端スクロール、Undo、Windows印刷を含む`8f04c53`より後のUI改善コミットと、その後の独立レビュー修正を含むworkspaceを対象に再検証した。レビュー修正では、印刷中タブを除外する休止候補選択、worker切断時の応答待ち解除、リリースUIの日本語エラー案内を追加した。上記のGUI記録は以前の対象commitに対する証拠であり、変更後UIの手動受入結果としては流用していない。
+
+自動検証では、Windows workspaceで`cargo fmt --check`と`git diff --check`、Dev ContainerのLinux targetで`cargo check`、`cargo test`、`cargo clippy --all-targets`、`cargo check --release`を実行した。全テストの最終結果は97 passed、0 failed、1 ignoredで、ignoredは外部ビューア確認用PDFを書き出す既存の明示実行fixtureである。release checkも警告なしで成功し、通常ビルドではデバッグ表示にしか使わない要素がコンパイル上も不要であることを確認した。
+
+Windowsホストでは`cargo check --target x86_64-pc-windows-msvc`を試行したが、製品コードへ到達する前に`mupdf-sys 0.8.0`のbindgenが`libclang.dll`不在で停止した。この試行をWindows全体buildの成功には含めない。MuPDF依存をstub化した一時MSVC harnessでは`src/pdf/windows_print.rs`を同じ`windows-sys` featureで型検査し、成功後にharnessと生成物を削除した。
+
+現在のDev Containerには`DISPLAY`、`WAYLAND_DISPLAY`、WSLg socketが共有されていない。また、現在コードのWindows実行ファイルは上記bindgen停止により生成できなかった。このため、変更後UIの実ウィンドウ、日本語IME、ホイール／トラックパッドの実ジェスチャー、Windowsネイティブ印刷ダイアログ、実プリンターへのページ範囲・部数出力は未確認である。外部PDFビューアでの今回変更後の再確認も未実施であり、既存のMuPDF保存互換テストと過去commitの受入結果までを確認済み範囲とする。
