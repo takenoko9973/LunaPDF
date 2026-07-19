@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use crossbeam_channel::TryRecvError;
 use eframe::egui::{
-    self, Color32, Id, Key, Modifiers, Pos2, Rect, TextureHandle, TextureOptions, UiBuilder, Vec2,
-    ViewportCommand,
+    self, Color32, CursorIcon, Event, Id, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2,
+    Rect, Stroke, TextureHandle, TextureOptions, TouchPhase, UiBuilder, Vec2, ViewportCommand,
 };
 
 use crate::domain::document::{
@@ -52,9 +52,33 @@ const THUMBNAIL_MAX_WIDTH: u32 = 160;
 const THUMBNAIL_MAX_HEIGHT: u32 = 220;
 const THUMBNAIL_ROW_HEIGHT: f32 = 248.0;
 
-// Trackpads emit several small deltas for one gesture. Requiring 32 points of
-// unconsumed vertical motion prevents a page flip from an incidental edge touch.
-const SINGLE_PAGE_WHEEL_THRESHOLD: f32 = 32.0;
+// High-precision devices emit point deltas rather than discrete wheel steps.
+// Twenty-four logical points filters incidental edge motion without delaying a
+// deliberate short trackpad gesture by more than a typical line of content.
+const TRACKPAD_PAGE_THRESHOLD_POINTS: f32 = 24.0;
+
+// A short idle interval separates trackpad inertia from the next deliberate
+// gesture even when the backend never emits an exact zero-delta frame.
+const WHEEL_GESTURE_IDLE_SECONDS: f64 = 0.150;
+
+// One logical point absorbs PAGE_GAP and fractional ScrollArea rounding while
+// remaining too small to skip visible page content.
+const SINGLE_PAGE_EDGE_TOLERANCE_POINTS: f32 = 1.0;
+
+// Browser-style autoscroll should remain still near its anchor. Twelve logical
+// points is large enough to tolerate click jitter at ordinary desktop DPI.
+const AUTOSCROLL_DEAD_ZONE_POINTS: f32 = 12.0;
+const AUTOSCROLL_SPEED_PER_POINT: f32 = 12.0;
+
+// Bound both long pointer excursions and a stalled frame: the former prevents
+// uncontrollable jumps, while 100 ms keeps one frame below 160 logical points.
+const AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND: f32 = 1_600.0;
+const AUTOSCROLL_MAX_FRAME_SECONDS: f32 = 0.100;
+
+// A 200 ms page cooldown is visibly brief at 30-60 Hz but prevents one held
+// outward pointer position from crossing several single pages immediately.
+const AUTOSCROLL_PAGE_COOLDOWN_SECONDS: f64 = 0.200;
+const AUTOSCROLL_MARKER_RADIUS_POINTS: f32 = 8.0;
 
 // N-05 sets 512 MiB as the stable process target. Suspension is only allowed
 // after crossing that limit; ordinary tab switches retain documents.
@@ -253,9 +277,24 @@ struct ViewState {
     restore_anchor: Option<PageAnchor>,
     single_center_anchor: Option<Vec2>,
     restore_single_anchor: Option<Vec2>,
-    single_wheel_accumulator: f32,
-    single_wheel_latched: bool,
+    single_wheel: SinglePageWheelState,
+    autoscroll: Option<AutoscrollState>,
     generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SinglePageWheelState {
+    accumulated_points: f32,
+    latched: bool,
+    direction: f32,
+    last_input_time: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AutoscrollState {
+    anchor: Pos2,
+    requested_offset: Option<Vec2>,
+    last_page_change_time: Option<f64>,
 }
 
 impl PrototypeApp {
@@ -324,11 +363,20 @@ impl PrototypeApp {
 
     /// Opens the native picker and forwards only an explicitly chosen PDF.
     fn pick_pdf_and_open(&mut self) {
+        // The native picker temporarily replaces the PDF interaction surface,
+        // so an anchor must not resume when the dialog returns.
+        self.stop_active_autoscroll();
         let selected = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
             .pick_file();
         if let Some(path) = selected {
             self.open_document(path);
+        }
+    }
+
+    fn stop_active_autoscroll(&mut self) {
+        if let Some(index) = self.active_index() {
+            self.documents[index].view.stop_autoscroll();
         }
     }
 
@@ -1065,6 +1113,7 @@ impl PrototypeApp {
 
     fn activate_document(&mut self, index: usize, previous: Option<usize>) {
         if let Some(previous) = previous.filter(|previous| *previous != index) {
+            self.documents[previous].view.stop_autoscroll();
             // Pending work is invalidated immediately. Completed textures remain
             // reusable only while the shared byte-budget LRU can retain them.
             self.documents[previous].invalidate_rendering();
@@ -1150,6 +1199,9 @@ impl PrototypeApp {
     }
 
     fn close_tab(&mut self, index: usize) {
+        if let Some(document) = self.documents.get_mut(index) {
+            document.view.stop_autoscroll();
+        }
         let Some(document) = self.documents.get(index) else {
             return;
         };
@@ -2603,10 +2655,14 @@ impl PrototypeApp {
                     .map(|(x, y)| Vec2::new(x, y))
             })
         };
+        let autoscroll_offset = tab
+            .view
+            .autoscroll
+            .and_then(|autoscroll| autoscroll.requested_offset);
         let mut scroll_area = egui::ScrollArea::both()
-            .id_salt(("continuous-pdf", path))
+            .id_salt(("continuous-pdf", &path))
             .auto_shrink([false, false]);
-        if let Some(offset) = jump_offset {
+        if let Some(offset) = jump_offset.or(autoscroll_offset) {
             scroll_area = scroll_area.scroll_offset(offset);
         }
 
@@ -2695,6 +2751,16 @@ impl PrototypeApp {
         }
         let viewport_center = output.state.offset + output.inner_rect.size() / 2.0;
         tab.view.center_anchor = layout.anchor_at(viewport_center.x, viewport_center.y);
+        let maximum_offset = (output.content_size - output.inner_rect.size()).max(Vec2::ZERO);
+        if let Some(frame) = update_autoscroll(
+            ui.ctx(),
+            &mut tab.view,
+            output.inner_rect,
+            output.state.offset,
+            maximum_offset,
+        ) {
+            paint_autoscroll_marker(ui, output.inner_rect, frame.anchor);
+        }
         if let Some((page_index, start, end)) = completed_drag {
             tab.request_selection(page_index, start, end);
             self.status = "Resolving selection on the document worker…".to_owned();
@@ -2727,11 +2793,26 @@ impl PrototypeApp {
         let restored_offset = tab.view.restore_single_anchor.take().map(|anchor| {
             single_page_centered_offset(page_content_rect, anchor, viewport_size, content_size)
         });
+        let maximum_offset = (content_size - viewport_size).max(Vec2::ZERO);
+        let scroll_id = ui.make_persistent_id(("single-pdf", &path));
+        let stored_offset = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+            .map(|state| state.offset)
+            .unwrap_or(Vec2::ZERO);
+        let starting_offset =
+            clamp_scroll_offset(restored_offset.unwrap_or(stored_offset), maximum_offset);
+        let was_at_top = starting_offset.y <= SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
+        let was_at_bottom =
+            starting_offset.y >= maximum_offset.y - SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
+        let page_fits_vertically = maximum_offset.y <= SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
+        let autoscroll_offset = tab
+            .view
+            .autoscroll
+            .and_then(|autoscroll| autoscroll.requested_offset);
         let mut completed_drag = None;
         let mut scroll_area = egui::ScrollArea::both()
-            .id_salt(("single-pdf", path))
+            .id_salt(("single-pdf", &path))
             .auto_shrink([false, false]);
-        if let Some(offset) = restored_offset {
+        if let Some(offset) = restored_offset.or(autoscroll_offset) {
             scroll_area = scroll_area.scroll_offset(offset);
         }
         let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
@@ -2790,35 +2871,57 @@ impl PrototypeApp {
             viewport_center.to_pos2(),
         ));
 
-        let (scroll_delta, control_held, pointer_position) = ui.ctx().input(|input| {
+        let (raw_events, pointer_position, now) = ui.ctx().input(|input| {
             (
-                input.smooth_scroll_delta,
-                input.modifiers.ctrl,
+                input.raw.events.clone(),
                 input.pointer.hover_pos(),
+                input.time,
             )
         });
         let pointer_over_view =
             pointer_position.is_some_and(|position| output.inner_rect.contains(position));
-        let vertical_gesture = scroll_delta.y.abs() > scroll_delta.x.abs();
-        let maximum_y = (output.content_size.y - output.inner_rect.height()).max(0.0);
-        let at_top = output.state.offset.y <= 0.5;
-        let at_bottom = output.state.offset.y >= maximum_y - 0.5;
-        let page_delta = if pointer_over_view && vertical_gesture && !control_held {
-            accumulate_single_page_edge_scroll(
-                scroll_delta.y,
+        let wheel_page_delta = single_page_wheel_steps(
+            &raw_events,
+            pointer_over_view,
+            was_at_top,
+            was_at_bottom,
+            page_fits_vertically,
+            now,
+            &mut tab.view.single_wheel,
+        );
+
+        let maximum_output_offset =
+            (output.content_size - output.inner_rect.size()).max(Vec2::ZERO);
+        let at_top = output.state.offset.y <= SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
+        let at_bottom =
+            output.state.offset.y >= maximum_output_offset.y - SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
+        let autoscroll_frame = update_autoscroll(
+            ui.ctx(),
+            &mut tab.view,
+            output.inner_rect,
+            output.state.offset,
+            maximum_output_offset,
+        );
+        if let Some(frame) = &autoscroll_frame {
+            paint_autoscroll_marker(ui, output.inner_rect, frame.anchor);
+        }
+        let autoscroll_page_delta = autoscroll_frame.as_ref().and_then(|frame| {
+            let last_page_change = tab
+                .view
+                .autoscroll
+                .and_then(|autoscroll| autoscroll.last_page_change_time);
+            autoscroll_page_delta(
+                frame.velocity.y,
                 at_top,
                 at_bottom,
-                &mut tab.view.single_wheel_accumulator,
-                &mut tab.view.single_wheel_latched,
+                frame.now,
+                last_page_change,
             )
+        });
+        let page_delta = if wheel_page_delta != 0 {
+            Some(wheel_page_delta)
         } else {
-            accumulate_single_page_edge_scroll(
-                0.0,
-                false,
-                false,
-                &mut tab.view.single_wheel_accumulator,
-                &mut tab.view.single_wheel_latched,
-            )
+            autoscroll_page_delta
         };
         if let Some(page_delta) = page_delta {
             let last_page = page_count.saturating_sub(1);
@@ -2828,11 +2931,13 @@ impl PrototypeApp {
                 // Enter the next page at its top and the previous page at its
                 // bottom so the wheel continues in the direction of travel.
                 let y = if page_delta > 0 { 0.0 } else { 1.0 };
-                let anchor = Vec2::new(x, y);
-                tab.view.current_page = target;
-                tab.view.single_center_anchor = Some(anchor);
-                tab.view.restore_single_anchor = Some(anchor);
-                tab.invalidate_rendering();
+                tab.jump_to_single_page_edge(target, Vec2::new(x, y));
+                if let Some(autoscroll) = &mut tab.view.autoscroll {
+                    // The new page has a different scroll extent. Recompute its
+                    // offset next frame and apply the same cooldown to wheel/auto races.
+                    autoscroll.requested_offset = None;
+                    autoscroll.last_page_change_time = Some(now);
+                }
             }
         }
 
@@ -3057,39 +3162,225 @@ fn normalized_page_point(page_rect: Rect, point: Pos2) -> Vec2 {
     )
 }
 
-/// Centers a normalized PDF page point while respecting both scroll extents.
-/// Converts only a deliberate, unconsumed edge gesture into one page change.
-fn accumulate_single_page_edge_scroll(
-    vertical_delta: f32,
+/// Converts raw wheel events into bounded single-page navigation steps.
+///
+/// The edge flags describe the scroll position before this frame's ScrollArea
+/// processing. This prevents the event that merely reaches an edge from also
+/// changing the page.
+fn single_page_wheel_steps(
+    events: &[Event],
+    pointer_over_view: bool,
     at_top: bool,
     at_bottom: bool,
-    accumulator: &mut f32,
-    latched: &mut bool,
+    page_fits_vertically: bool,
+    now: f64,
+    state: &mut SinglePageWheelState,
+) -> isize {
+    expire_wheel_gesture_after_idle(now, state);
+    let mut page_steps = 0_isize;
+
+    for event in events {
+        let Event::MouseWheel {
+            unit,
+            delta,
+            phase,
+            modifiers,
+        } = event
+        else {
+            continue;
+        };
+
+        // End and cancellation must release the latch even if the pointer left
+        // the PDF area before the backend delivered the final phase.
+        if matches!(phase, TouchPhase::End | TouchPhase::Cancel) {
+            reset_wheel_gesture(state);
+            continue;
+        }
+        let vertical_input = delta.y.abs() > delta.x.abs() && delta.y.abs() > f32::EPSILON;
+        if !pointer_over_view || modifiers.ctrl || !vertical_input {
+            continue;
+        }
+
+        if *phase == TouchPhase::Start {
+            reset_wheel_gesture(state);
+        }
+        let direction = delta.y.signum();
+        let reversed = state.direction != 0.0 && state.direction != direction;
+        if reversed {
+            // Reversal is a deliberate new intent and must not inherit either
+            // the accumulated distance or the previous page latch.
+            reset_wheel_gesture(state);
+        }
+        state.direction = direction;
+        state.last_input_time = Some(now);
+
+        let moves_to_previous = direction > 0.0 && at_top;
+        let moves_to_next = direction < 0.0 && at_bottom;
+        if !moves_to_previous && !moves_to_next {
+            state.accumulated_points = 0.0;
+            continue;
+        }
+        let page_delta = if moves_to_next { 1 } else { -1 };
+
+        match unit {
+            MouseWheelUnit::Line | MouseWheelUnit::Page => {
+                // A raw discrete event represents one physical wheel action;
+                // its platform-specific numeric magnitude must not multiply pages.
+                state.accumulated_points = 0.0;
+                state.latched = false;
+                page_steps += page_delta;
+            }
+            MouseWheelUnit::Point => {
+                if state.latched {
+                    continue;
+                }
+                state.accumulated_points += delta.y;
+                if state.accumulated_points.abs() >= TRACKPAD_PAGE_THRESHOLD_POINTS {
+                    state.accumulated_points = 0.0;
+                    state.latched = true;
+                    page_steps += page_delta;
+                }
+            }
+        }
+    }
+
+    if page_fits_vertically {
+        page_steps
+    } else {
+        // After one edge transition the adjacent enlarged page begins at the
+        // opposite edge, which cannot be evaluated until the following frame.
+        page_steps.signum()
+    }
+}
+
+fn expire_wheel_gesture_after_idle(now: f64, state: &mut SinglePageWheelState) {
+    let idle = state
+        .last_input_time
+        .is_some_and(|last| now - last >= WHEEL_GESTURE_IDLE_SECONDS);
+    if idle {
+        reset_wheel_gesture(state);
+    }
+}
+
+fn reset_wheel_gesture(state: &mut SinglePageWheelState) {
+    state.accumulated_points = 0.0;
+    state.latched = false;
+    state.direction = 0.0;
+    state.last_input_time = None;
+}
+
+struct AutoscrollFrame {
+    anchor: Pos2,
+    velocity: Vec2,
+    now: f64,
+}
+
+/// Starts, advances, or stops browser-style autoscroll for one PDF ScrollArea.
+fn update_autoscroll(
+    context: &egui::Context,
+    view: &mut ViewState,
+    view_rect: Rect,
+    current_offset: Vec2,
+    maximum_offset: Vec2,
+) -> Option<AutoscrollFrame> {
+    let input = context.input(|input| {
+        (
+            input.pointer.button_clicked(PointerButton::Middle),
+            input.pointer.button_clicked(PointerButton::Primary),
+            input.pointer.button_clicked(PointerButton::Secondary),
+            input.key_pressed(Key::Escape),
+            input.focused,
+            input.pointer.hover_pos(),
+            input.time,
+            input.stable_dt.min(AUTOSCROLL_MAX_FRAME_SECONDS),
+        )
+    });
+    let (middle_clicked, primary_clicked, secondary_clicked, escape, focused, pointer, now, dt) =
+        input;
+
+    if view.autoscroll.is_some() {
+        let stop_requested =
+            middle_clicked || primary_clicked || secondary_clicked || escape || !focused;
+        if stop_requested {
+            view.autoscroll = None;
+            return None;
+        }
+    } else if middle_clicked && pointer.is_some_and(|position| view_rect.contains(position)) {
+        let anchor = pointer.expect("the start condition requires a pointer position");
+        view.autoscroll = Some(AutoscrollState {
+            anchor,
+            requested_offset: Some(current_offset),
+            last_page_change_time: None,
+        });
+    }
+
+    let autoscroll = view.autoscroll.as_mut()?;
+    let velocity = pointer.map_or(Vec2::ZERO, |position| {
+        autoscroll_velocity(autoscroll.anchor, position)
+    });
+    let desired_offset = current_offset + velocity * dt;
+    autoscroll.requested_offset = Some(clamp_scroll_offset(desired_offset, maximum_offset));
+    context.set_cursor_icon(CursorIcon::AllScroll);
+    context.request_repaint();
+    Some(AutoscrollFrame {
+        anchor: autoscroll.anchor,
+        velocity,
+        now,
+    })
+}
+
+fn autoscroll_velocity(anchor: Pos2, pointer: Pos2) -> Vec2 {
+    let displacement = pointer - anchor;
+    let distance = displacement.length();
+    if distance <= AUTOSCROLL_DEAD_ZONE_POINTS {
+        return Vec2::ZERO;
+    }
+
+    // Radial scaling keeps diagonal movement directionally stable, unlike
+    // independent per-axis clipping which would skew near the speed ceiling.
+    let requested_speed = (distance - AUTOSCROLL_DEAD_ZONE_POINTS) * AUTOSCROLL_SPEED_PER_POINT;
+    let speed = requested_speed.min(AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND);
+    displacement / distance * speed
+}
+
+fn clamp_scroll_offset(offset: Vec2, maximum: Vec2) -> Vec2 {
+    Vec2::new(
+        offset.x.clamp(0.0, maximum.x.max(0.0)),
+        offset.y.clamp(0.0, maximum.y.max(0.0)),
+    )
+}
+
+fn autoscroll_page_delta(
+    velocity_y: f32,
+    at_top: bool,
+    at_bottom: bool,
+    now: f64,
+    last_page_change_time: Option<f64>,
 ) -> Option<isize> {
-    if vertical_delta.abs() <= f32::EPSILON {
-        *accumulator = 0.0;
-        *latched = false;
+    let cooling_down =
+        last_page_change_time.is_some_and(|last| now - last < AUTOSCROLL_PAGE_COOLDOWN_SECONDS);
+    if cooling_down {
         return None;
     }
-    if *latched {
-        return None;
+    if velocity_y > 0.0 && at_bottom {
+        Some(1)
+    } else if velocity_y < 0.0 && at_top {
+        Some(-1)
+    } else {
+        None
     }
-    let moves_to_previous = vertical_delta > 0.0 && at_top;
-    let moves_to_next = vertical_delta < 0.0 && at_bottom;
-    if !moves_to_previous && !moves_to_next {
-        *accumulator = 0.0;
-        return None;
-    }
-    if accumulator.signum() != 0.0 && accumulator.signum() != vertical_delta.signum() {
-        *accumulator = 0.0;
-    }
-    *accumulator += vertical_delta;
-    if accumulator.abs() < SINGLE_PAGE_WHEEL_THRESHOLD {
-        return None;
-    }
-    *accumulator = 0.0;
-    *latched = true;
-    Some(if moves_to_next { 1 } else { -1 })
+}
+
+fn paint_autoscroll_marker(ui: &egui::Ui, view_rect: Rect, anchor: Pos2) {
+    let painter = ui.painter().with_clip_rect(view_rect);
+    let stroke = Stroke::new(1.5, ui.visuals().strong_text_color());
+    painter.circle_filled(
+        anchor,
+        AUTOSCROLL_MARKER_RADIUS_POINTS,
+        ui.visuals().panel_fill,
+    );
+    painter.circle_stroke(anchor, AUTOSCROLL_MARKER_RADIUS_POINTS, stroke);
+    painter.circle_filled(anchor, 2.0, stroke.color);
 }
 
 fn single_page_centered_offset(
@@ -3310,17 +3601,17 @@ impl DocumentTab {
 
     fn set_display_mode(&mut self, mode: DisplayMode) {
         if self.view.switch_display_mode(mode) {
+            // Display modes use different ScrollArea coordinate systems, so an
+            // anchor from the old mode cannot be resumed safely.
+            self.view.stop_autoscroll();
             self.invalidate_rendering();
         }
     }
 
     fn jump_to_page(&mut self, page_index: usize) {
-        let page_count = self.info.as_ref().map_or(0, |info| info.page_bounds.len());
-        if page_index >= page_count {
+        if !self.set_page_index(page_index) {
             return;
         }
-        self.page_input_error = None;
-        self.view.current_page = page_index;
         match self.view.display_mode {
             DisplayMode::Continuous => {
                 self.view.scroll_to_page = Some(page_index);
@@ -3335,12 +3626,19 @@ impl DocumentTab {
         self.invalidate_rendering();
     }
 
-    fn jump_to_search_match(&mut self, anchor: PageAnchor) {
-        let page_count = self.info.as_ref().map_or(0, |info| info.page_bounds.len());
-        if anchor.page_index >= page_count {
+    fn jump_to_single_page_edge(&mut self, page_index: usize, anchor: Vec2) {
+        if !self.set_page_index(page_index) {
             return;
         }
-        self.view.current_page = anchor.page_index;
+        self.view.single_center_anchor = Some(anchor);
+        self.view.restore_single_anchor = Some(anchor);
+        self.invalidate_rendering();
+    }
+
+    fn jump_to_search_match(&mut self, anchor: PageAnchor) {
+        if !self.set_page_index(anchor.page_index) {
+            return;
+        }
         match self.view.display_mode {
             DisplayMode::Continuous => {
                 // Page-top scrolling would hide lower-page hits. Reuse the
@@ -3355,6 +3653,18 @@ impl DocumentTab {
             }
         }
         self.invalidate_rendering();
+    }
+
+    /// Applies bounds checking and shared page-input state before a caller sets
+    /// the display-mode-specific restore position.
+    fn set_page_index(&mut self, page_index: usize) -> bool {
+        let page_count = self.info.as_ref().map_or(0, |info| info.page_bounds.len());
+        if page_index >= page_count {
+            return false;
+        }
+        self.page_input_error = None;
+        self.view.current_page = page_index;
+        true
     }
 
     fn request_thumbnail(&mut self, page_index: usize, key: ThumbnailCacheKey) {
@@ -3505,6 +3815,10 @@ impl DocumentTab {
 }
 
 impl ViewState {
+    fn stop_autoscroll(&mut self) {
+        self.autoscroll = None;
+    }
+
     fn new() -> Self {
         Self {
             display_mode: DisplayMode::Continuous,
@@ -3516,8 +3830,8 @@ impl ViewState {
             restore_anchor: None,
             single_center_anchor: None,
             restore_single_anchor: None,
-            single_wheel_accumulator: 0.0,
-            single_wheel_latched: false,
+            single_wheel: SinglePageWheelState::default(),
+            autoscroll: None,
             generation: 1,
         }
     }
@@ -3551,8 +3865,8 @@ impl ViewState {
                 .then_some(single_anchor),
             restore_single_anchor: (display_mode == DisplayMode::SinglePage)
                 .then_some(single_anchor),
-            single_wheel_accumulator: 0.0,
-            single_wheel_latched: false,
+            single_wheel: SinglePageWheelState::default(),
+            autoscroll: None,
             generation: 1,
         }
     }
@@ -3661,6 +3975,12 @@ impl ViewState {
 
 impl eframe::App for PrototypeApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        let modal_open = self.close_confirmation.is_some() || self.session_close_failure.is_some();
+        if modal_open {
+            // A modal owns pointer intent until it closes; retaining a background
+            // autoscroll anchor would move the document under the dialog.
+            self.stop_active_autoscroll();
+        }
         self.receive_document_events(context);
         self.maybe_suspend_inactive_document();
         self.handle_dropped_files(context);
@@ -4200,44 +4520,202 @@ mod tests {
         assert!((restored_anchor.y - expected_anchor.y).abs() < f32::EPSILON);
     }
 
+    fn wheel_event(
+        unit: MouseWheelUnit,
+        delta: Vec2,
+        phase: TouchPhase,
+        control_held: bool,
+    ) -> Event {
+        Event::MouseWheel {
+            unit,
+            delta,
+            phase,
+            modifiers: Modifiers {
+                ctrl: control_held,
+                ..Modifiers::default()
+            },
+        }
+    }
+
     #[test]
-    fn single_page_edge_scroll_changes_one_page_per_gesture() {
-        let mut accumulator = 0.0;
-        let mut latched = false;
+    fn discrete_single_page_wheel_uses_one_step_per_raw_event() {
+        let events = vec![
+            wheel_event(
+                MouseWheelUnit::Line,
+                Vec2::new(0.0, -3.0),
+                TouchPhase::Move,
+                false,
+            ),
+            wheel_event(
+                MouseWheelUnit::Page,
+                Vec2::new(0.0, -1.0),
+                TouchPhase::Move,
+                false,
+            ),
+        ];
+        let mut state = SinglePageWheelState::default();
 
         assert_eq!(
-            accumulate_single_page_edge_scroll(-16.0, false, true, &mut accumulator, &mut latched),
-            None
-        );
-        assert_eq!(
-            accumulate_single_page_edge_scroll(-20.0, false, true, &mut accumulator, &mut latched),
-            Some(1)
-        );
-        assert_eq!(
-            accumulate_single_page_edge_scroll(-50.0, false, true, &mut accumulator, &mut latched),
-            None
-        );
-        assert_eq!(
-            accumulate_single_page_edge_scroll(0.0, false, false, &mut accumulator, &mut latched),
-            None
-        );
-        assert_eq!(
-            accumulate_single_page_edge_scroll(32.0, true, false, &mut accumulator, &mut latched),
-            Some(-1)
+            single_page_wheel_steps(&events, true, true, true, true, 1.0, &mut state),
+            2
         );
     }
 
     #[test]
-    fn single_page_scroll_inside_page_does_not_accumulate() {
-        let mut accumulator = 18.0;
-        let mut latched = false;
+    fn point_wheel_accumulates_once_until_end_idle_or_reversal() {
+        let small = [wheel_event(
+            MouseWheelUnit::Point,
+            Vec2::new(0.0, -12.0),
+            TouchPhase::Move,
+            false,
+        )];
+        let full = [wheel_event(
+            MouseWheelUnit::Point,
+            Vec2::new(0.0, -24.0),
+            TouchPhase::Move,
+            false,
+        )];
+        let end = [wheel_event(
+            MouseWheelUnit::Point,
+            Vec2::ZERO,
+            TouchPhase::End,
+            false,
+        )];
+        let reverse = [wheel_event(
+            MouseWheelUnit::Point,
+            Vec2::new(0.0, 24.0),
+            TouchPhase::Move,
+            false,
+        )];
+        let mut state = SinglePageWheelState::default();
 
         assert_eq!(
-            accumulate_single_page_edge_scroll(-20.0, false, false, &mut accumulator, &mut latched),
+            single_page_wheel_steps(&small, true, true, true, true, 1.0, &mut state),
+            0
+        );
+        assert_eq!(
+            single_page_wheel_steps(&small, true, true, true, true, 1.01, &mut state),
+            1
+        );
+        assert_eq!(
+            single_page_wheel_steps(&full, true, true, true, true, 1.02, &mut state),
+            0
+        );
+        assert_eq!(
+            single_page_wheel_steps(&end, false, false, false, true, 1.03, &mut state),
+            0
+        );
+        assert_eq!(
+            single_page_wheel_steps(&full, true, true, true, true, 1.04, &mut state),
+            1
+        );
+        assert_eq!(
+            single_page_wheel_steps(&reverse, true, true, true, true, 1.05, &mut state),
+            -1
+        );
+        assert_eq!(
+            single_page_wheel_steps(&full, true, true, true, true, 1.30, &mut state),
+            1
+        );
+    }
+
+    #[test]
+    fn single_page_wheel_ignores_control_horizontal_and_outside_input() {
+        let control = [wheel_event(
+            MouseWheelUnit::Line,
+            Vec2::new(0.0, -1.0),
+            TouchPhase::Move,
+            true,
+        )];
+        let horizontal = [wheel_event(
+            MouseWheelUnit::Line,
+            Vec2::new(2.0, -1.0),
+            TouchPhase::Move,
+            false,
+        )];
+        let vertical = [wheel_event(
+            MouseWheelUnit::Line,
+            Vec2::new(0.0, -1.0),
+            TouchPhase::Move,
+            false,
+        )];
+        let mut state = SinglePageWheelState::default();
+
+        assert_eq!(
+            single_page_wheel_steps(&control, true, true, true, true, 1.0, &mut state),
+            0
+        );
+        assert_eq!(
+            single_page_wheel_steps(&horizontal, true, true, true, true, 1.0, &mut state),
+            0
+        );
+        assert_eq!(
+            single_page_wheel_steps(&vertical, false, true, true, true, 1.0, &mut state),
+            0
+        );
+    }
+
+    #[test]
+    fn enlarged_page_changes_only_after_it_was_already_at_the_edge() {
+        let events = vec![
+            wheel_event(
+                MouseWheelUnit::Line,
+                Vec2::new(0.0, -1.0),
+                TouchPhase::Move,
+                false,
+            ),
+            wheel_event(
+                MouseWheelUnit::Line,
+                Vec2::new(0.0, -1.0),
+                TouchPhase::Move,
+                false,
+            ),
+        ];
+        let mut state = SinglePageWheelState::default();
+
+        assert_eq!(
+            single_page_wheel_steps(&events, true, false, false, false, 1.0, &mut state),
+            0
+        );
+        assert_eq!(
+            single_page_wheel_steps(&events, true, false, true, false, 1.1, &mut state),
+            1
+        );
+    }
+
+    #[test]
+    fn autoscroll_velocity_has_dead_zone_and_speed_ceiling() {
+        let anchor = Pos2::new(100.0, 100.0);
+        assert_eq!(
+            autoscroll_velocity(anchor, Pos2::new(110.0, 100.0)),
+            Vec2::ZERO
+        );
+
+        let moderate = autoscroll_velocity(anchor, Pos2::new(40.0, 100.0));
+        let distant = autoscroll_velocity(anchor, Pos2::new(10_000.0, 100.0));
+        assert!(moderate.x < 0.0);
+        assert!(moderate.length() < distant.length());
+        assert!(distant.length() <= AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND + f32::EPSILON);
+    }
+
+    #[test]
+    fn single_page_autoscroll_respects_edge_direction_and_cooldown() {
+        assert_eq!(
+            autoscroll_page_delta(100.0, false, true, 1.0, None),
+            Some(1)
+        );
+        assert_eq!(
+            autoscroll_page_delta(-100.0, true, false, 1.0, None),
+            Some(-1)
+        );
+        assert_eq!(
+            autoscroll_page_delta(100.0, false, true, 1.1, Some(1.0)),
             None
         );
-        assert_eq!(accumulator, 0.0);
-        assert!(!latched);
+        assert_eq!(
+            autoscroll_page_delta(100.0, true, false, 1.3, Some(1.0)),
+            None
+        );
     }
 
     #[test]
@@ -4267,8 +4745,8 @@ mod tests {
             restore_anchor: None,
             single_center_anchor: None,
             restore_single_anchor: None,
-            single_wheel_accumulator: 0.0,
-            single_wheel_latched: false,
+            single_wheel: SinglePageWheelState::default(),
+            autoscroll: None,
             generation: 1,
         };
 
