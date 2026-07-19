@@ -14,3 +14,4 @@
 
 - [Codex向け LunaPDF UI・編集機能改善指示書](ui-improvement/lunapdf_codex_ui_improvement_instructions.md)
 - [Codex向け LunaPDF UI・操作・描画性能 差分修正指示書](ui-improvement/lunapdf_codex_followup_ui_performance_instructions.md)
+- [Codex向け LunaPDF SVGアイコン移行・ツールバー修正指示書](ui-improvement/lunapdf_codex_svg_icons_toolbar_instructions.md)
