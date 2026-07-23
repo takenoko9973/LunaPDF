@@ -10,6 +10,8 @@
   `docker compose -f .devcontainer/compose.base.yml exec workspace cargo check`
 - Run Linux Clippy with:
   `docker compose -f .devcontainer/compose.base.yml exec workspace cargo clippy --all-targets`
-- Run Windows MSVC checks directly on the host with:
-  `cargo check --target x86_64-pc-windows-msvc`
+- Cross-compile Windows GNU debug builds in the Dev Container with:
+  `docker compose -f .devcontainer/compose.base.yml exec workspace sh -c "cargo build --target=x86_64-pc-windows-gnu && install -D target/x86_64-pc-windows-gnu/debug/lunapdf.exe /workspace/dist/lunapdf-debug.exe"`
+- Cross-compile Windows GNU release builds in the Dev Container with:
+  `docker compose -f .devcontainer/compose.base.yml exec workspace sh -c "cargo build --release --target=x86_64-pc-windows-gnu && install -D target/x86_64-pc-windows-gnu/release/lunapdf.exe /workspace/dist/lunapdf-release.exe"`
 - Keep container and Windows build outputs separate.
