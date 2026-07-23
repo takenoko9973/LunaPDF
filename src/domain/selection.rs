@@ -78,13 +78,13 @@ pub(crate) struct SelectionSnapshot {
 /// Keeping this ordered glyph selection separate ensures future Typst-only
 /// display correction cannot silently alter copy order.
 pub(crate) fn selected_text(glyphs: &[GlyphSnapshot], start: PagePoint, end: PagePoint) -> String {
-    let Some(range) = selected_glyph_range(glyphs, start, end) else {
+    let Some(selected_glyphs) = selected_glyphs(glyphs, start, end) else {
         return String::new();
     };
 
     let mut text = String::new();
-    let mut previous_line = glyphs[*range.start()].line_index;
-    for glyph in &glyphs[range] {
+    let mut previous_line = selected_glyphs[0].line_index;
+    for glyph in selected_glyphs {
         if glyph.line_index != previous_line {
             text.push('\n');
             previous_line = glyph.line_index;
@@ -92,6 +92,28 @@ pub(crate) fn selected_text(glyphs: &[GlyphSnapshot], start: PagePoint, end: Pag
         text.push(glyph.character);
     }
     text
+}
+
+/// Returns display and annotation Quads for the same inclusive glyph range as copy text.
+pub(crate) fn selected_quads(
+    glyphs: &[GlyphSnapshot],
+    start: PagePoint,
+    end: PagePoint,
+) -> Vec<PageQuad> {
+    let Some(selected_glyphs) = selected_glyphs(glyphs, start, end) else {
+        return Vec::new();
+    };
+    selected_glyphs.iter().map(|glyph| glyph.quad).collect()
+}
+
+/// Borrows the canonical inclusive glyph range without allocating during drag preview.
+pub(crate) fn selected_glyphs(
+    glyphs: &[GlyphSnapshot],
+    start: PagePoint,
+    end: PagePoint,
+) -> Option<&[GlyphSnapshot]> {
+    let range = selected_glyph_range(glyphs, start, end)?;
+    Some(&glyphs[range])
 }
 
 /// Maps a pointer to a stable character center in the Rust-owned text snapshot.
@@ -178,6 +200,50 @@ mod tests {
         assert_eq!(
             selected_glyph_range(&glyphs, snapped, PagePoint::new(1.0, 5.0)),
             Some(0..=1)
+        );
+    }
+
+    #[test]
+    fn selection_quads_include_both_endpoint_glyphs() {
+        let glyphs = vec![glyph('A', 0.0, 0), glyph('B', 10.0, 0), glyph('C', 20.0, 0)];
+        let start = PagePoint::new(1.0, 5.0);
+        let end = PagePoint::new(27.0, 5.0);
+
+        let forward = selected_quads(&glyphs, start, end);
+        let reverse = selected_quads(&glyphs, end, start);
+
+        assert_eq!(
+            forward,
+            glyphs.iter().map(|glyph| glyph.quad).collect::<Vec<_>>()
+        );
+        assert_eq!(reverse, forward);
+    }
+
+    #[test]
+    fn single_glyph_selection_preserves_its_original_quad() {
+        let mut tilted = glyph('A', 10.0, 0);
+        tilted.quad.upper_right.y = 2.0;
+        tilted.quad.lower_right.y = 12.0;
+        let point = PagePoint::new(14.0, 6.0);
+
+        let quads = selected_quads(std::slice::from_ref(&tilted), point, point);
+
+        assert_eq!(quads, vec![tilted.quad]);
+    }
+
+    #[test]
+    fn selection_outside_the_last_glyph_uses_the_same_endpoint_for_text_and_quads() {
+        let glyphs = vec![glyph('A', 10.0, 0), glyph('B', 20.0, 1)];
+        let start = PagePoint::new(11.0, 5.0);
+        let outside = PagePoint::new(200.0, 200.0);
+
+        let text = selected_text(&glyphs, start, outside);
+        let quads = selected_quads(&glyphs, start, outside);
+
+        assert_eq!(text, "A\nB");
+        assert_eq!(
+            quads,
+            glyphs.iter().map(|glyph| glyph.quad).collect::<Vec<_>>()
         );
     }
 }

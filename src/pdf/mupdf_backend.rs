@@ -33,14 +33,8 @@ use crate::domain::document::{
 };
 use crate::domain::selection::{
     GlyphSnapshot, PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
-    selected_text,
+    selected_quads, selected_text,
 };
-
-// A one-page selection needs a finite output buffer because the high-level
-// MuPDF API fills caller-owned Quad slots. 4096 lines is deliberately above
-// the target technical documents' per-page line count while still turning a
-// malformed result into an explicit error instead of unbounded allocation.
-const SELECTION_QUAD_CAPACITY: usize = 4_096;
 
 // PDF numeric objects can round coordinates while serializing an incremental
 // update. One hundredth of a PDF point is below display-pixel precision at the
@@ -372,31 +366,18 @@ impl MuPdfBackend {
         start: PagePoint,
         end: PagePoint,
     ) -> Result<SelectionSnapshot> {
-        let (mut text_page, glyphs, extraction_time) =
+        let (_text_page, glyphs, extraction_time) =
             load_text_snapshot(&self.document, page_index, self.page_bounds.len())?;
-        let placeholder = Quad::from(Rect::default());
-        let mut selection_quads = vec![placeholder; SELECTION_QUAD_CAPACITY];
-        let quad_count = text_page.highlight_selection(
-            Point::new(start.x, start.y),
-            Point::new(end.x, end.y),
-            &selection_quads,
-        )?;
-        ensure!(
-            quad_count >= 0,
-            "MuPDF returned a negative selection Quad count"
-        );
-        let quad_count = usize::try_from(quad_count)?;
-        ensure!(
-            quad_count <= selection_quads.len(),
-            "selection exceeds the validation limit of {SELECTION_QUAD_CAPACITY} Quads"
-        );
-        selection_quads.truncate(quad_count);
+        // The drag preview already resolves pointer positions to snapshot glyphs.
+        // Re-running MuPDF's point selection here excludes endpoint glyphs, so
+        // confirmed display, copy and Highlight all derive from that same range.
+        let selection_quads = selected_quads(&glyphs, start, end);
 
         Ok(SelectionSnapshot {
             page_index,
             generation,
             text: selected_text(&glyphs, start, end),
-            quads: selection_quads.iter().map(page_quad_from_mupdf).collect(),
+            quads: selection_quads,
             extraction_time,
         })
     }
@@ -1798,6 +1779,47 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_selection_quads_match_the_preview_glyph_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selection-range.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(400.0, 200.0)).unwrap();
+            let mut shape = Shape::new(&mut page).unwrap();
+            shape
+                .insert_text(Point::new(40.0, 100.0), "ABCDE", &TextOptions::default())
+                .unwrap()
+                .commit(&mut document, true)
+                .unwrap();
+            document.save(path_text).unwrap();
+        }
+
+        let backend = MuPdfBackend::open(path).unwrap();
+        let snapshot = backend
+            .text_snapshot(TextSnapshotRequest {
+                page_index: 0,
+                expected_revision: 0,
+            })
+            .unwrap()
+            .unwrap();
+        let first = snapshot.glyphs.first().unwrap().quad.bounds();
+        let last = snapshot.glyphs.last().unwrap().quad.bounds();
+        let start = PagePoint::new((first.0 + first.2) / 2.0, (first.1 + first.3) / 2.0);
+        let end = PagePoint::new((last.0 + last.2) / 2.0, (last.1 + last.3) / 2.0);
+        let expected_quads = snapshot
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.quad)
+            .collect::<Vec<_>>();
+
+        let selection = backend.select(0, 1, start, end).unwrap();
+
+        assert_eq!(selection.text, "ABCDE");
+        assert_eq!(selection.quads, expected_quads);
+    }
+
+    #[test]
     fn nonzero_pdf_boxes_render_internal_and_right_bottom_edge_tiles() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nonzero-boxes.pdf");
@@ -1848,6 +1870,48 @@ mod tests {
                 .unwrap();
             assert_eq!(tile.spec, spec);
             assert_eq!(tile.pixels_rgba.len(), spec.rgba_bytes().unwrap());
+        }
+    }
+
+    #[test]
+    fn landscape_fractional_dpi_keeps_request_and_rendered_tile_edges_identical() {
+        use crate::render::tiles::TileGrid;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("landscape-fractional-dpi.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(1_600.0, 1_100.0)).unwrap();
+            let mut media_box = document.new_array_with_capacity(4).unwrap();
+            for coordinate in [100.25, 200.5, 893.951, 795.776] {
+                media_box
+                    .array_push(PdfObject::new_real(coordinate).unwrap())
+                    .unwrap();
+            }
+            page.object().dict_put("MediaBox", media_box).unwrap();
+            page.set_crop_box(Rect::new(100.25, 200.5, 893.951, 795.776))
+                .unwrap();
+            document.save(path_text).unwrap();
+        }
+
+        let mut backend = MuPdfBackend::open(path).unwrap();
+        let bounds = backend.info().unwrap().page_bounds[0];
+        for scale in [0.942_420_66, 0.9375, 1.125, 1.5] {
+            let grid = TileGrid::new(bounds, scale).unwrap();
+            let specs = grid
+                .specs_in_pixel_rect(0, 0, grid.pixel_width(), grid.pixel_height())
+                .unwrap();
+
+            for spec in specs {
+                let tile = backend
+                    .render_tile(tile_request_with_spec(0, scale, 1, 0, spec))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(tile.spec, spec);
+                assert_eq!(tile.page_pixel_width, grid.pixel_width());
+                assert_eq!(tile.page_pixel_height, grid.pixel_height());
+            }
         }
     }
 

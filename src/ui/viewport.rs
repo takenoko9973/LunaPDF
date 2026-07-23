@@ -2,7 +2,7 @@ use eframe::egui::{Color32, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Tex
 
 use crate::domain::document::{PageRect, RenderedTile, SearchMatch};
 use crate::domain::selection::{
-    PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, selected_glyph_range, snap_to_glyph,
+    PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, selected_glyphs, snap_to_glyph,
 };
 
 #[derive(Default)]
@@ -137,10 +137,10 @@ impl PageViewport {
         else {
             return;
         };
-        let Some(range) = selected_glyph_range(&text_snapshot.glyphs, start, current) else {
+        let Some(glyphs) = selected_glyphs(&text_snapshot.glyphs, start, current) else {
             return;
         };
-        for glyph in &text_snapshot.glyphs[range] {
+        for glyph in glyphs {
             paint_quad(
                 ui,
                 screen_rect,

@@ -8,7 +8,8 @@ use std::time::Instant;
 use crossbeam_channel::TryRecvError;
 use eframe::egui::{
     self, Color32, CursorIcon, Event, Id, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2,
-    Rect, Stroke, TextureHandle, TextureOptions, TouchPhase, UiBuilder, Vec2, ViewportCommand,
+    Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, TouchPhase, UiBuilder, Vec2,
+    ViewportCommand,
 };
 
 use crate::domain::document::{
@@ -42,6 +43,17 @@ const MAX_ZOOM: f32 = 4.0;
 // difference below one tenth of a percent avoids invalidating every page on
 // visually identical consecutive frames.
 const ZOOM_CHANGE_EPSILON: f32 = 0.001;
+
+// These values preserve egui's 18-point minimum interaction height, keep a
+// 24-point close target and a readable title region at minimum width, and cap
+// the former unbounded filename label at a conventional desktop tab width.
+const TAB_MIN_WIDTH: f32 = 96.0;
+const TAB_MAX_WIDTH: f32 = 240.0;
+const TAB_HEIGHT: f32 = 24.0;
+const TAB_HORIZONTAL_PADDING: f32 = 8.0;
+const TAB_CLOSE_WIDTH: f32 = 24.0;
+const TAB_CONTENT_GAP: f32 = 4.0;
+const TAB_ITEM_SPACING: f32 = 1.0;
 
 // The design budget is shared across all tabs so the active document can use
 // available GPU memory instead of dividing a fixed allocation per tab.
@@ -109,6 +121,9 @@ pub(crate) struct PrototypeApp {
     session_restore_progress: Option<SessionRestoreProgress>,
     next_document_id: u64,
     activity_sequence: u64,
+    // A reveal request is consumed by the next tab-bar frame. Keeping it
+    // one-shot lets users scroll away afterward to inspect inactive tabs.
+    tab_to_reveal: Option<usize>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
     gpu_lru: WeightedLruCache<TileCacheKey, ()>,
@@ -343,6 +358,145 @@ struct ZoomPerformance {
     discarded_intermediate_requests: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TabContentRects {
+    selection: Rect,
+    title: Rect,
+    close: Rect,
+}
+
+struct TabPaintState<'a> {
+    selected: bool,
+    can_close: bool,
+    select_response: &'a egui::Response,
+    close_response: &'a egui::Response,
+}
+
+/// Returns one equal tab width, including the transition to horizontal scroll.
+fn tab_width_for_count(
+    available_width: f32,
+    tab_count: usize,
+    item_spacing: f32,
+    minimum_width: f32,
+    maximum_width: f32,
+) -> f32 {
+    if tab_count == 0 {
+        return 0.0;
+    }
+    let spacing_total = item_spacing * tab_count.saturating_sub(1) as f32;
+    let width_for_tabs = (available_width - spacing_total).max(0.0);
+    let equal_width = width_for_tabs / tab_count as f32;
+    equal_width.clamp(minimum_width, maximum_width)
+}
+
+fn tab_reveal_for_selection_change(previous: Option<usize>, selected: usize) -> Option<usize> {
+    (previous != Some(selected)).then_some(selected)
+}
+
+fn tab_reveal_after_close(
+    previous: Option<usize>,
+    closed: usize,
+    current: Option<usize>,
+) -> Option<usize> {
+    let selected_document_changed = previous == Some(closed);
+    selected_document_changed.then_some(current).flatten()
+}
+
+/// Reserves the close target before assigning the remaining tab width to text.
+fn tab_content_rects(
+    tab_rect: Rect,
+    horizontal_padding: f32,
+    close_width: f32,
+    content_gap: f32,
+) -> TabContentRects {
+    let close = Rect::from_min_max(
+        Pos2::new(
+            tab_rect.right() - horizontal_padding - close_width,
+            tab_rect.top(),
+        ),
+        Pos2::new(tab_rect.right() - horizontal_padding, tab_rect.bottom()),
+    );
+    let title = Rect::from_min_max(
+        Pos2::new(tab_rect.left() + horizontal_padding, tab_rect.top()),
+        Pos2::new(close.left() - content_gap, tab_rect.bottom()),
+    );
+    let selection = Rect::from_min_max(tab_rect.min, Pos2::new(close.left(), tab_rect.bottom()));
+    TabContentRects {
+        selection,
+        title,
+        close,
+    }
+}
+
+fn paint_document_tab(
+    ui: &egui::Ui,
+    tab_rect: Rect,
+    content: TabContentRects,
+    title: &str,
+    state: TabPaintState<'_>,
+) {
+    let pointer_over_tab = state.select_response.hovered() || state.close_response.hovered();
+    let (background, outline) = if state.selected {
+        (
+            ui.visuals().selection.bg_fill,
+            ui.visuals().selection.stroke,
+        )
+    } else if pointer_over_tab {
+        let hovered = &ui.visuals().widgets.hovered;
+        (hovered.weak_bg_fill, hovered.bg_stroke)
+    } else {
+        let inactive = &ui.visuals().widgets.inactive;
+        (inactive.weak_bg_fill, inactive.bg_stroke)
+    };
+    ui.painter()
+        .rect(tab_rect, 4.0, background, outline, StrokeKind::Inside);
+
+    let text_color = if state.selected {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    let mut title_job = egui::text::LayoutJob::single_section(
+        title.to_owned(),
+        egui::TextFormat {
+            font_id: egui::TextStyle::Button.resolve(ui.style()),
+            color: text_color,
+            ..Default::default()
+        },
+    );
+    title_job.wrap = egui::epaint::text::TextWrapping::truncate_at_width(content.title.width());
+    let title_galley = ui.fonts_mut(|fonts| fonts.layout_job(title_job));
+    let title_position = Pos2::new(
+        content.title.left(),
+        content.title.center().y - title_galley.size().y / 2.0,
+    );
+    ui.painter()
+        .with_clip_rect(content.title)
+        .galley(title_position, title_galley, text_color);
+
+    // The close region shares the tab background; a local fill appears only on
+    // hover so it remains discoverable without recreating the old boxed button.
+    if state.can_close && state.close_response.hovered() {
+        ui.painter().rect_filled(
+            content.close.shrink(2.0),
+            3.0,
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+    let close_color = if state.can_close {
+        text_color
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    ui.painter().text(
+        content.close.center(),
+        egui::Align2::CENTER_CENTER,
+        "×",
+        egui::TextStyle::Button.resolve(ui.style()),
+        close_color,
+    );
+}
+
 impl PrototypeApp {
     /// Creates the application and opens each command-line PDF.
     pub(crate) fn new(
@@ -386,6 +540,7 @@ impl PrototypeApp {
             session_restore_progress: None,
             next_document_id: 1,
             activity_sequence: 0,
+            tab_to_reveal: None,
             sidebar_open: false,
             sidebar_tab: SidebarTab::Outline,
             gpu_lru: WeightedLruCache::new(GPU_TILE_BUDGET_BYTES),
@@ -1176,6 +1331,9 @@ impl PrototypeApp {
     }
 
     fn activate_document(&mut self, index: usize, previous: Option<usize>) {
+        if let Some(tab_to_reveal) = tab_reveal_for_selection_change(previous, index) {
+            self.tab_to_reveal = Some(tab_to_reveal);
+        }
         if let Some(previous) = previous.filter(|previous| *previous != index) {
             self.documents[previous].view.stop_autoscroll();
             // A tab switch changes request ownership, not tile identity. Cancel
@@ -1341,6 +1499,7 @@ impl PrototypeApp {
     }
 
     fn remove_tab_now(&mut self, index: usize) -> bool {
+        let previous_selection = self.active_index();
         if self.tabs.close(index).is_none() {
             return false;
         }
@@ -1352,6 +1511,7 @@ impl PrototypeApp {
             self.thumbnail_lru.remove(key);
         }
         self.documents.remove(index);
+        self.tab_to_reveal = tab_reveal_after_close(previous_selection, index, self.active_index());
         if was_restoring {
             // Closing an opening restore tab consumes its pending result; the
             // worker is dropped with the tab, so no event can complete it later.
@@ -1869,11 +2029,21 @@ impl PrototypeApp {
 
     fn tab_bar(&mut self, root_ui: &mut egui::Ui) {
         let selected_index = self.active_index();
+        let tab_to_reveal = self.tab_to_reveal.take();
         let mut select_request = None;
         let mut close_request = None;
         egui::Panel::top("tabs").show(root_ui, |ui| {
+            let tab_count = self.tabs.tabs().len();
+            let tab_width = tab_width_for_count(
+                ui.available_width(),
+                tab_count,
+                TAB_ITEM_SPACING,
+                TAB_MIN_WIDTH,
+                TAB_MAX_WIDTH,
+            );
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = TAB_ITEM_SPACING;
                     for (index, tab) in self.tabs.tabs().iter().enumerate() {
                         let dirty = self.documents[index].has_unsaved_changes();
                         let marker = if dirty { "● " } else { "" };
@@ -1882,25 +2052,49 @@ impl PrototypeApp {
                             .file_name()
                             .map(|name| name.to_string_lossy())
                             .unwrap_or_else(|| tab.path().as_os_str().to_string_lossy());
-                        if ui
-                            .selectable_label(
-                                selected_index == Some(index),
-                                format!("{marker}{title}"),
-                            )
-                            .clicked()
-                        {
+                        let full_title = format!("{marker}{title}");
+                        let (tab_rect, tab_response) = ui
+                            .allocate_exact_size(Vec2::new(tab_width, TAB_HEIGHT), Sense::hover());
+                        let content = tab_content_rects(
+                            tab_rect,
+                            TAB_HORIZONTAL_PADDING,
+                            TAB_CLOSE_WIDTH,
+                            TAB_CONTENT_GAP,
+                        );
+                        let tab_id = ui.id().with(("document-tab", index));
+                        let select_response = ui
+                            .interact(content.selection, tab_id.with("select"), Sense::click())
+                            .on_hover_text(tab.path().display().to_string());
+                        let can_close = !self.documents[index].is_printing();
+                        let close_sense = if can_close {
+                            Sense::click()
+                        } else {
+                            Sense::hover()
+                        };
+                        let close_response =
+                            ui.interact(content.close, tab_id.with("close"), close_sense);
+                        let selected = selected_index == Some(index);
+                        paint_document_tab(
+                            ui,
+                            tab_rect,
+                            content,
+                            &full_title,
+                            TabPaintState {
+                                selected,
+                                can_close,
+                                select_response: &select_response,
+                                close_response: &close_response,
+                            },
+                        );
+                        if selected && tab_to_reveal == Some(index) {
+                            tab_response.scroll_to_me(None);
+                        }
+                        if select_response.clicked() {
                             select_request = Some(index);
                         }
-                        if ui
-                            .add_enabled(
-                                !self.documents[index].is_printing(),
-                                egui::Button::new("×"),
-                            )
-                            .clicked()
-                        {
+                        if can_close && close_response.clicked() {
                             close_request = Some(index);
                         }
-                        ui.separator();
                     }
                 });
             });
@@ -2692,21 +2886,33 @@ impl PrototypeApp {
         let Some(bounds) = info.page_bounds.get(tab.view.current_page) else {
             return;
         };
+        let Some(desired) = Self::fit_zoom_for_page(*bounds, available, tab.view.zoom_mode) else {
+            return;
+        };
+
+        if (tab.view.zoom - desired).abs() > ZOOM_CHANGE_EPSILON {
+            let mode = tab.view.zoom_mode;
+            tab.set_zoom(desired, mode);
+        }
+    }
+
+    /// Calculates fit zoom from the current viewport so resize invalidation is testable.
+    fn fit_zoom_for_page(
+        bounds: crate::domain::document::PageRect,
+        available: Vec2,
+        zoom_mode: ZoomMode,
+    ) -> Option<f32> {
         let usable_width = (available.x - PAGE_GAP * 2.0).max(1.0);
         let usable_height = (available.y - PAGE_GAP * 2.0).max(1.0);
-        let desired = match tab.view.zoom_mode {
-            ZoomMode::Fixed => return,
+        let desired = match zoom_mode {
+            ZoomMode::Fixed => return None,
             ZoomMode::FitWidth => usable_width / bounds.width(),
             ZoomMode::FitPage => {
                 (usable_width / bounds.width()).min(usable_height / bounds.height())
             }
         }
         .clamp(MIN_ZOOM, MAX_ZOOM);
-
-        if (tab.view.zoom - desired).abs() > ZOOM_CHANGE_EPSILON {
-            let mode = tab.view.zoom_mode;
-            tab.set_zoom(desired, mode);
-        }
+        Some(desired)
     }
 
     fn continuous_view(&mut self, ui: &mut egui::Ui, index: usize) {
@@ -4879,6 +5085,61 @@ mod tests {
     }
 
     #[test]
+    fn tab_width_handles_empty_and_single_tab_bars() {
+        assert_eq!(tab_width_for_count(800.0, 0, 1.0, 96.0, 240.0), 0.0);
+        assert_eq!(tab_width_for_count(800.0, 1, 1.0, 96.0, 240.0), 240.0);
+    }
+
+    #[test]
+    fn tab_width_shrinks_monotonically_until_the_minimum() {
+        let widths = (1..=20)
+            .map(|count| tab_width_for_count(1_000.0, count, 1.0, 96.0, 240.0))
+            .collect::<Vec<_>>();
+
+        assert!(widths.windows(2).all(|pair| pair[1] <= pair[0]));
+        assert_eq!(widths.last().copied(), Some(96.0));
+    }
+
+    #[test]
+    fn tab_width_accounts_for_spacing_before_horizontal_scroll() {
+        let available = 1_000.0;
+        let count = 10;
+        let spacing = 1.0;
+        let width = tab_width_for_count(available, count, spacing, 96.0, 240.0);
+        let total = width * count as f32 + spacing * count.saturating_sub(1) as f32;
+
+        assert_eq!(total, available);
+
+        let minimum_width = tab_width_for_count(available, 11, spacing, 96.0, 240.0);
+        let minimum_total = minimum_width * 11.0 + spacing * 10.0;
+        assert_eq!(minimum_width, 96.0);
+        assert!(minimum_total > available);
+    }
+
+    #[test]
+    fn tab_title_and_close_regions_do_not_overlap_at_minimum_width() {
+        let tab_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(96.0, 24.0));
+        let content = tab_content_rects(tab_rect, 8.0, 24.0, 4.0);
+
+        assert!(content.title.is_positive());
+        assert_eq!(content.close.width(), 24.0);
+        assert!(content.selection.right() <= content.close.left());
+        assert!(content.title.right() <= content.close.left());
+    }
+
+    #[test]
+    fn tab_reveal_requests_only_follow_selection_changes() {
+        assert_eq!(tab_reveal_for_selection_change(Some(2), 2), None);
+        assert_eq!(tab_reveal_for_selection_change(Some(2), 7), Some(7));
+        assert_eq!(tab_reveal_for_selection_change(None, 0), Some(0));
+
+        assert_eq!(tab_reveal_after_close(Some(2), 3, Some(2)), None);
+        assert_eq!(tab_reveal_after_close(Some(2), 0, Some(1)), None);
+        assert_eq!(tab_reveal_after_close(Some(2), 2, Some(2)), Some(2));
+        assert_eq!(tab_reveal_after_close(Some(2), 2, Some(1)), Some(1));
+    }
+
+    #[test]
     fn focused_search_editor_keeps_h_for_text_input() {
         let focused_context = egui::Context::default();
         let query_id = search_query_id(7);
@@ -5141,6 +5402,241 @@ mod tests {
         let requested = prioritized_tile_specs(grid, page_rect, visible).unwrap();
 
         assert_eq!(requested.len(), 63 * 50);
+    }
+
+    fn requested_right_edge(
+        bounds: crate::domain::document::PageRect,
+        zoom: f32,
+        pixels_per_point: f32,
+        page_rect: Rect,
+        viewport: Rect,
+    ) -> (TileGrid, Vec<TileSpec>) {
+        let grid = TileGrid::new(bounds, zoom * pixels_per_point).unwrap();
+        let specs = tile_specs_intersecting_viewport(grid, page_rect, viewport).unwrap();
+        (grid, specs)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct FitPageScrollMetrics {
+        available_size: Vec2,
+        visible_viewport: Rect,
+        content_size: Vec2,
+        page_content_rect: Rect,
+        page_screen_rect: Rect,
+        clip_rect: Rect,
+    }
+
+    fn measure_single_page_scroll_area(
+        bounds: crate::domain::document::PageRect,
+        screen_size: Vec2,
+        pixels_per_point: f32,
+    ) -> FitPageScrollMetrics {
+        let context = egui::Context::default();
+        let mut latest = None;
+        for _ in 0..3 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen_size)),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(pixels_per_point);
+            let _output = context.run_ui(input, |ui| {
+                let available_size = ui.available_size();
+                let zoom =
+                    PrototypeApp::fit_zoom_for_page(bounds, available_size, ZoomMode::FitPage)
+                        .unwrap();
+                let geometry = single_page_geometry(bounds, zoom, available_size);
+                let output = egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show_viewport(ui, |ui, visible_viewport| {
+                        ui.set_min_size(geometry.content_size);
+                        let page_screen_rect = Rect::from_min_size(
+                            ui.max_rect().min + geometry.page_rect.min.to_vec2(),
+                            geometry.page_rect.size(),
+                        );
+                        latest = Some(FitPageScrollMetrics {
+                            available_size,
+                            visible_viewport,
+                            content_size: geometry.content_size,
+                            page_content_rect: geometry.page_rect,
+                            page_screen_rect,
+                            clip_rect: ui.clip_rect(),
+                        });
+                    });
+                assert_eq!(output.content_size, geometry.content_size);
+            });
+        }
+        latest.unwrap()
+    }
+
+    #[test]
+    fn landscape_fit_page_scroll_area_exposes_the_page_right_edge() {
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 1_280.0,
+            y1: 720.0,
+        };
+
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            for screen_size in [
+                Vec2::new(800.0, 600.0),
+                Vec2::new(1_000.0, 600.0),
+                Vec2::new(1_200.0, 700.0),
+            ] {
+                let metrics =
+                    measure_single_page_scroll_area(bounds, screen_size, pixels_per_point);
+                let grid = TileGrid::new(
+                    bounds,
+                    metrics.page_content_rect.width() / bounds.width() * pixels_per_point,
+                )
+                .unwrap();
+                let specs = tile_specs_intersecting_viewport(
+                    grid,
+                    metrics.page_content_rect,
+                    metrics.visible_viewport,
+                )
+                .unwrap();
+                let rightmost = specs.iter().max_by_key(|spec| spec.pixel_x).unwrap();
+
+                assert_eq!(metrics.content_size, metrics.available_size);
+                assert!(
+                    metrics
+                        .visible_viewport
+                        .contains(metrics.page_content_rect.right_top())
+                );
+                assert!(metrics.clip_rect.right() >= metrics.page_screen_rect.right());
+                assert_eq!(
+                    rightmost.pixel_x + rightmost.pixel_width,
+                    grid.pixel_width()
+                );
+                assert_eq!(
+                    logical_tile_rect(metrics.page_content_rect, grid, *rightmost).right(),
+                    metrics.page_content_rect.right()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn landscape_fit_page_requests_the_rightmost_tile() {
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 1_280.0,
+            y1: 720.0,
+        };
+        let page_rect = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(960.0, 540.0));
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 580.0));
+
+        let (grid, specs) = requested_right_edge(bounds, 0.75, 1.25, page_rect, viewport);
+        let rightmost = specs.iter().max_by_key(|spec| spec.pixel_x).unwrap();
+
+        assert_eq!(
+            rightmost.pixel_x + rightmost.pixel_width,
+            grid.pixel_width()
+        );
+        assert_eq!(
+            logical_tile_rect(page_rect, grid, *rightmost).right(),
+            page_rect.right()
+        );
+    }
+
+    #[test]
+    fn fit_page_right_edge_handles_nonzero_page_and_layout_origins() {
+        let bounds = crate::domain::document::PageRect {
+            x0: 100.25,
+            y0: 200.5,
+            x1: 1_300.75,
+            y1: 900.5,
+        };
+        let page_rect = Rect::from_min_size(Pos2::new(137.0, 41.0), Vec2::new(900.375, 525.0));
+        let viewport = Rect::from_min_size(Pos2::new(100.0, 0.0), Vec2::new(980.0, 620.0));
+
+        let (grid, specs) = requested_right_edge(bounds, 0.75, 1.5, page_rect, viewport);
+        let rightmost = specs.iter().max_by_key(|spec| spec.pixel_x).unwrap();
+
+        assert_eq!(
+            rightmost.pixel_x + rightmost.pixel_width,
+            grid.pixel_width()
+        );
+        assert_eq!(
+            logical_tile_rect(page_rect, grid, *rightmost).right(),
+            page_rect.right()
+        );
+    }
+
+    #[test]
+    fn square_and_portrait_fit_pages_keep_their_right_edges() {
+        for (width, height) in [(700.0, 700.0), (600.0, 900.0)] {
+            let bounds = crate::domain::document::PageRect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: width,
+                y1: height,
+            };
+            let zoom = (760.0_f32 / width).min(560.0_f32 / height);
+            let page_size = Vec2::new(width * zoom, height * zoom);
+            let page_rect = Rect::from_center_size(Pos2::new(400.0, 300.0), page_size);
+            let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+
+            let (grid, specs) = requested_right_edge(bounds, zoom, 2.0, page_rect, viewport);
+            let rightmost = specs.iter().max_by_key(|spec| spec.pixel_x).unwrap();
+
+            assert_eq!(
+                rightmost.pixel_x + rightmost.pixel_width,
+                grid.pixel_width()
+            );
+            assert_eq!(
+                logical_tile_rect(page_rect, grid, *rightmost).right(),
+                page_rect.right()
+            );
+        }
+    }
+
+    #[test]
+    fn fit_page_zoom_recalculates_after_window_resize() {
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 1_280.0,
+            y1: 720.0,
+        };
+
+        let wide =
+            PrototypeApp::fit_zoom_for_page(bounds, Vec2::new(1_000.0, 600.0), ZoomMode::FitPage)
+                .unwrap();
+        let narrow =
+            PrototypeApp::fit_zoom_for_page(bounds, Vec2::new(800.0, 600.0), ZoomMode::FitPage)
+                .unwrap();
+
+        assert_eq!(wide, (1_000.0 - PAGE_GAP * 2.0) / bounds.width());
+        assert_eq!(narrow, (800.0 - PAGE_GAP * 2.0) / bounds.width());
+        assert!(narrow < wide);
+    }
+
+    #[test]
+    fn enlarged_landscape_page_does_not_request_every_tile() {
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 8_000.0,
+            y1: 4_500.0,
+        };
+        let grid = TileGrid::new(bounds, 2.0).unwrap();
+        let page_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(16_000.0, 9_000.0));
+        let viewport = Rect::from_min_size(Pos2::new(4_000.0, 2_000.0), Vec2::new(1_000.0, 700.0));
+
+        let requested = prioritized_tile_specs(grid, page_rect, viewport).unwrap();
+        let full_grid_count = grid
+            .specs_in_pixel_rect(0, 0, grid.pixel_width(), grid.pixel_height())
+            .unwrap()
+            .len();
+
+        assert!(requested.len() < full_grid_count);
     }
 
     #[test]

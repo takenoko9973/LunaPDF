@@ -1,5 +1,10 @@
 use crate::domain::document::{PageRect, TILE_EDGE_PIXELS, TileSpec};
 
+// MuPDF's `fz_round_rect` ignores sub-thousandth-device-pixel error before
+// rasterization. The UI grid must use the same threshold or an edge tile can
+// differ by one pixel from the worker result and fail cache-key validation.
+const MUPDF_RECT_ROUNDING_EPSILON: f32 = 0.001;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TileGrid {
     pixel_width: u32,
@@ -80,8 +85,10 @@ impl TileGrid {
 }
 
 fn scaled_extent(start: f32, end: f32, scale: f32) -> Option<u32> {
-    let first_pixel = (start * scale).floor();
-    let last_pixel = (end * scale).ceil();
+    // Match `fz_round_rect`: without its tolerance, a value such as
+    // 748.00006 is ceiled to 749 here but rounded to 748 by MuPDF.
+    let first_pixel = (start * scale + MUPDF_RECT_ROUNDING_EPSILON).floor();
+    let last_pixel = (end * scale - MUPDF_RECT_ROUNDING_EPSILON).ceil();
     let extent = last_pixel - first_pixel;
     if !first_pixel.is_finite()
         || !last_pixel.is_finite()
@@ -132,6 +139,13 @@ mod tests {
         assert_eq!(grid.pixel_width(), 513);
         assert_eq!(grid.pixel_height(), 257);
         assert_eq!(grid.specs_in_pixel_rect(0, 0, 513, 257).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn near_integer_edge_uses_mupdf_rectangle_rounding() {
+        let grid = TileGrid::new(page(0.0, 0.0, 793.701, 595.276), 0.942_420_66).unwrap();
+
+        assert_eq!(grid.pixel_width(), 748);
     }
 
     #[test]
