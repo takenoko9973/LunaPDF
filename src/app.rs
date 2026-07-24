@@ -3220,19 +3220,19 @@ impl PrototypeApp {
         } else {
             autoscroll_page_delta
         };
-        if let Some(page_delta) = page_delta {
-            if let Some(target) = adjacent_page_index(page_index, page_count, page_delta) {
-                let x = tab.view.single_center_anchor.unwrap_or(Vec2::splat(0.5)).x;
-                // Enter the next page at its top and the previous page at its
-                // bottom so the wheel continues in the direction of travel.
-                let y = if page_delta > 0 { 0.0 } else { 1.0 };
-                tab.jump_to_single_page_edge(target, Vec2::new(x, y));
-                if let Some(autoscroll) = &mut tab.view.autoscroll {
-                    // The new page has a different scroll extent. Recompute its
-                    // offset next frame and apply the same cooldown to wheel/auto races.
-                    autoscroll.requested_offset = None;
-                    autoscroll.last_page_change_time = Some(now);
-                }
+        if let Some(page_delta) = page_delta
+            && let Some(target) = adjacent_page_index(page_index, page_count, page_delta)
+        {
+            let x = tab.view.single_center_anchor.unwrap_or(Vec2::splat(0.5)).x;
+            // Enter the next page at its top and the previous page at its
+            // bottom so the wheel continues in the direction of travel.
+            let y = if page_delta > 0 { 0.0 } else { 1.0 };
+            tab.jump_to_single_page_edge(target, Vec2::new(x, y));
+            if let Some(autoscroll) = &mut tab.view.autoscroll {
+                // The new page has a different scroll extent. Recompute its
+                // offset next frame and apply the same cooldown to wheel/auto races.
+                autoscroll.requested_offset = None;
+                autoscroll.last_page_change_time = Some(now);
             }
         }
 

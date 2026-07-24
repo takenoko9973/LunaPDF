@@ -2,7 +2,7 @@ use eframe::egui::{Color32, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Tex
 
 use crate::domain::document::{PageRect, RenderedTile, SearchMatch};
 use crate::domain::selection::{
-    PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, selected_glyphs, snap_to_glyph,
+    PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, selected_display_quads, snap_to_glyph,
 };
 
 #[derive(Default)]
@@ -10,6 +10,8 @@ pub(crate) struct PageViewport {
     drag_page: Option<usize>,
     drag_start: Option<PagePoint>,
     drag_current: Option<PagePoint>,
+    drag_origin_screen: Option<Pos2>,
+    drag_active: bool,
 }
 
 impl PageViewport {
@@ -53,7 +55,14 @@ impl PageViewport {
                 )
             };
             for quad in &search_match.quads {
-                paint_quad(ui, screen_rect, bounds, *quad, fill, stroke);
+                paint_quad(
+                    ui,
+                    screen_rect,
+                    bounds,
+                    *quad,
+                    fill,
+                    Stroke::new(1.5, stroke),
+                );
             }
         }
     }
@@ -71,35 +80,62 @@ impl PageViewport {
         let response = ui.interact(
             screen_rect,
             ui.id().with(("pdf-page", page_index)),
-            Sense::drag(),
+            Sense::click_and_drag(),
         );
 
         if let Some(selection) = selection.filter(|value| value.page_index == page_index) {
-            for quad in &selection.quads {
+            for quad in &selection.display_quads {
                 paint_quad(
                     ui,
                     screen_rect,
                     bounds,
                     *quad,
                     Color32::from_rgba_unmultiplied(255, 210, 0, 72),
-                    Color32::from_rgb(220, 150, 0),
+                    Stroke::NONE,
                 );
             }
         }
 
-        if response.drag_started_by(PointerButton::Primary) {
-            self.drag_start = response
-                .interact_pointer_pos()
+        let (primary_pressed, primary_released, pointer_position, press_origin) =
+            ui.input(|input| {
+                (
+                    input.pointer.button_pressed(PointerButton::Primary),
+                    input.pointer.button_released(PointerButton::Primary),
+                    input.pointer.latest_pos(),
+                    input.pointer.press_origin(),
+                )
+            });
+        let origin = press_origin.or(pointer_position);
+        if primary_pressed && origin.is_some_and(|position| response.rect.contains(position)) {
+            self.drag_start = origin
                 .map(|position| page_point_from_screen(position, screen_rect, bounds))
                 .and_then(|point| {
                     text_snapshot.and_then(|snapshot| snap_to_glyph(&snapshot.glyphs, point))
                 });
             self.drag_page = self.drag_start.map(|_| page_index);
             self.drag_current = self.drag_start;
+            // A press without a text glyph must not leave an origin that a
+            // later move could activate as a selection on another page.
+            self.drag_origin_screen = if self.drag_page.is_some() {
+                origin
+            } else {
+                None
+            };
+            self.drag_active = false;
         }
-        if response.dragged_by(PointerButton::Primary) && self.drag_page == Some(page_index) {
+
+        if self.drag_page == Some(page_index)
+            && let (Some(origin), Some(position)) = (self.drag_origin_screen, pointer_position)
+        {
+            let drag_threshold = ui
+                .ctx()
+                .options(|options| options.input_options.max_click_dist);
+            self.drag_active |= selection_drag_exceeds_threshold(origin, position, drag_threshold);
+        }
+        if self.drag_active && self.drag_page == Some(page_index) {
             self.drag_current = response
                 .interact_pointer_pos()
+                .or(pointer_position)
                 .map(|position| page_point_from_screen(position, screen_rect, bounds))
                 .and_then(|point| {
                     text_snapshot.and_then(|snapshot| snap_to_glyph(&snapshot.glyphs, point))
@@ -108,15 +144,18 @@ impl PageViewport {
 
         self.paint_drag_preview(ui, screen_rect, page_index, bounds, text_snapshot);
 
-        if response.drag_stopped_by(PointerButton::Primary) && self.drag_page == Some(page_index) {
-            let completed = self
-                .drag_start
-                .zip(self.drag_current)
-                .map(|(start, end)| (page_index, start, end));
+        if primary_released && self.drag_page == Some(page_index) {
+            let completed = self.drag_active.then(|| {
+                self.drag_start
+                    .zip(self.drag_current)
+                    .map(|(start, end)| (page_index, start, end))
+            });
             self.drag_page = None;
             self.drag_start = None;
             self.drag_current = None;
-            return completed;
+            self.drag_origin_screen = None;
+            self.drag_active = false;
+            return completed.flatten();
         }
         None
     }
@@ -129,7 +168,7 @@ impl PageViewport {
         bounds: PageRect,
         text_snapshot: Option<&TextPageSnapshot>,
     ) {
-        if self.drag_page != Some(page_index) {
+        if !self.drag_active || self.drag_page != Some(page_index) {
             return;
         }
         let (Some(start), Some(current), Some(text_snapshot)) =
@@ -137,20 +176,23 @@ impl PageViewport {
         else {
             return;
         };
-        let Some(glyphs) = selected_glyphs(&text_snapshot.glyphs, start, current) else {
-            return;
-        };
-        for glyph in glyphs {
+        for quad in selected_display_quads(&text_snapshot.glyphs, start, current) {
             paint_quad(
                 ui,
                 screen_rect,
                 bounds,
-                glyph.quad,
+                quad,
                 Color32::from_rgba_unmultiplied(255, 210, 0, 56),
-                Color32::from_rgb(220, 150, 0),
+                Stroke::NONE,
             );
         }
     }
+}
+
+fn selection_drag_exceeds_threshold(origin: Pos2, current: Pos2, threshold: f32) -> bool {
+    // The threshold is egui's logical-point click tolerance, so the decision
+    // remains consistent across native DPI and application zoom settings.
+    origin.distance_sq(current) > threshold * threshold
 }
 
 /// Maps a raster tile's device-pixel window into normalized page-screen coordinates.
@@ -179,7 +221,7 @@ fn paint_quad(
     bounds: PageRect,
     quad: PageQuad,
     fill: Color32,
-    stroke: Color32,
+    stroke: Stroke,
 ) {
     let points = vec![
         screen_point_from_page(quad.upper_left, screen_rect, bounds),
@@ -187,11 +229,8 @@ fn paint_quad(
         screen_point_from_page(quad.lower_right, screen_rect, bounds),
         screen_point_from_page(quad.lower_left, screen_rect, bounds),
     ];
-    ui.painter().add(Shape::convex_polygon(
-        points,
-        fill,
-        Stroke::new(1.5, stroke),
-    ));
+    ui.painter()
+        .add(Shape::convex_polygon(points, fill, stroke));
 }
 
 fn page_point_from_screen(position: Pos2, screen_rect: Rect, bounds: PageRect) -> PagePoint {
@@ -220,8 +259,11 @@ fn screen_point_from_page(point: PagePoint, screen_rect: Rect, bounds: PageRect)
 mod tests {
     use std::time::Duration;
 
+    use eframe::egui;
+
     use super::*;
     use crate::domain::document::TileSpec;
+    use crate::domain::selection::GlyphSnapshot;
 
     fn bounds() -> PageRect {
         PageRect {
@@ -247,6 +289,72 @@ mod tests {
             bounds: bounds(),
             render_time: Duration::ZERO,
             physical_memory_bytes: None,
+        }
+    }
+
+    fn text_snapshot() -> TextPageSnapshot {
+        TextPageSnapshot {
+            page_index: 0,
+            revision: 0,
+            glyphs: vec![GlyphSnapshot {
+                character: 'A',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(0.0, 0.0),
+                    upper_right: PagePoint::new(20.0, 0.0),
+                    lower_left: PagePoint::new(0.0, 20.0),
+                    lower_right: PagePoint::new(20.0, 20.0),
+                },
+                line_index: 0,
+            }],
+        }
+    }
+
+    fn selection_frame(
+        context: &egui::Context,
+        viewport: &mut PageViewport,
+        events: Vec<egui::Event>,
+    ) -> Option<(usize, PagePoint, PagePoint)> {
+        selection_frame_at(context, viewport, events, None)
+    }
+
+    fn selection_frame_at(
+        context: &egui::Context,
+        viewport: &mut PageViewport,
+        events: Vec<egui::Event>,
+        time: Option<f64>,
+    ) -> Option<(usize, PagePoint, PagePoint)> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, [200.0, 200.0].into())),
+            events,
+            time,
+            ..Default::default()
+        };
+        let mut completed = None;
+        let snapshot = text_snapshot();
+        let _output = context.run_ui(input, |ui| {
+            completed = viewport.interact_at(
+                ui,
+                Rect::from_min_size(Pos2::new(20.0, 20.0), [100.0, 100.0].into()),
+                0,
+                PageRect {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 100.0,
+                    y1: 100.0,
+                },
+                Some(&snapshot),
+                None,
+            );
+        });
+        completed
+    }
+
+    fn primary_button_event(position: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: position,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
         }
     }
 
@@ -284,5 +392,165 @@ mod tests {
         assert_eq!(left_rect.right(), right_rect.left());
         assert_eq!(left_rect.left(), page_rect.left());
         assert_eq!(right_rect.right(), page_rect.right());
+    }
+
+    #[test]
+    fn primary_click_does_not_complete_a_text_selection() {
+        let context = egui::Context::default();
+        let mut viewport = PageViewport::default();
+        let position = Pos2::new(25.0, 25.0);
+
+        assert!(
+            selection_frame(
+                &context,
+                &mut viewport,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    primary_button_event(position, true),
+                ],
+            )
+            .is_none()
+        );
+        assert_eq!(viewport.drag_page, Some(0));
+        assert!(
+            selection_frame(
+                &context,
+                &mut viewport,
+                vec![primary_button_event(position, false)],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn subthreshold_pointer_jitter_does_not_complete_a_text_selection() {
+        let context = egui::Context::default();
+        let mut viewport = PageViewport::default();
+        let pressed = Pos2::new(25.0, 25.0);
+        let jittered = Pos2::new(27.0, 26.0);
+
+        assert!(
+            selection_frame(
+                &context,
+                &mut viewport,
+                vec![
+                    egui::Event::PointerMoved(pressed),
+                    primary_button_event(pressed, true),
+                ],
+            )
+            .is_none()
+        );
+        assert_eq!(viewport.drag_page, Some(0));
+        assert_eq!(viewport.drag_origin_screen, Some(pressed));
+        assert_eq!(
+            context.options(|options| options.input_options.max_click_dist),
+            6.0
+        );
+        assert!(
+            selection_frame(
+                &context,
+                &mut viewport,
+                vec![egui::Event::PointerMoved(jittered)],
+            )
+            .is_none()
+        );
+        assert!(
+            selection_frame(
+                &context,
+                &mut viewport,
+                vec![primary_button_event(jittered, false)],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stationary_long_press_does_not_complete_a_text_selection() {
+        let context = egui::Context::default();
+        let mut viewport = PageViewport::default();
+        let position = Pos2::new(25.0, 25.0);
+
+        assert!(
+            selection_frame_at(
+                &context,
+                &mut viewport,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    primary_button_event(position, true),
+                ],
+                Some(0.0),
+            )
+            .is_none()
+        );
+        assert!(selection_frame_at(&context, &mut viewport, Vec::new(), Some(1.0)).is_none());
+        assert!(
+            selection_frame_at(
+                &context,
+                &mut viewport,
+                vec![primary_button_event(position, false)],
+                Some(1.01),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn intentional_short_drag_can_select_one_glyph() {
+        let context = egui::Context::default();
+        let mut viewport = PageViewport::default();
+        let pressed = Pos2::new(25.0, 25.0);
+        let dragged = Pos2::new(33.0, 25.0);
+
+        assert!(
+            selection_frame(
+                &context,
+                &mut viewport,
+                vec![
+                    egui::Event::PointerMoved(pressed),
+                    primary_button_event(pressed, true),
+                ],
+            )
+            .is_none()
+        );
+        assert_eq!(viewport.drag_page, Some(0));
+        assert_eq!(viewport.drag_origin_screen, Some(pressed));
+        assert!(
+            selection_frame(
+                &context,
+                &mut viewport,
+                vec![egui::Event::PointerMoved(dragged)],
+            )
+            .is_none()
+        );
+        assert!(viewport.drag_active);
+        let completed = selection_frame(
+            &context,
+            &mut viewport,
+            vec![
+                egui::Event::PointerMoved(dragged),
+                primary_button_event(dragged, false),
+            ],
+        )
+        .expect("a drag beyond egui's click tolerance should complete");
+
+        assert_eq!(completed.0, 0);
+        assert_eq!(completed.1, PagePoint::new(10.0, 10.0));
+        assert_eq!(completed.2, PagePoint::new(10.0, 10.0));
+    }
+
+    #[test]
+    fn drag_threshold_requires_distance_beyond_egui_click_tolerance() {
+        let origin = Pos2::new(10.0, 10.0);
+
+        assert!(!selection_drag_exceeds_threshold(
+            origin,
+            Pos2::new(16.0, 10.0),
+            6.0,
+        ));
+        assert!(selection_drag_exceeds_threshold(
+            origin,
+            Pos2::new(16.01, 10.0),
+            6.0,
+        ));
     }
 }

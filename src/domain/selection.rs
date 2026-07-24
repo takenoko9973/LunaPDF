@@ -68,6 +68,7 @@ pub(crate) struct SelectionSnapshot {
     pub(crate) page_index: usize,
     pub(crate) generation: u64,
     pub(crate) text: String,
+    pub(crate) display_quads: Vec<PageQuad>,
     pub(crate) quads: Vec<PageQuad>,
     pub(crate) extraction_time: Duration,
 }
@@ -104,6 +105,84 @@ pub(crate) fn selected_quads(
         return Vec::new();
     };
     selected_glyphs.iter().map(|glyph| glyph.quad).collect()
+}
+
+/// Returns the geometry used only to paint the selected glyph range.
+pub(crate) fn selected_display_quads(
+    glyphs: &[GlyphSnapshot],
+    start: PagePoint,
+    end: PagePoint,
+) -> Vec<PageQuad> {
+    let Some(selected_glyphs) = selected_glyphs(glyphs, start, end) else {
+        return Vec::new();
+    };
+    let mut bands = Vec::new();
+    let mut line_start = 0;
+    for index in 1..=selected_glyphs.len() {
+        let line_ended = index == selected_glyphs.len()
+            || selected_glyphs[index].line_index != selected_glyphs[line_start].line_index;
+        if line_ended {
+            bands.push(merge_line_band(&selected_glyphs[line_start..index]));
+            line_start = index;
+        }
+    }
+    bands
+}
+
+fn merge_line_band(glyphs: &[GlyphSnapshot]) -> PageQuad {
+    let first = &glyphs[0];
+    if glyphs.len() == 1 {
+        return first.quad;
+    }
+
+    let center = |glyph: &GlyphSnapshot| {
+        let (x0, y0, x1, y1) = glyph.quad.bounds();
+        PagePoint::new((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+    };
+    let horizontal_span = glyphs.iter().map(|glyph| center(glyph).x).fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(minimum, maximum), x| (minimum.min(x), maximum.max(x)),
+    );
+    let vertical_span = glyphs.iter().map(|glyph| center(glyph).y).fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(minimum, maximum), y| (minimum.min(y), maximum.max(y)),
+    );
+    let advances_horizontally =
+        horizontal_span.1 - horizontal_span.0 >= vertical_span.1 - vertical_span.0;
+
+    if advances_horizontally {
+        let left = glyphs
+            .iter()
+            .min_by(|left, right| center(left).x.total_cmp(&center(right).x))
+            .expect("a line band always has at least one glyph");
+        let right = glyphs
+            .iter()
+            .max_by(|left, right| center(left).x.total_cmp(&center(right).x))
+            .expect("a line band always has at least one glyph");
+        // Reusing the outer glyph edges keeps tilted and rotated text geometry;
+        // an axis-aligned bounds union would overpaint Typst text lines.
+        PageQuad {
+            upper_left: left.quad.upper_left,
+            upper_right: right.quad.upper_right,
+            lower_left: left.quad.lower_left,
+            lower_right: right.quad.lower_right,
+        }
+    } else {
+        let top = glyphs
+            .iter()
+            .min_by(|top, bottom| center(top).y.total_cmp(&center(bottom).y))
+            .expect("a line band always has at least one glyph");
+        let bottom = glyphs
+            .iter()
+            .max_by(|top, bottom| center(top).y.total_cmp(&center(bottom).y))
+            .expect("a line band always has at least one glyph");
+        PageQuad {
+            upper_left: top.quad.upper_left,
+            upper_right: top.quad.upper_right,
+            lower_left: bottom.quad.lower_left,
+            lower_right: bottom.quad.lower_right,
+        }
+    }
 }
 
 /// Borrows the canonical inclusive glyph range without allocating during drag preview.
@@ -245,5 +324,95 @@ mod tests {
             quads,
             glyphs.iter().map(|glyph| glyph.quad).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn display_quads_merge_adjacent_glyphs_on_the_same_line() {
+        let glyphs = vec![glyph('A', 0.0, 0), glyph('B', 10.0, 0), glyph('C', 20.0, 0)];
+
+        let bands =
+            selected_display_quads(&glyphs, PagePoint::new(1.0, 5.0), PagePoint::new(27.0, 5.0));
+
+        assert_eq!(bands.len(), 1);
+        assert_eq!(bands[0].upper_left, glyphs[0].quad.upper_left);
+        assert_eq!(bands[0].lower_right, glyphs[2].quad.lower_right);
+        assert_eq!(
+            selected_quads(&glyphs, PagePoint::new(1.0, 5.0), PagePoint::new(27.0, 5.0),).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn display_quads_keep_separate_line_bands() {
+        let glyphs = vec![
+            glyph('A', 0.0, 0),
+            glyph('B', 10.0, 0),
+            glyph('C', 0.0, 1),
+            glyph('D', 10.0, 1),
+        ];
+
+        let bands = selected_display_quads(
+            &glyphs,
+            PagePoint::new(1.0, 5.0),
+            PagePoint::new(17.0, 25.0),
+        );
+
+        assert_eq!(bands.len(), 2);
+        assert_eq!(bands[0].upper_left, glyphs[0].quad.upper_left);
+        assert_eq!(bands[0].lower_right, glyphs[1].quad.lower_right);
+        assert_eq!(bands[1].upper_left, glyphs[2].quad.upper_left);
+        assert_eq!(bands[1].lower_right, glyphs[3].quad.lower_right);
+    }
+
+    #[test]
+    fn display_band_preserves_tilted_outer_edges() {
+        let mut left = glyph('A', 10.0, 0);
+        left.quad.upper_left.y = 3.0;
+        left.quad.upper_right.y = 5.0;
+        left.quad.lower_left.y = 13.0;
+        left.quad.lower_right.y = 15.0;
+        let mut right = glyph('B', 20.0, 0);
+        right.quad.upper_left.y = 5.0;
+        right.quad.upper_right.y = 7.0;
+        right.quad.lower_left.y = 15.0;
+        right.quad.lower_right.y = 17.0;
+
+        let band = merge_line_band(&[left.clone(), right.clone()]);
+
+        assert_eq!(band.upper_left, left.quad.upper_left);
+        assert_eq!(band.lower_left, left.quad.lower_left);
+        assert_eq!(band.upper_right, right.quad.upper_right);
+        assert_eq!(band.lower_right, right.quad.lower_right);
+    }
+
+    #[test]
+    fn display_band_preserves_vertical_outer_edges() {
+        let top = GlyphSnapshot {
+            character: '縦',
+            quad: PageQuad {
+                upper_left: PagePoint::new(10.0, 20.0),
+                upper_right: PagePoint::new(20.0, 20.0),
+                lower_left: PagePoint::new(10.0, 30.0),
+                lower_right: PagePoint::new(20.0, 30.0),
+            },
+            line_index: 0,
+        };
+        let bottom = GlyphSnapshot {
+            character: '書',
+            quad: PageQuad {
+                upper_left: PagePoint::new(10.0, 32.0),
+                upper_right: PagePoint::new(20.0, 32.0),
+                lower_left: PagePoint::new(10.0, 42.0),
+                lower_right: PagePoint::new(20.0, 42.0),
+            },
+            line_index: 0,
+        };
+
+        let band = merge_line_band(&[top.clone(), bottom.clone()]);
+
+        assert_eq!(band.upper_left, top.quad.upper_left);
+        assert_eq!(band.upper_right, top.quad.upper_right);
+        assert_eq!(band.lower_left, bottom.quad.lower_left);
+        assert_eq!(band.lower_right, bottom.quad.lower_right);
     }
 }

@@ -33,7 +33,7 @@ use crate::domain::document::{
 };
 use crate::domain::selection::{
     GlyphSnapshot, PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
-    selected_quads, selected_text,
+    selected_display_quads, selected_quads, selected_text,
 };
 
 // PDF numeric objects can round coordinates while serializing an incremental
@@ -377,6 +377,7 @@ impl MuPdfBackend {
             page_index,
             generation,
             text: selected_text(&glyphs, start, end),
+            display_quads: selected_display_quads(&glyphs, start, end),
             quads: selection_quads,
             extraction_time,
         })
@@ -1817,6 +1818,15 @@ mod tests {
 
         assert_eq!(selection.text, "ABCDE");
         assert_eq!(selection.quads, expected_quads);
+        assert_eq!(selection.display_quads.len(), 1);
+        assert_eq!(
+            selection.display_quads[0].upper_left,
+            snapshot.glyphs[0].quad.upper_left
+        );
+        assert_eq!(
+            selection.display_quads[0].lower_right,
+            snapshot.glyphs[4].quad.lower_right
+        );
     }
 
     #[test]

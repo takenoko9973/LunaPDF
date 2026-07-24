@@ -166,3 +166,56 @@ cargo test
 - 全体：133 passed、0 failed、1 ignored
 
 ノッチ式マウス、高精度wheel／trackpad、オーバーレイ上の入力除外は最終受入およびオーバーレイ実装後に確認する。
+
+## 3. クリック／ドラッグ判定と行単位選択表示
+
+### クリック／ドラッグの確認
+
+egui 0.35の実入力状態を複数フレームで再現し、次を確認した。
+
+- 同一位置の左押下・解放：選択要求なし
+- egui既定click tolerance 6論理pt未満の移動：選択要求なし
+- 1秒間静止した左押下：選択要求なし
+
+この条件では「単純クリックで確定する」現象自体は再現しなかった。現行APIの`max_click_dist`を使うことを明示し、押下位置と現在位置がその距離を超えた場合だけ選択をactiveにする状態へ整理した。固定DPI補正は追加していない。押下点から8論理pt移動し、同じglyph内で解放した場合は1文字選択になることを確認した。
+
+右クリックはPrimary押下条件へ入らない。注釈ダブルクリックとの競合は注釈入口の実装後に追加確認する。
+
+### 行単位表示の修正前失敗
+
+同一行の`ABC`を選択した表示geometryはglyphごとの3 Quadだった。
+
+```text
+cargo test display_quads_merge_adjacent_glyphs_on_the_same_line -- --nocapture
+left: 3
+right: 1
+```
+
+確定表示とドラッグ中プレビューの両方が各glyphを個別に塗り、さらに1.5ptの外枠を描いていたため、文字間に透明線と枠線が残っていた。
+
+### 変更
+
+- `SelectionSnapshot`で、コピー／注釈保存用のglyph Quadと、表示専用の行帯Quadを分離した。
+- 表示用は同じ`line_index`の連続glyphだけを1本へ統合し、改行では別帯にする。
+- 水平行は左右端glyphの外側edge、縦方向の行は上下端glyphのedgeを再利用する。外接水平矩形へ変換しないため、傾斜・縦書きの向きを維持する。
+- ドラッグ中プレビューと確定表示は同じ`selected_display_quads()`を使用する。
+- 選択表示は半透明塗りだけとし、glyphごとの外枠を廃止した。検索結果の既存外枠は維持した。
+- コピー順、両端包含、Highlightへ渡す元のglyph Quadは変更していない。
+
+### 自動検証
+
+```text
+cargo test domain::selection::tests -- --nocapture
+cargo test ui::viewport::tests -- --nocapture
+cargo test confirmed_selection_quads_match_the_preview_glyph_range -- --nocapture
+cargo test
+```
+
+実結果：
+
+- 論理選択／表示geometry 10件：成功
+- 画面座標／ドラッグ入力7件：成功
+- MuPDF選択統合1件：成功
+- 全体：142 passed、0 failed、1 ignored
+
+Typst PDF、逆方向ドラッグ、複数行の実画面表示、プレビュー・コピー・保存注釈の実機一致は最終受入で確認する。
