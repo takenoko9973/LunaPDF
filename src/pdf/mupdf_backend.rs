@@ -12,8 +12,8 @@ use std::os::windows::io::AsRawHandle as _;
 use anyhow::{Context, Result, anyhow, ensure};
 use mupdf::color::AnnotationColor;
 use mupdf::pdf::{
-    AnnotationQuadPoints, Encryption, PdfAnnotationType, PdfDocument, PdfWriteOptions, Permission,
-    WidgetType,
+    AnnotationFlags, AnnotationQuadPoints, Encryption, PdfAnnotationType, PdfDocument,
+    PdfWriteOptions, Permission, WidgetType,
 };
 use mupdf::text_page::SearchHitResponse;
 use mupdf::{
@@ -26,6 +26,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, ReplaceFileW,
 };
 
+use crate::domain::annotation::{
+    AnnotationId, AnnotationKind, AnnotationPageRequest, AnnotationPageSnapshot,
+    AnnotationSnapshot, PdfAnnotationColor,
+};
 use crate::domain::document::{
     DocumentInfo, DocumentVersion, EditAction, HighlightCapability, HighlightRequest, OutlineItem,
     PageRect, RenderedThumbnail, RenderedTile, SearchMatch, SearchPageResult, TILE_EDGE_PIXELS,
@@ -356,6 +360,59 @@ impl MuPdfBackend {
             page_index: request.page_index,
             revision: self.revision,
             glyphs,
+        }))
+    }
+
+    /// Reads one revision-bound page of editable annotation metadata.
+    pub(super) fn annotation_page(
+        &self,
+        request: AnnotationPageRequest,
+    ) -> Result<Option<AnnotationPageSnapshot>> {
+        if request.expected_revision != self.revision {
+            return Ok(None);
+        }
+        let page = self
+            .document
+            .load_pdf_page(page_number(request.page_index, self.page_bounds.len())?)?;
+        let document_allows_edits = self.highlight_capability.is_allowed();
+        let mut annotations = Vec::new();
+        for annotation in page.annotations() {
+            if annotation.r#type()? != PdfAnnotationType::Highlight {
+                continue;
+            }
+            let xref = annotation.xref()?;
+            ensure!(
+                xref > 0,
+                "MuPDF returned an invalid xref for an existing Highlight"
+            );
+            let flags = annotation.flags()?;
+            let properties_locked =
+                flags.intersects(AnnotationFlags::IS_READ_ONLY | AnnotationFlags::IS_LOCKED);
+            let contents_locked =
+                properties_locked || flags.contains(AnnotationFlags::IS_LOCKED_CONTENTS);
+            annotations.push(AnnotationSnapshot {
+                id: AnnotationId {
+                    page_index: request.page_index,
+                    xref,
+                },
+                kind: AnnotationKind::Highlight,
+                quads: annotation
+                    .quad_points()?
+                    .iter()
+                    .map(page_quad_from_mupdf)
+                    .collect(),
+                contents: annotation.contents()?.unwrap_or_default().to_owned(),
+                color: annotation.color()?.map(annotation_color_from_mupdf),
+                opacity: annotation.opacity()?,
+                can_edit_contents: document_allows_edits && !contents_locked,
+                can_edit_color: document_allows_edits && !properties_locked,
+                can_delete: document_allows_edits && !properties_locked,
+            });
+        }
+        Ok(Some(AnnotationPageSnapshot {
+            page_index: request.page_index,
+            revision: self.revision,
+            annotations,
         }))
     }
 
@@ -1158,6 +1215,24 @@ fn page_quad_from_mupdf(quad: &Quad) -> PageQuad {
     }
 }
 
+fn annotation_color_from_mupdf(color: AnnotationColor) -> PdfAnnotationColor {
+    match color {
+        AnnotationColor::Gray(gray) => PdfAnnotationColor::Gray(gray),
+        AnnotationColor::Rgb { red, green, blue } => PdfAnnotationColor::Rgb { red, green, blue },
+        AnnotationColor::Cmyk {
+            cyan,
+            magenta,
+            yellow,
+            key,
+        } => PdfAnnotationColor::Cmyk {
+            cyan,
+            magenta,
+            yellow,
+            key,
+        },
+    }
+}
+
 fn mupdf_quad_from_page(quad: &PageQuad) -> Quad {
     Quad::new(
         Point::new(quad.upper_left.x, quad.upper_left.y),
@@ -1356,6 +1431,142 @@ mod tests {
             highlight_capability_from_constraints(false, true, false),
             HighlightCapability::Allowed
         );
+    }
+
+    #[test]
+    fn reads_existing_highlight_identity_geometry_comment_color_and_opacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing-highlight.pdf");
+        let path_text = path.to_str().unwrap();
+        let expected_xref;
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut annotation = page
+                .add_highlight_annotation(Quad::from(Rect::new(30.0, 40.0, 130.0, 60.0)))
+                .unwrap();
+            annotation
+                .set_color(AnnotationColor::Rgb {
+                    red: 0.1,
+                    green: 0.2,
+                    blue: 0.8,
+                })
+                .unwrap();
+            annotation
+                .set_contents("外部コメント\nsecond line")
+                .unwrap();
+            annotation.set_opacity(0.65).unwrap();
+            expected_xref = annotation.xref().unwrap();
+            annotation.update().unwrap();
+            page.update().unwrap();
+            drop(annotation);
+            drop(page);
+            document.save(path_text).unwrap();
+        }
+
+        let backend = MuPdfBackend::open(path).unwrap();
+        let snapshot = backend
+            .annotation_page(AnnotationPageRequest {
+                page_index: 0,
+                expected_revision: 0,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(snapshot.annotations.len(), 1);
+        let annotation = &snapshot.annotations[0];
+        assert_eq!(annotation.id.xref, expected_xref);
+        assert_eq!(annotation.contents, "外部コメント\nsecond line");
+        assert!((annotation.opacity - 0.65).abs() < f32::EPSILON);
+        assert_eq!(annotation.quads.len(), 1);
+        assert!(annotation.can_edit_contents);
+        assert!(annotation.can_edit_color);
+        assert!(annotation.can_delete);
+        let Some(PdfAnnotationColor::Rgb { red, green, blue }) = annotation.color else {
+            panic!("expected the existing RGB annotation color");
+        };
+        assert!((red - 0.1).abs() < f32::EPSILON);
+        assert!((green - 0.2).abs() < f32::EPSILON);
+        assert!((blue - 0.8).abs() < f32::EPSILON);
+
+        let repeated = backend
+            .annotation_page(AnnotationPageRequest {
+                page_index: 0,
+                expected_revision: 0,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.annotations[0].id.xref, expected_xref);
+        assert!(
+            backend
+                .annotation_page(AnnotationPageRequest {
+                    page_index: 0,
+                    expected_revision: 1,
+                })
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn annotation_flags_limit_only_the_supported_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("locked-highlights.pdf");
+        let path_text = path.to_str().unwrap();
+        let contents_locked_xref;
+        let properties_locked_xref;
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut contents_locked = page
+                .add_highlight_annotation(Quad::from(Rect::new(30.0, 40.0, 130.0, 60.0)))
+                .unwrap();
+            contents_locked
+                .set_flags(AnnotationFlags::IS_LOCKED_CONTENTS)
+                .unwrap();
+            contents_locked_xref = contents_locked.xref().unwrap();
+            contents_locked.update().unwrap();
+            drop(contents_locked);
+
+            let mut properties_locked = page
+                .add_highlight_annotation(Quad::from(Rect::new(30.0, 80.0, 130.0, 100.0)))
+                .unwrap();
+            properties_locked
+                .set_flags(AnnotationFlags::IS_LOCKED)
+                .unwrap();
+            properties_locked_xref = properties_locked.xref().unwrap();
+            properties_locked.update().unwrap();
+            page.update().unwrap();
+            drop(properties_locked);
+            drop(page);
+            document.save(path_text).unwrap();
+        }
+
+        let backend = MuPdfBackend::open(path).unwrap();
+        let snapshot = backend
+            .annotation_page(AnnotationPageRequest {
+                page_index: 0,
+                expected_revision: 0,
+            })
+            .unwrap()
+            .unwrap();
+        let contents_locked = snapshot
+            .annotations
+            .iter()
+            .find(|annotation| annotation.id.xref == contents_locked_xref)
+            .unwrap();
+        let properties_locked = snapshot
+            .annotations
+            .iter()
+            .find(|annotation| annotation.id.xref == properties_locked_xref)
+            .unwrap();
+
+        assert!(!contents_locked.can_edit_contents);
+        assert!(contents_locked.can_edit_color);
+        assert!(contents_locked.can_delete);
+        assert!(!properties_locked.can_edit_contents);
+        assert!(!properties_locked.can_edit_color);
+        assert!(!properties_locked.can_delete);
     }
 
     #[test]

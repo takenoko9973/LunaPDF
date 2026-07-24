@@ -12,6 +12,7 @@ use eframe::egui::{
     ViewportCommand,
 };
 
+use crate::domain::annotation::{AnnotationPageRequest, AnnotationPageSnapshot};
 use crate::domain::document::{
     DocumentInfo, EditAction, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail,
     RenderedTile, SearchMatch, SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
@@ -156,6 +157,10 @@ struct DocumentTab {
     pending_text_snapshots: HashSet<TextSnapshotKey>,
     failed_text_snapshots: HashSet<TextSnapshotKey>,
     wanted_text_snapshots: HashSet<TextSnapshotKey>,
+    annotation_pages: HashMap<AnnotationPageRequest, AnnotationPageSnapshot>,
+    pending_annotation_pages: HashSet<AnnotationPageRequest>,
+    failed_annotation_pages: HashSet<AnnotationPageRequest>,
+    wanted_annotation_pages: HashSet<AnnotationPageRequest>,
     selection: Option<SelectionSnapshot>,
     selection_generation: u64,
     pending_highlights: usize,
@@ -772,6 +777,7 @@ impl PrototypeApp {
                         tab.info = Some(info);
                         tab.invalidate_rendering();
                         tab.invalidate_text_snapshots();
+                        tab.invalidate_annotation_pages();
                         let thumbnail_keys = tab.invalidate_thumbnails();
                         for key in thumbnail_keys {
                             self.thumbnail_lru.remove(&key);
@@ -934,6 +940,49 @@ impl PrototypeApp {
                             tab.failed_text_snapshots.insert(key);
                             tab.error = Some(format!(
                                 "テキスト情報を読み取れませんでした。PDFを開き直してください。詳細: {message}"
+                            ));
+                        }
+                    }
+                    Ok(DocumentEvent::AnnotationsReady(snapshot)) => {
+                        let request = AnnotationPageRequest {
+                            page_index: snapshot.page_index,
+                            expected_revision: snapshot.revision,
+                        };
+                        let is_active = self.active_index() == Some(index);
+                        let tab = &mut self.documents[index];
+                        tab.pending_annotation_pages.remove(&request);
+                        let current_revision = tab.info.as_ref().map(|info| info.revision);
+                        let is_current = annotation_page_result_is_current(
+                            is_active,
+                            request,
+                            current_revision,
+                            &tab.wanted_annotation_pages,
+                        );
+                        if is_current {
+                            tab.failed_annotation_pages.remove(&request);
+                            tab.annotation_pages.insert(request, snapshot);
+                        }
+                    }
+                    Ok(DocumentEvent::AnnotationsSkipped(request)) => {
+                        self.documents[index]
+                            .pending_annotation_pages
+                            .remove(&request);
+                    }
+                    Ok(DocumentEvent::AnnotationsFailed { request, message }) => {
+                        let is_active = self.active_index() == Some(index);
+                        let tab = &mut self.documents[index];
+                        tab.pending_annotation_pages.remove(&request);
+                        let current_revision = tab.info.as_ref().map(|info| info.revision);
+                        let is_current = annotation_page_result_is_current(
+                            is_active,
+                            request,
+                            current_revision,
+                            &tab.wanted_annotation_pages,
+                        );
+                        if is_current {
+                            tab.failed_annotation_pages.insert(request);
+                            tab.error = Some(format!(
+                                "注釈情報を読み取れませんでした。PDFを開き直してください。詳細: {message}"
                             ));
                         }
                     }
@@ -1355,6 +1404,7 @@ impl PrototypeApp {
             // queued work without discarding the generation or reusable textures.
             self.documents[previous].cancel_rendering_requests();
             self.documents[previous].invalidate_text_snapshots();
+            self.documents[previous].invalidate_annotation_pages();
             self.documents[previous].search.generation =
                 self.documents[previous].search.generation.wrapping_add(1);
             let generation = self.documents[previous].search.generation;
@@ -2975,7 +3025,8 @@ impl PrototypeApp {
             ui.set_min_size(Vec2::new(content_width, layout.total_height()));
             let visible_text_pages =
                 layout.visible_pages(visible_viewport.min.y..visible_viewport.max.y, 0.0);
-            tab.prepare_text_snapshots(visible_text_pages, revision);
+            tab.prepare_text_snapshots(visible_text_pages.clone(), revision);
+            tab.prepare_annotation_pages(visible_text_pages, revision);
             // One viewport of prefetch keeps ordinary wheel scrolling smooth
             // while the shared byte LRU supplies the hard memory bound.
             let wanted_pages = layout.visible_pages(
@@ -3115,6 +3166,7 @@ impl PrototypeApp {
         let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
             ui.set_min_size(content_size);
             tab.prepare_text_snapshots(std::iter::once(page_index), revision);
+            tab.prepare_annotation_pages(std::iter::once(page_index), revision);
             let screen_rect = Rect::from_min_size(
                 ui.max_rect().min + page_content_rect.min.to_vec2(),
                 page_content_rect.size(),
@@ -4063,6 +4115,10 @@ impl DocumentTab {
             pending_text_snapshots: HashSet::new(),
             failed_text_snapshots: HashSet::new(),
             wanted_text_snapshots: HashSet::new(),
+            annotation_pages: HashMap::new(),
+            pending_annotation_pages: HashSet::new(),
+            failed_annotation_pages: HashSet::new(),
+            wanted_annotation_pages: HashSet::new(),
             selection: None,
             selection_generation: 0,
             pending_highlights: 0,
@@ -4118,6 +4174,7 @@ impl DocumentTab {
         // No completion event can arrive after channel disconnection. Clear
         // every response-waiting flag so close and recovery actions remain usable.
         self.pending_highlights = 0;
+        self.pending_annotation_pages.clear();
         self.undo_in_flight = false;
         self.save_in_flight = false;
         self.print_in_flight = false;
@@ -4141,6 +4198,7 @@ impl DocumentTab {
     fn suspend(&mut self) {
         self.invalidate_rendering();
         self.invalidate_text_snapshots();
+        self.invalidate_annotation_pages();
         self.tiles.clear();
         self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
         self.pending_thumbnails.clear();
@@ -4321,6 +4379,13 @@ impl DocumentTab {
         self.wanted_text_snapshots.clear();
     }
 
+    fn invalidate_annotation_pages(&mut self) {
+        self.annotation_pages.clear();
+        self.pending_annotation_pages.clear();
+        self.failed_annotation_pages.clear();
+        self.wanted_annotation_pages.clear();
+    }
+
     fn prepare_text_snapshots(&mut self, page_indices: impl Iterator<Item = usize>, revision: u64) {
         let wanted = page_indices
             .map(|page_index| TextSnapshotKey {
@@ -4359,6 +4424,43 @@ impl DocumentTab {
             };
             if self.send(DocumentCommand::LoadTextSnapshot(request)) {
                 self.pending_text_snapshots.insert(key);
+            }
+        }
+    }
+
+    fn prepare_annotation_pages(
+        &mut self,
+        page_indices: impl Iterator<Item = usize>,
+        revision: u64,
+    ) {
+        let wanted = page_indices
+            .map(|page_index| AnnotationPageRequest {
+                page_index,
+                expected_revision: revision,
+            })
+            .collect::<HashSet<_>>();
+        self.annotation_pages
+            .retain(|request, _| wanted.contains(request));
+        self.failed_annotation_pages
+            .retain(|request| wanted.contains(request));
+        self.wanted_annotation_pages = wanted;
+
+        // A failed visible page stays blocked until it leaves and re-enters the
+        // wanted set. Pending stale pages are harmless because revision checks
+        // reject their eventual worker responses.
+        let requests = self
+            .wanted_annotation_pages
+            .iter()
+            .filter(|request| {
+                !self.annotation_pages.contains_key(request)
+                    && !self.pending_annotation_pages.contains(request)
+                    && !self.failed_annotation_pages.contains(request)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for request in requests {
+            if self.send(DocumentCommand::LoadAnnotations(request)) {
+                self.pending_annotation_pages.insert(request);
             }
         }
     }
@@ -4940,6 +5042,18 @@ fn text_snapshot_result_is_current(
         && current_revision == Some(key.revision)
         && key.page_index < page_count
         && wanted.contains(&key)
+}
+
+fn annotation_page_result_is_current(
+    is_active: bool,
+    request: AnnotationPageRequest,
+    current_revision: Option<u64>,
+    wanted: &HashSet<AnnotationPageRequest>,
+) -> bool {
+    // Annotation xrefs are document-local mutable identities. A result from an
+    // inactive tab, old revision, or no-longer-visible page must not become an
+    // edit target in the current UI.
+    is_active && current_revision == Some(request.expected_revision) && wanted.contains(&request)
 }
 
 fn retain_visible_text_failures(
@@ -6179,6 +6293,10 @@ mod tests {
         let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None, false);
         tab.state = DocumentState::Saving;
         tab.pending_highlights = 1;
+        tab.pending_annotation_pages.insert(AnnotationPageRequest {
+            page_index: 0,
+            expected_revision: 0,
+        });
         tab.undo_in_flight = true;
         tab.save_in_flight = true;
         tab.print_in_flight = true;
@@ -6186,6 +6304,7 @@ mod tests {
         tab.mark_worker_disconnected();
 
         assert_eq!(tab.pending_highlights, 0);
+        assert!(tab.pending_annotation_pages.is_empty());
         assert!(!tab.undo_in_flight);
         assert!(!tab.is_saving());
         assert!(!tab.is_printing());
@@ -6365,6 +6484,40 @@ mod tests {
             key,
             Some(4),
             3,
+            &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn annotation_result_requires_active_visible_current_revision() {
+        let request = AnnotationPageRequest {
+            page_index: 2,
+            expected_revision: 4,
+        };
+        let wanted = HashSet::from([request]);
+
+        assert!(annotation_page_result_is_current(
+            true,
+            request,
+            Some(4),
+            &wanted
+        ));
+        assert!(!annotation_page_result_is_current(
+            false,
+            request,
+            Some(4),
+            &wanted
+        ));
+        assert!(!annotation_page_result_is_current(
+            true,
+            request,
+            Some(3),
+            &wanted
+        ));
+        assert!(!annotation_page_result_is_current(
+            true,
+            request,
+            Some(4),
             &HashSet::new()
         ));
     }

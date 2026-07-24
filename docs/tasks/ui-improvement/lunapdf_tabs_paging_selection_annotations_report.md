@@ -219,3 +219,44 @@ cargo test
 - 全体：142 passed、0 failed、1 ignored
 
 Typst PDF、逆方向ドラッグ、複数行の実画面表示、プレビュー・コピー・保存注釈の実機一致は最終受入で確認する。
+
+## 4. 既存ハイライトの列挙・安定識別・読取・ヒットテスト
+
+### 修正前の失敗
+
+外部作成相当のHighlightへコメント、RGB色、透明度を設定して保存したfixtureを開き、ページ注釈を要求した。読取コマンドのstubは空一覧を返したため、注釈件数が0件となって失敗した。
+
+```text
+cargo test reads_existing_highlight_identity_geometry_comment_color_and_opacity -- --nocapture
+left: 0
+right: 1
+```
+
+### 変更
+
+- ページ単位・revision指定の注釈読取コマンドをworker境界へ追加した。
+- MuPDFのページ内配列順ではなく、文書内の間接オブジェクト番号であるxrefとページ番号の組を`AnnotationId`にした。IDの有効範囲は、その文書を開いているタブの同一revision内である。
+- HighlightのQuadPoints、コメント（Contents）、Gray／RGB／CMYK色、透明度を所有データへコピーし、MuPDFオブジェクトをUIスレッドへ渡さない。
+- 文書全体の既存`HighlightCapability`に加え、注釈の`ReadOnly`、`Locked`、`LockedContents`フラグからコメント・色・削除の可否を別々に判定する。更新不能時に新規注釈へ置き換えるfallbackは追加していない。
+- 表示中ページだけを要求し、非表示化、タブ切替、文書revision更新でキャッシュを破棄する。非アクティブタブ、古いrevision、要求対象外ページから届いた結果は編集候補へ採用しない。
+- 画面座標から変換済みのページ座標に対し、回転・傾斜Quadの実領域でヒット判定する。外接矩形内でもQuad外の点は候補にしない。退化Quadにもヒット領域を与えない。
+- 候補列挙と0件／1件／複数件の決定方針を分離した。複数件は順序で自動決定せず、次フェーズのサブメニューへ全候補を渡す。
+
+### 自動検証
+
+```text
+cargo test annotation -- --nocapture
+cargo test reads_existing_highlight_identity_geometry_comment_color_and_opacity -- --nocapture
+cargo test
+cargo clippy --all-targets
+```
+
+実結果：
+
+- 注釈読取、フラグ別編集可否、worker伝達、古い結果の拒否、Quadヒット、候補方針：成功
+- 保存した外部作成相当Highlightのxref、geometry、コメント、色、透明度の再読込：成功
+- 同一文書・同一revisionで再列挙したxrefの一致：成功
+- 全体：150 passed、0 failed、1 ignored
+- Clippy：終了コード0。次フェーズでUI入口へ接続するヒットテスト／候補決定の未使用警告4件のみ
+
+読取専用ファイルの文書全体編集不可判定は既存テスト、注釈個別の`Locked`／`LockedContents`は追加テストで確認した。実在する署名・暗号化権限制限PDF、外部ソフト固有の外観ストリームはfixtureがないため、最終時点でも未確認ならその旨を残す。

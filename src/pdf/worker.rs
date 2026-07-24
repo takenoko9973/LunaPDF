@@ -7,6 +7,7 @@ use crossbeam_channel::{
     Receiver, Sender, TryRecvError, TrySendError, bounded, select_biased, unbounded,
 };
 
+use crate::domain::annotation::{AnnotationPageRequest, AnnotationPageSnapshot};
 use crate::domain::document::{
     DocumentInfo, DocumentVersion, EditAction, HighlightRequest, OutlineItem, RenderPriority,
     RenderedThumbnail, RenderedTile, SearchPageResult, ThumbnailRequest, TileRequest,
@@ -26,6 +27,7 @@ pub(crate) enum DocumentCommand {
         end: PagePoint,
     },
     LoadTextSnapshot(TextSnapshotRequest),
+    LoadAnnotations(AnnotationPageRequest),
     CreateHighlight(HighlightRequest),
     /// Removes the exact application-owned edit identified by the backend.
     Undo(EditAction),
@@ -53,6 +55,12 @@ pub(crate) enum DocumentEvent {
     TextSnapshotSkipped(TextSnapshotRequest),
     TextSnapshotFailed {
         request: TextSnapshotRequest,
+        message: String,
+    },
+    AnnotationsReady(AnnotationPageSnapshot),
+    AnnotationsSkipped(AnnotationPageRequest),
+    AnnotationsFailed {
+        request: AnnotationPageRequest,
         message: String,
     },
     /// Returns the stable identity produced when a document edit is created.
@@ -368,6 +376,20 @@ fn run_worker(
                     });
                 }
             },
+            DocumentCommand::LoadAnnotations(request) => match backend.annotation_page(request) {
+                Ok(Some(snapshot)) => {
+                    let _ = event_sender.send(DocumentEvent::AnnotationsReady(snapshot));
+                }
+                Ok(None) => {
+                    let _ = event_sender.send(DocumentEvent::AnnotationsSkipped(request));
+                }
+                Err(error) => {
+                    let _ = event_sender.send(DocumentEvent::AnnotationsFailed {
+                        request,
+                        message: format!("{error:#}"),
+                    });
+                }
+            },
             DocumentCommand::CreateHighlight(request) => {
                 match backend.create_highlight(request.page_index, &request.quads) {
                     Ok(action) => {
@@ -629,6 +651,8 @@ fn send_failure(
 mod tests {
     use super::*;
     use crate::domain::document::TileSpec;
+    use mupdf::Size;
+    use mupdf::pdf::PdfDocument;
     use std::time::{Duration, Instant};
 
     fn tile_request(priority: RenderPriority) -> TileRequest {
@@ -922,6 +946,46 @@ mod tests {
                     std::thread::yield_now();
                 }
                 Err(error) => panic!("worker did not report open failure: {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn existing_annotation_snapshot_reaches_event_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("annotations.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            document.save(path_text).unwrap();
+        }
+        let service = DocumentService::spawn(path);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut request_sent = false;
+
+        loop {
+            match service.try_recv() {
+                Ok(DocumentEvent::Opened(_)) if !request_sent => {
+                    assert!(service.send(DocumentCommand::LoadAnnotations(
+                        AnnotationPageRequest {
+                            page_index: 0,
+                            expected_revision: 0,
+                        },
+                    )));
+                    request_sent = true;
+                }
+                Ok(DocumentEvent::AnnotationsReady(snapshot)) => {
+                    assert_eq!(snapshot.page_index, 0);
+                    assert_eq!(snapshot.revision, 0);
+                    assert!(snapshot.annotations.is_empty());
+                    break;
+                }
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("worker did not return annotations: {error:?}"),
             }
         }
     }

@@ -1,3 +1,4 @@
+pub(crate) mod annotation;
 pub(crate) mod document;
 pub(crate) mod selection;
 pub(crate) mod session;
