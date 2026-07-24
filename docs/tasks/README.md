@@ -18,3 +18,4 @@
 - [Codex向け LunaPDF 描画欠落・タブUI・テキスト選択修正指示書](ui-improvement/lunapdf_codex_fitpage_tabs_selection_instructions.md)
 - [Codex向け LunaPDF タブ・ページ操作・テキスト選択・注釈編集 改善指示書](ui-improvement/lunapdf_codex_tabs_paging_selection_annotations_instructions.md)
 - [LunaPDF 描画欠落・タブUI・テキスト選択 調査・作業報告](ui-improvement/lunapdf_fitpage_tabs_selection_report.md)
+- [LunaPDF タブ・ページ操作・テキスト選択・注釈編集 調査・作業報告](ui-improvement/lunapdf_tabs_paging_selection_annotations_report.md)
