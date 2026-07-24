@@ -3091,7 +3091,7 @@ impl PrototypeApp {
             single_page_centered_offset(page_content_rect, anchor, viewport_size, content_size)
         });
         let maximum_offset = (content_size - viewport_size).max(Vec2::ZERO);
-        let scroll_id = ui.make_persistent_id(("single-pdf", &path));
+        let scroll_id = scroll_area_state_id(ui, ("single-pdf", &path));
         let stored_offset = egui::scroll_area::State::load(ui.ctx(), scroll_id)
             .map(|state| state.offset)
             .unwrap_or(Vec2::ZERO);
@@ -3221,9 +3221,7 @@ impl PrototypeApp {
             autoscroll_page_delta
         };
         if let Some(page_delta) = page_delta {
-            let last_page = page_count.saturating_sub(1);
-            let target = page_index.saturating_add_signed(page_delta).min(last_page);
-            if target != page_index {
+            if let Some(target) = adjacent_page_index(page_index, page_count, page_delta) {
                 let x = tab.view.single_center_anchor.unwrap_or(Vec2::splat(0.5)).x;
                 // Enter the next page at its top and the previous page at its
                 // bottom so the wheel continues in the direction of travel.
@@ -3243,6 +3241,12 @@ impl PrototypeApp {
             self.status = "Resolving selection on the document worker…".to_owned();
         }
     }
+}
+
+fn adjacent_page_index(current: usize, page_count: usize, delta: isize) -> Option<usize> {
+    let last_page = page_count.checked_sub(1)?;
+    let target = current.saturating_add_signed(delta).min(last_page);
+    (target != current).then_some(target)
 }
 
 impl TileCacheKey {
@@ -3765,6 +3769,14 @@ fn clamp_scroll_offset(offset: Vec2, maximum: Vec2) -> Vec2 {
         offset.x.clamp(0.0, maximum.x.max(0.0)),
         offset.y.clamp(0.0, maximum.y.max(0.0)),
     )
+}
+
+/// Produces the exact persistent ID that `ScrollArea::id_salt` stores.
+fn scroll_area_state_id(ui: &egui::Ui, id_salt: impl egui::AsIdSalt) -> Id {
+    // ScrollArea hashes its caller salt into IdSalt before combining it with
+    // the parent. Passing the raw tuple directly to make_persistent_id hashes
+    // a different value and reads a permanently empty scroll state.
+    ui.make_persistent_id(egui::IdSalt::new(id_salt))
 }
 
 fn autoscroll_page_delta(
@@ -5924,6 +5936,87 @@ mod tests {
             single_page_wheel_steps(&events, true, false, true, false, 1.1, &mut state),
             1
         );
+    }
+
+    #[test]
+    fn fit_width_scroll_area_uses_the_stored_bottom_for_wheel_transition() {
+        let bounds = crate::domain::document::PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 600.0,
+            y1: 1_600.0,
+        };
+        let screen_size = Vec2::new(800.0, 600.0);
+        let context = egui::Context::default();
+        let mut reconstructed_bottom = false;
+        let mut actual_bottom = false;
+
+        for frame in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen_size)),
+                ..Default::default()
+            };
+            let _output = context.run_ui(input, |ui| {
+                let viewport_size = ui.available_size();
+                let zoom =
+                    PrototypeApp::fit_zoom_for_page(bounds, viewport_size, ZoomMode::FitWidth)
+                        .unwrap();
+                let geometry = single_page_geometry(bounds, zoom, viewport_size);
+                let maximum_offset = (geometry.content_size - viewport_size).max(Vec2::ZERO);
+                let id = scroll_area_state_id(ui, "fit-width-wheel-edge");
+                let stored_offset = egui::scroll_area::State::load(ui.ctx(), id)
+                    .map(|state| state.offset)
+                    .unwrap_or(Vec2::ZERO);
+                let starting_offset = clamp_scroll_offset(stored_offset, maximum_offset);
+                reconstructed_bottom =
+                    starting_offset.y >= maximum_offset.y - SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
+
+                let mut scroll_area = egui::ScrollArea::both()
+                    .id_salt("fit-width-wheel-edge")
+                    .auto_shrink([false, false]);
+                if frame == 0 {
+                    scroll_area = scroll_area.scroll_offset(Vec2::splat(f32::INFINITY));
+                }
+                let output = scroll_area.show_viewport(ui, |ui, _| {
+                    ui.set_min_size(geometry.content_size);
+                });
+                let maximum_output_offset =
+                    (output.content_size - output.inner_rect.size()).max(Vec2::ZERO);
+                actual_bottom = output.state.offset.y
+                    >= maximum_output_offset.y - SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
+            });
+        }
+
+        assert!(actual_bottom);
+        assert_eq!(reconstructed_bottom, actual_bottom);
+        let down = [wheel_event(
+            MouseWheelUnit::Line,
+            Vec2::new(0.0, -1.0),
+            TouchPhase::Move,
+            false,
+        )];
+        let mut wheel_state = SinglePageWheelState::default();
+        assert_eq!(
+            single_page_wheel_steps(
+                &down,
+                true,
+                false,
+                reconstructed_bottom,
+                false,
+                1.0,
+                &mut wheel_state,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn single_page_wheel_does_not_cross_document_boundaries() {
+        assert_eq!(adjacent_page_index(0, 3, -1), None);
+        assert_eq!(adjacent_page_index(0, 3, 1), Some(1));
+        assert_eq!(adjacent_page_index(1, 3, -1), Some(0));
+        assert_eq!(adjacent_page_index(2, 3, 1), None);
+        assert_eq!(adjacent_page_index(0, 0, 1), None);
     }
 
     #[test]

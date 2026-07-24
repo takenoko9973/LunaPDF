@@ -121,3 +121,48 @@ cargo test
 - 全体：131 passed、0 failed、1 ignored
 
 100%・125%・150%・200%相当DPI、ホバー、無効状態、長い日本語名、多数タブの実画面確認は最終受入で実施する。
+
+## 2. 単一ページ＋FitWidthホイール遷移
+
+### 修正前の失敗
+
+600 × 1600ptの縦長ページを800 × 600ptの表示領域へFitWidth表示し、eguiのScrollAreaを最下端へ移動した状態を再現した。
+
+- `ScrollAreaOutput`が返す実際の下端判定：`true`
+- 次フレーム用に事前読取した下端判定：`false`
+
+```text
+cargo test fit_width_scroll_area_reports_the_same_bottom_as_the_pre_frame_edge_check -- --nocapture
+left: false
+right: true
+```
+
+既存の純粋関数テストでは下端フラグを直接渡していたため、入力イベントの条件は検証できていたが、実際のScrollArea状態を取得できない問題を検出できていなかった。
+
+### 原因
+
+`ScrollArea::id_salt`は、呼び出し元のsaltを一度`egui::IdSalt`へハッシュしてから親UIのIDと結合する。一方、修正前の事前読取は生のタプルを`Ui::make_persistent_id`へ直接渡していたため、別のIDを読んでいた。結果として縦長ページでも保存済みoffsetは常に取得できず、開始offset 0として上端だけを判定していた。
+
+FitPageなど縦方向に収まるページは最大offset自体が0なのでこの誤りが見えにくく、縦長になりやすいFitWidthで下端遷移ができなかった。
+
+### 変更
+
+- `ScrollArea`と同じ`IdSalt`変換を行う`scroll_area_state_id()`を追加し、事前offset読取を同一IDへ統一した。
+- ページ境界処理を`adjacent_page_index()`へ分離し、先頭より前、最終より後、0ページ文書を返さないことをテストした。
+- 既存の「端へ到達させる入力では遷移せず、その後の追加入力で遷移」「次ページは上端、前ページは下端」「Line／Pageは1イベント1段階、Pointは蓄積とラッチ」「Ctrl、横入力、表示領域外を除外」の処理は変更していない。
+
+### 自動検証
+
+```text
+cargo test fit_width_scroll_area_uses_the_stored_bottom_for_wheel_transition -- --nocapture
+cargo test single_page_wheel -- --nocapture
+cargo test
+```
+
+実結果：
+
+- FitWidth実ScrollArea下端と下方向遷移：成功
+- 単一ページwheel対象3件：成功
+- 全体：133 passed、0 failed、1 ignored
+
+ノッチ式マウス、高精度wheel／trackpad、オーバーレイ上の入力除外は最終受入およびオーバーレイ実装後に確認する。
