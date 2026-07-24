@@ -12,7 +12,7 @@ use eframe::egui::{
     ViewportCommand,
 };
 
-use crate::domain::annotation::{AnnotationPageRequest, AnnotationPageSnapshot};
+use crate::domain::annotation::{AnnotationId, AnnotationPageRequest, AnnotationPageSnapshot};
 use crate::domain::document::{
     DocumentInfo, EditAction, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail,
     RenderedTile, SearchMatch, SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
@@ -30,10 +30,16 @@ use crate::persistence::session_store::SessionStore;
 use crate::render::cache::WeightedLruCache;
 use crate::render::layout::{ContinuousLayout, PAGE_GAP, PageAnchor};
 use crate::render::tiles::TileGrid;
+use crate::ui::annotation_editor::{
+    AnnotationEditorAction, AnnotationEditorState, AnnotationMenuCandidate, AnnotationUiAction,
+    annotation_comment_id, annotation_overlay_rect, show_annotation_editor,
+};
 use crate::ui::fonts::install_cjk_fallback;
 use crate::ui::icons::{ToolbarIcon, icon_button};
 use crate::ui::sidebar::{SidebarTab, show_outline};
-use crate::ui::viewport::{PageViewport, screen_rect_for_tile};
+use crate::ui::viewport::{
+    PageInteraction, PageInteractionInput, PageViewport, screen_rect_for_tile,
+};
 
 // These bounds cover detailed inspection and overview use without allowing an
 // accidental wheel gesture to request an unbounded raster allocation.
@@ -138,6 +144,8 @@ pub(crate) struct PrototypeApp {
     sidebar_tab: SidebarTab,
     gpu_lru: WeightedLruCache<TileCacheKey, ()>,
     thumbnail_lru: WeightedLruCache<ThumbnailCacheKey, ()>,
+    annotation_editor: Option<AnnotationEditorState>,
+    annotation_picker: Option<AnnotationPickerState>,
 }
 
 struct DocumentTab {
@@ -217,6 +225,12 @@ struct ThumbnailCacheKey {
 struct TextSnapshotKey {
     page_index: usize,
     revision: u64,
+}
+
+struct AnnotationPickerState {
+    document_id: u64,
+    revision: u64,
+    candidates: Vec<AnnotationMenuCandidate>,
 }
 
 #[derive(Default)]
@@ -565,6 +579,8 @@ impl PrototypeApp {
             sidebar_tab: SidebarTab::Outline,
             gpu_lru: WeightedLruCache::new(GPU_TILE_BUDGET_BYTES),
             thumbnail_lru: WeightedLruCache::new(THUMBNAIL_BUDGET_BYTES),
+            annotation_editor: None,
+            annotation_picker: None,
         };
         if paths.is_empty() && restore_enabled {
             if let Some(session) = saved_session {
@@ -1229,7 +1245,36 @@ impl PrototypeApp {
             let document_id = self.documents[index].document_id;
             let query_id = search_query_id(document_id);
             let page_id = page_number_id(document_id);
-            if context.memory(|memory| memory.has_focus(page_id)) {
+            let annotation_input_id = self
+                .annotation_editor
+                .as_ref()
+                .filter(|editor| editor.document_id == document_id)
+                .map(|editor| annotation_comment_id(document_id, editor.annotation_id));
+            if annotation_input_id
+                .is_some_and(|input_id| context.memory(|memory| memory.has_focus(input_id)))
+            {
+                // The first Escape leaves the multiline editor; it must not
+                // also discard the buffer or act on the PDF behind the overlay.
+                context.memory_mut(|memory| {
+                    memory.surrender_focus(annotation_input_id.expect("checked above"));
+                });
+            } else if self
+                .annotation_editor
+                .as_ref()
+                .is_some_and(|editor| editor.document_id == document_id)
+            {
+                let editor = self
+                    .annotation_editor
+                    .as_mut()
+                    .expect("active document editor checked above");
+                if editor.is_dirty() {
+                    editor.notice = Some(
+                        "未保存の変更があります。保存または変更を破棄してください。".to_owned(),
+                    );
+                } else {
+                    self.annotation_editor = None;
+                }
+            } else if context.memory(|memory| memory.has_focus(page_id)) {
                 self.documents[index].page_input =
                     (self.documents[index].view.current_page + 1).to_string();
                 self.documents[index].page_input_error = None;
@@ -1299,9 +1344,19 @@ impl PrototypeApp {
     fn active_text_input_id(&self, context: &egui::Context) -> Option<Id> {
         let index = self.active_index()?;
         let document_id = self.documents[index].document_id;
-        [search_query_id(document_id), page_number_id(document_id)]
-            .into_iter()
-            .find(|id| context.memory(|memory| memory.has_focus(*id)))
+        let annotation_id = self
+            .annotation_editor
+            .as_ref()
+            .filter(|editor| editor.document_id == document_id)
+            .map(|editor| annotation_comment_id(document_id, editor.annotation_id));
+        [
+            Some(search_query_id(document_id)),
+            Some(page_number_id(document_id)),
+            annotation_id,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|id| context.memory(|memory| memory.has_focus(*id)))
     }
 
     fn active_text_input_has_focus(&self, context: &egui::Context) -> bool {
@@ -1972,6 +2027,90 @@ impl PrototypeApp {
         };
         context.copy_text(selection.text.clone());
         self.status = "Selected text copied".to_owned();
+    }
+
+    fn handle_annotation_ui_action(
+        &mut self,
+        index: usize,
+        revision: u64,
+        action: AnnotationUiAction,
+        context: &egui::Context,
+    ) {
+        if self.active_index() != Some(index)
+            || self.documents[index]
+                .info
+                .as_ref()
+                .is_none_or(|info| info.revision != revision)
+        {
+            return;
+        }
+        match action {
+            AnnotationUiAction::CopySelection => self.copy_selection(context),
+            AnnotationUiAction::CreateHighlight => self.create_highlight(),
+            AnnotationUiAction::EditAnnotation(annotation_id) => {
+                self.open_annotation_editor(index, revision, annotation_id);
+            }
+            AnnotationUiAction::DeleteAnnotation(annotation_id) => {
+                self.open_annotation_editor(index, revision, annotation_id);
+                if let Some(editor) = &mut self.annotation_editor {
+                    editor.notice =
+                        Some("削除する場合は下部の「注釈を削除」を選択してください。".to_owned());
+                }
+            }
+            AnnotationUiAction::ChooseAnnotation(candidates) => {
+                self.annotation_picker = Some(AnnotationPickerState {
+                    document_id: self.documents[index].document_id,
+                    revision,
+                    candidates,
+                });
+            }
+        }
+    }
+
+    fn open_annotation_editor(&mut self, index: usize, revision: u64, annotation_id: AnnotationId) {
+        let document_id = self.documents[index].document_id;
+        if let Some(editor) = &mut self.annotation_editor {
+            let same_target = editor.document_id == document_id
+                && editor.revision == revision
+                && editor.annotation_id == annotation_id;
+            if same_target {
+                editor.notice = None;
+                return;
+            }
+            if editor.is_dirty() {
+                // Switching targets must never silently discard a long comment
+                // or implicitly save it into another annotation.
+                editor.notice =
+                    Some("別の注釈を開く前に、現在の変更を保存または破棄してください。".to_owned());
+                return;
+            }
+        }
+
+        let request = AnnotationPageRequest {
+            page_index: annotation_id.page_index,
+            expected_revision: revision,
+        };
+        let annotation = self.documents[index]
+            .annotation_pages
+            .get(&request)
+            .and_then(|page| {
+                page.annotations
+                    .iter()
+                    .find(|annotation| annotation.id == annotation_id)
+            })
+            .cloned();
+        let Some(annotation) = annotation else {
+            self.error = Some(
+                "注釈を開けませんでした。ページを再表示してから選択し直してください。".to_owned(),
+            );
+            return;
+        };
+        self.annotation_editor = Some(AnnotationEditorState::from_snapshot(
+            document_id,
+            revision,
+            &annotation,
+        ));
+        self.annotation_picker = None;
     }
 
     fn create_highlight(&mut self) {
@@ -2901,8 +3040,8 @@ impl PrototypeApp {
         selected_page
     }
 
-    fn central_panel(&mut self, root_ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(root_ui, |ui| {
+    fn central_panel(&mut self, root_ui: &mut egui::Ui) -> Rect {
+        let response = egui::CentralPanel::default().show(root_ui, |ui| {
             let Some(index) = self.active_index() else {
                 ui.centered_and_justified(|ui| {
                     ui.label("PDFをこのウィンドウへドロップしてください");
@@ -2942,6 +3081,97 @@ impl PrototypeApp {
                 DisplayMode::SinglePage => self.single_page_view(ui, index),
             }
         });
+        response.response.rect
+    }
+
+    fn annotation_candidate_picker(&mut self, context: &egui::Context) {
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let document_id = self.documents[index].document_id;
+        let revision = self.documents[index]
+            .info
+            .as_ref()
+            .map(|info| info.revision);
+        let Some(picker) = self.annotation_picker.as_ref().filter(|picker| {
+            picker.document_id == document_id && revision == Some(picker.revision)
+        }) else {
+            return;
+        };
+        let picker_revision = picker.revision;
+        let candidates = picker.candidates.clone();
+        let mut open = true;
+        let mut selected = None;
+        egui::Window::new("注釈を選択")
+            .id(Id::new(("annotation-picker", document_id)))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.label("同じ位置に複数の注釈があります。");
+                for candidate in &candidates {
+                    if ui.button(&candidate.label).clicked() {
+                        selected = Some(candidate.id);
+                    }
+                }
+            });
+        if let Some(annotation_id) = selected {
+            self.annotation_picker = None;
+            self.open_annotation_editor(index, picker_revision, annotation_id);
+        } else if !open {
+            self.annotation_picker = None;
+        }
+    }
+
+    fn annotation_editor_overlay(&mut self, context: &egui::Context, bounds: Rect) {
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let document_id = self.documents[index].document_id;
+        let revision = self.documents[index]
+            .info
+            .as_ref()
+            .map(|info| info.revision);
+        let Some(editor) = self
+            .annotation_editor
+            .as_mut()
+            .filter(|editor| editor.document_id == document_id)
+        else {
+            return;
+        };
+        editor.stale = revision != Some(editor.revision);
+        if editor.stale {
+            // A revision-bound xref must not be updated after another edit or
+            // save/reopen cycle. The visible buffer can still be explicitly discarded.
+            editor.notice = Some(
+                "PDFが変更されたため、この編集内容は保存できません。変更を破棄してください。"
+                    .to_owned(),
+            );
+        }
+        let action = show_annotation_editor(context, bounds, editor);
+        match action {
+            Some(AnnotationEditorAction::Close | AnnotationEditorAction::Discard) => {
+                self.annotation_editor = None;
+            }
+            Some(AnnotationEditorAction::Save) => {
+                // Backend mutation is connected in the following phase; keep
+                // the edit buffer intact rather than pretending it was saved.
+                if let Some(editor) = &mut self.annotation_editor {
+                    editor.notice = Some(
+                        "注釈更新処理を準備しています。変更はまだPDFへ反映されていません。"
+                            .to_owned(),
+                    );
+                }
+            }
+            Some(AnnotationEditorAction::Delete) => {
+                if let Some(editor) = &mut self.annotation_editor {
+                    editor.notice = Some(
+                        "注釈削除処理を準備しています。注釈はまだ削除されていません。".to_owned(),
+                    );
+                }
+            }
+            None => {}
+        }
     }
 
     fn update_fit_zoom(&mut self, index: usize, available: Vec2) {
@@ -2991,6 +3221,7 @@ impl PrototypeApp {
         let path = info.path.clone();
         let page_bounds = info.page_bounds.clone();
         let revision = info.revision;
+        let can_create_highlight = info.highlight_capability.is_allowed() && !tab.print_in_flight;
         let widest_page = page_bounds
             .iter()
             .map(|bounds| bounds.width() * tab.view.zoom)
@@ -3021,6 +3252,7 @@ impl PrototypeApp {
         }
 
         let mut completed_drag = None;
+        let mut annotation_action = None;
         let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
             ui.set_min_size(Vec2::new(content_width, layout.total_height()));
             let visible_text_pages =
@@ -3079,24 +3311,35 @@ impl PrototypeApp {
                         selected_match,
                     );
                 }
-                let response = ui
+                let interaction = ui
                     .scope_builder(UiBuilder::new().max_rect(screen_rect), |page_ui| {
                         let text_key = TextSnapshotKey {
                             page_index,
                             revision,
                         };
+                        let annotation_key = AnnotationPageRequest {
+                            page_index,
+                            expected_revision: revision,
+                        };
                         viewport.interact_at(
                             page_ui,
-                            screen_rect,
-                            page_index,
-                            page_bounds[page_index],
-                            tab.text_snapshots.get(&text_key),
-                            tab.selection.as_ref(),
+                            PageInteractionInput {
+                                screen_rect,
+                                page_index,
+                                bounds: page_bounds[page_index],
+                                text_snapshot: tab.text_snapshots.get(&text_key),
+                                selection: tab.selection.as_ref(),
+                                annotation_page: tab.annotation_pages.get(&annotation_key),
+                                can_create_highlight,
+                            },
                         )
                     })
                     .inner;
-                if response.is_some() {
-                    completed_drag = response;
+                if interaction.completed_drag.is_some() {
+                    completed_drag = interaction.completed_drag;
+                }
+                if interaction.annotation_action.is_some() {
+                    annotation_action = interaction.annotation_action;
                 }
             }
         });
@@ -3120,9 +3363,18 @@ impl PrototypeApp {
             tab.request_selection(page_index, start, end);
             self.status = "Resolving selection on the document worker…".to_owned();
         }
+        if let Some(action) = annotation_action {
+            self.handle_annotation_ui_action(index, revision, action, ui.ctx());
+        }
     }
 
     fn single_page_view(&mut self, ui: &mut egui::Ui, index: usize) {
+        let document_id = self.documents[index].document_id;
+        let editor_input_rect = self
+            .annotation_editor
+            .as_ref()
+            .filter(|editor| editor.document_id == document_id)
+            .map(|_| annotation_overlay_rect(ui.max_rect()));
         let pixels_per_point = ui.ctx().pixels_per_point();
         let viewport = &mut self.viewport;
         let gpu_lru = &mut self.gpu_lru;
@@ -3134,6 +3386,7 @@ impl PrototypeApp {
         let page_count = page_bounds.len();
         let page_index = tab.view.current_page;
         let bounds = page_bounds[page_index];
+        let can_create_highlight = info.highlight_capability.is_allowed() && !tab.print_in_flight;
         let viewport_size = ui.available_size();
         let geometry = single_page_geometry(bounds, tab.view.zoom, viewport_size);
         let content_size = geometry.content_size;
@@ -3156,7 +3409,7 @@ impl PrototypeApp {
             .view
             .autoscroll
             .and_then(|autoscroll| autoscroll.requested_offset);
-        let mut completed_drag = None;
+        let mut interaction = PageInteraction::default();
         let mut scroll_area = egui::ScrollArea::both()
             .id_salt(("single-pdf", &path))
             .auto_shrink([false, false]);
@@ -3196,19 +3449,27 @@ impl PrototypeApp {
                     selected_match,
                 );
             }
-            completed_drag = ui
+            interaction = ui
                 .scope_builder(UiBuilder::new().max_rect(screen_rect), |page_ui| {
                     let text_key = TextSnapshotKey {
                         page_index,
                         revision,
                     };
+                    let annotation_key = AnnotationPageRequest {
+                        page_index,
+                        expected_revision: revision,
+                    };
                     viewport.interact_at(
                         page_ui,
-                        screen_rect,
-                        page_index,
-                        bounds,
-                        tab.text_snapshots.get(&text_key),
-                        tab.selection.as_ref(),
+                        PageInteractionInput {
+                            screen_rect,
+                            page_index,
+                            bounds,
+                            text_snapshot: tab.text_snapshots.get(&text_key),
+                            selection: tab.selection.as_ref(),
+                            annotation_page: tab.annotation_pages.get(&annotation_key),
+                            can_create_highlight,
+                        },
                     )
                 })
                 .inner;
@@ -3227,8 +3488,10 @@ impl PrototypeApp {
                 input.time,
             )
         });
-        let pointer_over_view =
-            pointer_position.is_some_and(|position| output.inner_rect.contains(position));
+        let pointer_over_view = pointer_position.is_some_and(|position| {
+            output.inner_rect.contains(position)
+                && editor_input_rect.is_none_or(|rect| !rect.contains(position))
+        });
         let wheel_page_delta = single_page_wheel_steps(
             &raw_events,
             pointer_over_view,
@@ -3288,9 +3551,12 @@ impl PrototypeApp {
             }
         }
 
-        if let Some((page_index, start, end)) = completed_drag {
+        if let Some((page_index, start, end)) = interaction.completed_drag {
             tab.request_selection(page_index, start, end);
             self.status = "Resolving selection on the document worker…".to_owned();
+        }
+        if let Some(action) = interaction.annotation_action {
+            self.handle_annotation_ui_action(index, revision, action, ui.ctx());
         }
     }
 }
@@ -4827,7 +5093,9 @@ impl eframe::App for PrototypeApp {
         self.error_banner(ui);
         self.status_panel(ui);
         self.sidebar_panel(ui);
-        self.central_panel(ui);
+        let central_rect = self.central_panel(ui);
+        self.annotation_candidate_picker(ui.ctx());
+        self.annotation_editor_overlay(ui.ctx(), central_rect);
         self.close_confirmation_dialog(ui.ctx());
         self.session_close_failure_dialog(ui.ctx());
     }

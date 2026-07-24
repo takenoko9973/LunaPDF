@@ -67,12 +67,7 @@ pub(crate) fn annotations_at_point(
 ) -> Vec<&AnnotationSnapshot> {
     annotations
         .iter()
-        .filter(|annotation| {
-            annotation
-                .quads
-                .iter()
-                .any(|quad| quad_contains_point(*quad, point))
-        })
+        .filter(|annotation| annotation.quads.iter().any(|quad| quad.contains(point)))
         .collect()
 }
 
@@ -85,43 +80,6 @@ pub(crate) fn decide_annotation_candidates(
         [annotation] => AnnotationCandidateDecision::Open(annotation.id),
         _ => AnnotationCandidateDecision::Choose,
     }
-}
-
-fn quad_contains_point(quad: PageQuad, point: PagePoint) -> bool {
-    let corners = [
-        quad.upper_left,
-        quad.upper_right,
-        quad.lower_right,
-        quad.lower_left,
-    ];
-    let polygon_area_twice = corners
-        .iter()
-        .zip(corners.iter().cycle().skip(1))
-        .take(corners.len())
-        .map(|(start, end)| start.x * end.y - end.x * start.y)
-        .sum::<f32>();
-    if polygon_area_twice == 0.0 {
-        // A degenerate Quad has no visible interior and must not become an
-        // annotation target merely because every cross product is zero.
-        return false;
-    }
-
-    let mut has_clockwise_edge = false;
-    let mut has_counterclockwise_edge = false;
-    for index in 0..corners.len() {
-        let start = corners[index];
-        let end = corners[(index + 1) % corners.len()];
-        let cross =
-            (end.x - start.x) * (point.y - start.y) - (end.y - start.y) * (point.x - start.x);
-        has_clockwise_edge |= cross < 0.0;
-        has_counterclockwise_edge |= cross > 0.0;
-        // Convex PDF Quad points contain a point only while all non-zero
-        // edge products have the same orientation.
-        if has_clockwise_edge && has_counterclockwise_edge {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]

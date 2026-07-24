@@ -41,6 +41,44 @@ impl PageQuad {
         let y1 = ys.into_iter().fold(f32::NEG_INFINITY, f32::max);
         (x0, y0, x1, y1)
     }
+
+    /// Tests a point against the visible interior of this convex PDF Quad.
+    pub(crate) fn contains(self, point: PagePoint) -> bool {
+        let corners = [
+            self.upper_left,
+            self.upper_right,
+            self.lower_right,
+            self.lower_left,
+        ];
+        let polygon_area_twice = corners
+            .iter()
+            .zip(corners.iter().cycle().skip(1))
+            .take(corners.len())
+            .map(|(start, end)| start.x * end.y - end.x * start.y)
+            .sum::<f32>();
+        if polygon_area_twice == 0.0 {
+            // A degenerate Quad has no visible interior and must not become a
+            // selection or annotation target because all edge products are zero.
+            return false;
+        }
+
+        let mut has_clockwise_edge = false;
+        let mut has_counterclockwise_edge = false;
+        for index in 0..corners.len() {
+            let start = corners[index];
+            let end = corners[(index + 1) % corners.len()];
+            let cross =
+                (end.x - start.x) * (point.y - start.y) - (end.y - start.y) * (point.x - start.x);
+            has_clockwise_edge |= cross < 0.0;
+            has_counterclockwise_edge |= cross > 0.0;
+            // Convex PDF Quad points contain a point only while all non-zero
+            // edge products have the same orientation.
+            if has_clockwise_edge && has_counterclockwise_edge {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,6 +109,19 @@ pub(crate) struct SelectionSnapshot {
     pub(crate) display_quads: Vec<PageQuad>,
     pub(crate) quads: Vec<PageQuad>,
     pub(crate) extraction_time: Duration,
+}
+
+/// Reports whether the page point is inside the current selection display geometry.
+pub(crate) fn selection_contains_point(
+    selection: &SelectionSnapshot,
+    page_index: usize,
+    point: PagePoint,
+) -> bool {
+    selection.page_index == page_index
+        && selection
+            .display_quads
+            .iter()
+            .any(|quad| quad.contains(point))
 }
 
 /// Creates the logical copy string independently from the display quads.
