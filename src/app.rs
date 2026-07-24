@@ -55,6 +55,15 @@ const TAB_CLOSE_WIDTH: f32 = 24.0;
 const TAB_CONTENT_GAP: f32 = 4.0;
 const TAB_ITEM_SPACING: f32 = 1.0;
 
+// An 8-point vector X remains legible inside the 24-point close target while
+// leaving enough hover fill around it at the minimum tab height.
+const TAB_CLOSE_ICON_HALF_SIZE: f32 = 4.0;
+const TAB_CLOSE_ICON_STROKE_WIDTH: f32 = 1.5;
+
+// The first three page digits keep a stable toolbar column. Longer documents
+// measure all required digits instead of truncating or rejecting page input.
+const PAGE_INPUT_MINIMUM_COLUMNS: usize = 3;
+
 // The design budget is shared across all tabs so the active document can use
 // available GPU memory instead of dividing a fixed allocation per tab.
 const GPU_TILE_BUDGET_BYTES: usize = 192 * 1_024 * 1_024;
@@ -410,11 +419,8 @@ fn tab_content_rects(
     content_gap: f32,
 ) -> TabContentRects {
     let close = Rect::from_min_max(
-        Pos2::new(
-            tab_rect.right() - horizontal_padding - close_width,
-            tab_rect.top(),
-        ),
-        Pos2::new(tab_rect.right() - horizontal_padding, tab_rect.bottom()),
+        Pos2::new(tab_rect.right() - close_width, tab_rect.top()),
+        tab_rect.right_bottom(),
     );
     let title = Rect::from_min_max(
         Pos2::new(tab_rect.left() + horizontal_padding, tab_rect.top()),
@@ -488,13 +494,22 @@ fn paint_document_tab(
     } else {
         ui.visuals().weak_text_color()
     };
-    ui.painter().text(
-        content.close.center(),
-        egui::Align2::CENTER_CENTER,
-        "×",
-        egui::TextStyle::Button.resolve(ui.style()),
-        close_color,
-    );
+    let close_stroke = Stroke::new(TAB_CLOSE_ICON_STROKE_WIDTH, close_color);
+    for segment in close_icon_segments(content.close) {
+        ui.painter().line_segment(segment, close_stroke);
+    }
+}
+
+fn close_icon_segments(close_rect: Rect) -> [[Pos2; 2]; 2] {
+    let center = close_rect.center();
+    let offset = Vec2::splat(TAB_CLOSE_ICON_HALF_SIZE);
+    [
+        [center - offset, center + offset],
+        [
+            center + Vec2::new(-offset.x, offset.y),
+            center + Vec2::new(offset.x, -offset.y),
+        ],
+    ]
 }
 
 impl PrototypeApp {
@@ -2329,10 +2344,11 @@ impl PrototypeApp {
                         if !ui.memory(|memory| memory.has_focus(page_id)) {
                             self.documents[index].page_input = (current_page + 1).to_string();
                         }
+                        let page_input_width = page_number_input_width(ui, page_count);
                         let page_response = ui.add(
                             egui::TextEdit::singleline(&mut self.documents[index].page_input)
                                 .id(page_id)
-                                .desired_width(46.0)
+                                .desired_width(page_input_width)
                                 .horizontal_align(egui::Align::Center),
                         );
                         let enter_pressed = page_response.has_focus()
@@ -4981,6 +4997,27 @@ fn page_index_from_input(input: &str, page_count: usize) -> Option<usize> {
     page_number.checked_sub(1)
 }
 
+fn page_number_input_columns(page_count: usize) -> usize {
+    page_count
+        .max(1)
+        .to_string()
+        .len()
+        .max(PAGE_INPUT_MINIMUM_COLUMNS)
+}
+
+fn page_number_input_width(ui: &egui::Ui, page_count: usize) -> f32 {
+    let sample = "9".repeat(page_number_input_columns(page_count));
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let text_width = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(sample, font_id, Color32::WHITE)
+            .size()
+            .x
+    });
+    let frame_padding = ui.spacing().button_padding.x * 2.0;
+    (text_width + frame_padding).max(ui.spacing().interact_size.x + frame_padding)
+}
+
 fn page_number_id(document_id: u64) -> Id {
     Id::new(("pdf-page-number", document_id))
 }
@@ -5125,6 +5162,26 @@ mod tests {
         assert_eq!(content.close.width(), 24.0);
         assert!(content.selection.right() <= content.close.left());
         assert!(content.title.right() <= content.close.left());
+    }
+
+    #[test]
+    fn tab_close_region_reaches_tab_right_edge() {
+        let tab_rect = Rect::from_min_size(Pos2::new(10.0, 5.0), Vec2::new(96.0, 24.0));
+        let content = tab_content_rects(tab_rect, 8.0, 24.0, 4.0);
+
+        assert_eq!(content.close.right(), tab_rect.right());
+    }
+
+    #[test]
+    fn tab_close_icon_uses_two_equal_vector_strokes() {
+        let close_rect = Rect::from_min_size(Pos2::new(10.0, 5.0), Vec2::splat(24.0));
+        let segments = close_icon_segments(close_rect);
+        let first_length = segments[0][0].distance(segments[0][1]);
+        let second_length = segments[1][0].distance(segments[1][1]);
+
+        assert_eq!(first_length, second_length);
+        assert_eq!(segments[0][0].x, segments[1][0].x);
+        assert_eq!(segments[0][1].x, segments[1][1].x);
     }
 
     #[test]
@@ -5912,6 +5969,29 @@ mod tests {
         assert_eq!(page_index_from_input("-1", 5), None);
         assert_eq!(page_index_from_input("abc", 5), None);
         assert_eq!(page_index_from_input("6", 5), None);
+    }
+
+    #[test]
+    fn page_input_reserves_three_columns_and_expands_for_longer_documents() {
+        for page_count in [1, 9, 10, 99, 100, 999] {
+            assert_eq!(page_number_input_columns(page_count), 3);
+        }
+        assert_eq!(page_number_input_columns(1_000), 4);
+        assert_eq!(page_number_input_columns(12_345), 5);
+    }
+
+    #[test]
+    fn page_input_width_is_stable_through_three_digits() {
+        let context = egui::Context::default();
+        let mut widths = Vec::new();
+        let _output = context.run_ui(Default::default(), |ui| {
+            for page_count in [1, 9, 10, 99, 100, 999, 1_000] {
+                widths.push(page_number_input_width(ui, page_count));
+            }
+        });
+
+        assert!(widths[..6].windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(widths[6] >= widths[5]);
     }
 
     #[test]
