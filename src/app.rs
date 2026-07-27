@@ -86,9 +86,9 @@ const THUMBNAIL_MAX_WIDTH: u32 = 160;
 const THUMBNAIL_MAX_HEIGHT: u32 = 220;
 const THUMBNAIL_ROW_HEIGHT: f32 = 248.0;
 
-// A batch bounds the longest non-preemptible sidebar scan while amortizing
-// MuPDF page setup. The follow-up performance matrix compares 8/16/32 pages.
-const HIGHLIGHT_INDEX_BATCH_PAGES: usize = 16;
+// The release performance matrix showed eight pages had the shortest first
+// result and cancellation boundary without increasing total scan time.
+const HIGHLIGHT_INDEX_BATCH_PAGES: usize = 8;
 
 // High-precision devices emit point deltas rather than discrete wheel steps.
 // Twenty-four logical points filters incidental edge motion without delaying a
@@ -245,6 +245,38 @@ fn next_highlight_index_request(index: &HighlightIndexState) -> Option<Highlight
         first_page,
         page_count,
     })
+}
+
+/// Replaces page rows only when one response matches the exact outstanding request.
+fn apply_highlight_index_batch(
+    index: &mut HighlightIndexState,
+    batch: HighlightIndexBatch,
+) -> bool {
+    let request = HighlightIndexRequest {
+        generation: batch.generation,
+        expected_revision: batch.revision,
+        first_page: batch
+            .pages
+            .first()
+            .map_or(batch.total_pages, |page| page.page_index),
+        page_count: batch.pages.len(),
+    };
+    let current = index.in_flight == Some(request)
+        && index.generation == batch.generation
+        && index.revision == Some(batch.revision)
+        && index.total_pages == batch.total_pages;
+    if !current {
+        return false;
+    }
+
+    index.in_flight = None;
+    for page in batch.pages {
+        if index.refresh_page == Some(page.page_index) {
+            index.refresh_page = None;
+        }
+        index.pages.insert(page.page_index, page.highlights);
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4994,6 +5026,9 @@ impl DocumentTab {
         self.service = Some(DocumentService::resume(path, expected_version));
         self.state = DocumentState::Opening;
         self.invalidate_rendering();
+        // A resumed worker starts with generation zero; install the retained
+        // tab token before any cached index continuation reaches its queue.
+        self.reconnect_highlight_index();
     }
 
     fn set_zoom(&mut self, zoom: f32, mode: ZoomMode) {
@@ -5263,31 +5298,8 @@ impl DocumentTab {
     }
 
     fn receive_highlight_index_batch(&mut self, batch: HighlightIndexBatch) {
-        let request = HighlightIndexRequest {
-            generation: batch.generation,
-            expected_revision: batch.revision,
-            first_page: batch
-                .pages
-                .first()
-                .map_or(batch.total_pages, |page| page.page_index),
-            page_count: batch.pages.len(),
-        };
-        let current = self.highlight_index.in_flight == Some(request)
-            && self.highlight_index.generation == batch.generation
-            && self.highlight_index.revision == Some(batch.revision)
-            && self.highlight_index.total_pages == batch.total_pages;
-        if !current {
+        if !apply_highlight_index_batch(&mut self.highlight_index, batch) {
             return;
-        }
-
-        self.highlight_index.in_flight = None;
-        for page in batch.pages {
-            if self.highlight_index.refresh_page == Some(page.page_index) {
-                self.highlight_index.refresh_page = None;
-            }
-            self.highlight_index
-                .pages
-                .insert(page.page_index, page.highlights);
         }
         self.queue_next_highlight_index_batch();
     }
@@ -7779,5 +7791,66 @@ mod tests {
                 page_count: 1,
             }
         );
+    }
+
+    #[test]
+    fn highlight_index_replaces_repeated_pages_and_rejects_stale_batches() {
+        let request = HighlightIndexRequest {
+            generation: 3,
+            expected_revision: 7,
+            first_page: 0,
+            page_count: 1,
+        };
+        let mut state = HighlightIndexState {
+            generation: 3,
+            revision: Some(7),
+            total_pages: 2,
+            in_flight: Some(request),
+            started: true,
+            ..HighlightIndexState::default()
+        };
+        let page = crate::domain::annotation::HighlightIndexPage {
+            page_index: 0,
+            highlights: Vec::new(),
+            scan_time: Duration::ZERO,
+        };
+
+        assert!(apply_highlight_index_batch(
+            &mut state,
+            HighlightIndexBatch {
+                generation: 3,
+                revision: 7,
+                total_pages: 2,
+                pages: vec![page.clone()],
+            }
+        ));
+        assert_eq!(state.pages.len(), 1);
+
+        state.in_flight = Some(request);
+        assert!(apply_highlight_index_batch(
+            &mut state,
+            HighlightIndexBatch {
+                generation: 3,
+                revision: 7,
+                total_pages: 2,
+                pages: vec![page],
+            }
+        ));
+        assert_eq!(state.pages.len(), 1);
+
+        state.in_flight = Some(HighlightIndexRequest {
+            generation: 4,
+            ..request
+        });
+        assert!(!apply_highlight_index_batch(
+            &mut state,
+            HighlightIndexBatch {
+                generation: 3,
+                revision: 7,
+                total_pages: 2,
+                pages: Vec::new(),
+            }
+        ));
+        assert_eq!(state.pages.len(), 1);
     }
 }

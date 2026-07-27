@@ -22,6 +22,14 @@ pub(crate) enum HighlightSidebarAction {
     Delete(AnnotationSummary),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HighlightRowGesture {
+    PrimaryClick,
+    PrimaryDoubleClick,
+    EditMenu,
+    DeleteMenu,
+}
+
 /// Draws the Rust-owned outline hierarchy and returns a selected page target.
 pub(crate) fn show_outline(ui: &mut Ui, items: &[OutlineItem]) -> Option<usize> {
     show_outline_level(ui, items, Id::new("pdf-outline-root"))
@@ -97,11 +105,10 @@ pub(crate) fn show_highlights(
                     };
 
                     if row.double_clicked() {
-                        if summary.can_edit_contents || summary.can_edit_color {
-                            action = Some(HighlightSidebarAction::Edit(summary.clone()));
-                        }
+                        action =
+                            highlight_row_action(HighlightRowGesture::PrimaryDoubleClick, summary);
                     } else if row.clicked() {
-                        action = Some(HighlightSidebarAction::Jump(*page_index));
+                        action = highlight_row_action(HighlightRowGesture::PrimaryClick, summary);
                     }
                     row.context_menu(|ui| {
                         if ui
@@ -111,14 +118,14 @@ pub(crate) fn show_highlights(
                             )
                             .clicked()
                         {
-                            action = Some(HighlightSidebarAction::Edit(summary.clone()));
+                            action = highlight_row_action(HighlightRowGesture::EditMenu, summary);
                             ui.close();
                         }
                         if ui
                             .add_enabled(summary.can_delete, egui::Button::new("注釈を削除"))
                             .clicked()
                         {
-                            action = Some(HighlightSidebarAction::Delete(summary.clone()));
+                            action = highlight_row_action(HighlightRowGesture::DeleteMenu, summary);
                             ui.close();
                         }
                     });
@@ -135,36 +142,116 @@ pub(crate) fn show_highlights(
     action
 }
 
-fn comment_head(contents: &str) -> String {
-    let first_line = contents.lines().next().unwrap_or_default().trim();
-    if first_line.is_empty() {
-        "コメントなし".to_owned()
-    } else {
-        let mut characters = first_line.chars();
-        let head = characters
-            .by_ref()
-            .take(COMMENT_HEAD_CHARACTERS)
-            .collect::<String>();
-        if characters.next().is_some() {
-            format!("{head}…")
-        } else {
-            head
+/// Maps one row gesture without letting read-only rows open a mutation path.
+fn highlight_row_action(
+    gesture: HighlightRowGesture,
+    summary: &AnnotationSummary,
+) -> Option<HighlightSidebarAction> {
+    match gesture {
+        HighlightRowGesture::PrimaryClick => {
+            Some(HighlightSidebarAction::Jump(summary.id.page_index))
         }
+        HighlightRowGesture::PrimaryDoubleClick | HighlightRowGesture::EditMenu
+            if summary.can_edit_contents || summary.can_edit_color =>
+        {
+            Some(HighlightSidebarAction::Edit(summary.clone()))
+        }
+        HighlightRowGesture::DeleteMenu if summary.can_delete => {
+            Some(HighlightSidebarAction::Delete(summary.clone()))
+        }
+        HighlightRowGesture::PrimaryDoubleClick
+        | HighlightRowGesture::EditMenu
+        | HighlightRowGesture::DeleteMenu => None,
+    }
+}
+
+fn comment_head(contents: &str) -> String {
+    let first_line = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty());
+    let Some(first_line) = first_line else {
+        return "コメントなし".to_owned();
+    };
+    let mut characters = first_line.chars();
+    let head = characters
+        .by_ref()
+        .take(COMMENT_HEAD_CHARACTERS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMENT_HEAD_CHARACTERS, comment_head};
+    use super::*;
+    use crate::domain::annotation::{AnnotationId, AnnotationKind};
+
+    fn summary() -> AnnotationSummary {
+        AnnotationSummary {
+            id: AnnotationId {
+                page_index: 4,
+                xref: 17,
+            },
+            kind: AnnotationKind::Highlight,
+            contents: "comment".to_owned(),
+            color: None,
+            can_edit_contents: true,
+            can_edit_color: true,
+            can_delete: true,
+        }
+    }
 
     #[test]
     fn comment_head_uses_only_the_first_line() {
         assert_eq!(comment_head("first\nsecond"), "first");
-        assert_eq!(comment_head(" \nsecond"), "コメントなし");
+        assert_eq!(comment_head(" \nsecond"), "second");
+        assert_eq!(comment_head(" \n\t"), "コメントなし");
         assert_eq!(comment_head(""), "コメントなし");
         assert_eq!(
             comment_head(&"a".repeat(COMMENT_HEAD_CHARACTERS + 1)),
             format!("{}…", "a".repeat(COMMENT_HEAD_CHARACTERS))
+        );
+    }
+
+    #[test]
+    fn row_gestures_keep_navigation_edit_and_delete_distinct() {
+        let summary = summary();
+
+        assert_eq!(
+            highlight_row_action(HighlightRowGesture::PrimaryClick, &summary),
+            Some(HighlightSidebarAction::Jump(4))
+        );
+        assert_eq!(
+            highlight_row_action(HighlightRowGesture::PrimaryDoubleClick, &summary),
+            Some(HighlightSidebarAction::Edit(summary.clone()))
+        );
+        assert_eq!(
+            highlight_row_action(HighlightRowGesture::EditMenu, &summary),
+            Some(HighlightSidebarAction::Edit(summary.clone()))
+        );
+        assert_eq!(
+            highlight_row_action(HighlightRowGesture::DeleteMenu, &summary),
+            Some(HighlightSidebarAction::Delete(summary))
+        );
+    }
+
+    #[test]
+    fn row_gestures_disable_unsupported_edit_and_delete_actions() {
+        let mut summary = summary();
+        summary.can_edit_contents = false;
+        summary.can_edit_color = false;
+        summary.can_delete = false;
+
+        assert!(highlight_row_action(HighlightRowGesture::PrimaryDoubleClick, &summary).is_none());
+        assert!(highlight_row_action(HighlightRowGesture::EditMenu, &summary).is_none());
+        assert!(highlight_row_action(HighlightRowGesture::DeleteMenu, &summary).is_none());
+        assert_eq!(
+            highlight_row_action(HighlightRowGesture::PrimaryClick, &summary),
+            Some(HighlightSidebarAction::Jump(4))
         );
     }
 }

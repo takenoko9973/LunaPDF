@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -108,6 +109,7 @@ pub(crate) struct DocumentService {
     text_snapshot_wake_sender: Sender<()>,
     scheduled_tiles: Arc<Mutex<HashMap<WorkerTileKey, RenderPriority>>>,
     scheduled_text_snapshots: Arc<Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>>,
+    active_highlight_index_generation: Arc<AtomicU64>,
     event_receiver: Receiver<DocumentEvent>,
 }
 
@@ -192,8 +194,10 @@ impl DocumentService {
         let (event_sender, event_receiver) = bounded(BUFFERED_EVENT_CAPACITY);
         let scheduled_tiles = Arc::new(Mutex::new(HashMap::new()));
         let scheduled_text_snapshots = Arc::new(Mutex::new(HashMap::new()));
+        let active_highlight_index_generation = Arc::new(AtomicU64::new(0));
         let worker_scheduled_tiles = Arc::clone(&scheduled_tiles);
         let worker_scheduled_text_snapshots = Arc::clone(&scheduled_text_snapshots);
+        let worker_highlight_index_generation = Arc::clone(&active_highlight_index_generation);
         let worker_text_snapshot_wake_sender = text_snapshot_wake_sender.clone();
         let worker_channels = WorkerChannels {
             foreground: foreground_receiver,
@@ -213,6 +217,7 @@ impl DocumentService {
                     expected_version,
                     worker_channels,
                     worker_scheduled_tiles,
+                    worker_highlight_index_generation,
                     event_sender,
                 )
             })
@@ -227,6 +232,7 @@ impl DocumentService {
             text_snapshot_wake_sender,
             scheduled_tiles,
             scheduled_text_snapshots,
+            active_highlight_index_generation,
             event_receiver,
         }
     }
@@ -240,6 +246,13 @@ impl DocumentService {
             | DocumentCommand::LoadThumbnail(_)
             | DocumentCommand::LoadHighlightIndexBatch(_) => {
                 self.background_sender.send(command).is_ok()
+            }
+            DocumentCommand::SetHighlightIndexGeneration(generation) => {
+                // The atomic token is visible during a non-preemptible MuPDF
+                // batch, so a completed old batch is suppressed before send.
+                self.active_highlight_index_generation
+                    .store(generation, Ordering::Release);
+                self.foreground_sender.send(command).is_ok()
             }
             command => self.foreground_sender.send(command).is_ok(),
         }
@@ -338,6 +351,7 @@ fn run_worker(
     expected_version: Option<DocumentVersion>,
     channels: WorkerChannels,
     scheduled_tiles: Arc<Mutex<HashMap<WorkerTileKey, RenderPriority>>>,
+    active_highlight_index_generation: Arc<AtomicU64>,
     event_sender: Sender<DocumentEvent>,
 ) {
     let mut backend = match MuPdfBackend::open(path) {
@@ -351,8 +365,6 @@ fn run_worker(
         return;
     }
     let mut active_search_generation = 0;
-    let mut active_highlight_index_generation = 0;
-
     while let Some(command) = next_worker_command(&channels) {
         match command {
             DocumentCommand::RenderTile(request) => {
@@ -406,20 +418,26 @@ fn run_worker(
                     });
                 }
             },
-            DocumentCommand::SetHighlightIndexGeneration(generation) => {
-                active_highlight_index_generation = generation;
-            }
+            DocumentCommand::SetHighlightIndexGeneration(_) => {}
             DocumentCommand::LoadHighlightIndexBatch(request) => {
                 if !highlight_index_generation_is_current(
-                    active_highlight_index_generation,
+                    active_highlight_index_generation.load(Ordering::Acquire),
                     request.generation,
                 ) {
                     let _ = event_sender.send(DocumentEvent::HighlightIndexSkipped(request));
                     continue;
                 }
                 match backend.highlight_index_batch(request) {
-                    Ok(Some(batch)) => {
+                    Ok(Some(batch))
+                        if highlight_index_generation_is_current(
+                            active_highlight_index_generation.load(Ordering::Acquire),
+                            request.generation,
+                        ) =>
+                    {
                         let _ = event_sender.send(DocumentEvent::HighlightIndexReady(batch));
+                    }
+                    Ok(Some(_)) => {
+                        let _ = event_sender.send(DocumentEvent::HighlightIndexSkipped(request));
                     }
                     Ok(None) => {
                         let _ = event_sender.send(DocumentEvent::HighlightIndexSkipped(request));
@@ -1107,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn highlight_index_worker_skips_old_generation_then_returns_current_batch() {
+    fn highlight_index_worker_suppresses_canceled_generation_then_returns_current_batch() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("highlight-index.pdf");
         let path_text = path.to_str().unwrap();
@@ -1118,22 +1136,23 @@ mod tests {
         }
         let service = DocumentService::spawn(path);
         let deadline = Instant::now() + Duration::from_secs(5);
-        let stale = highlight_index_request(1);
+        let canceled = highlight_index_request(1);
         let current = highlight_index_request(2);
-        let mut stale_skipped = false;
+        let mut canceled_skipped = false;
 
         loop {
             match service.try_recv() {
                 Ok(DocumentEvent::Opened(_)) => {
+                    assert!(service.send(DocumentCommand::SetHighlightIndexGeneration(1)));
+                    assert!(service.send(DocumentCommand::LoadHighlightIndexBatch(canceled)));
                     assert!(service.send(DocumentCommand::SetHighlightIndexGeneration(2)));
-                    assert!(service.send(DocumentCommand::LoadHighlightIndexBatch(stale)));
                     assert!(service.send(DocumentCommand::LoadHighlightIndexBatch(current)));
                 }
-                Ok(DocumentEvent::HighlightIndexSkipped(request)) if request == stale => {
-                    stale_skipped = true;
+                Ok(DocumentEvent::HighlightIndexSkipped(request)) if request == canceled => {
+                    canceled_skipped = true;
                 }
                 Ok(DocumentEvent::HighlightIndexReady(batch)) if batch.generation == 2 => {
-                    assert!(stale_skipped);
+                    assert!(canceled_skipped);
                     assert_eq!(batch.pages.len(), 1);
                     assert_eq!(batch.pages[0].page_index, 0);
                     break;

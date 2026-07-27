@@ -2080,6 +2080,153 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "generates the explicit Highlight index performance matrix"]
+    fn measure_highlight_index_performance_matrix() {
+        let directory = tempfile::tempdir().unwrap();
+        for page_count in [100_usize, 500, 1_000] {
+            for highlights_per_page in [0_usize, 1, 10] {
+                let path = directory
+                    .path()
+                    .join(format!("index-{page_count}-{highlights_per_page}.pdf"));
+                write_highlight_index_fixture(&path, page_count, highlights_per_page);
+                for batch_size in [8_usize, 16, 32] {
+                    measure_highlight_index_case(
+                        &path,
+                        page_count,
+                        highlights_per_page,
+                        batch_size,
+                    );
+                }
+            }
+        }
+    }
+
+    fn write_highlight_index_fixture(path: &Path, page_count: usize, highlights_per_page: usize) {
+        let mut document = PdfDocument::new();
+        for page_index in 0..page_count {
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            for highlight_index in 0..highlights_per_page {
+                let y = 20.0 + highlight_index as f32 * 20.0;
+                let mut annotation = page
+                    .add_highlight_annotation(Quad::from(Rect::new(20.0, y, 120.0, y + 12.0)))
+                    .unwrap();
+                annotation
+                    .set_contents(&format!("{page_index}-{highlight_index}"))
+                    .unwrap();
+                annotation.update().unwrap();
+            }
+            page.update().unwrap();
+        }
+        document.save(path.to_str().unwrap()).unwrap();
+    }
+
+    fn measure_highlight_index_case(
+        path: &Path,
+        page_count: usize,
+        highlights_per_page: usize,
+        batch_size: usize,
+    ) {
+        let backend = MuPdfBackend::open(path.to_path_buf()).unwrap();
+        let memory_before = physical_memory_bytes();
+        let started_at = Instant::now();
+        let mut first_item_time = None;
+        let mut page_times = Vec::with_capacity(page_count);
+        let mut batch_times = Vec::new();
+        let mut batch_wait_times = Vec::new();
+        let mut previous_batch_finished = None;
+        let mut indexed_highlights = 0;
+        let mut retained_pages = Vec::with_capacity(page_count);
+
+        for first_page in (0..page_count).step_by(batch_size) {
+            if let Some(finished_at) = previous_batch_finished {
+                batch_wait_times.push(Instant::now().duration_since(finished_at));
+            }
+            let pages_in_batch = batch_size.min(page_count - first_page);
+            let batch_started_at = Instant::now();
+            let batch = backend
+                .highlight_index_batch(HighlightIndexRequest {
+                    generation: 1,
+                    expected_revision: 0,
+                    first_page,
+                    page_count: pages_in_batch,
+                })
+                .unwrap()
+                .unwrap();
+            batch_times.push(batch_started_at.elapsed());
+            for page in batch.pages {
+                indexed_highlights += page.highlights.len();
+                if first_item_time.is_none() && !page.highlights.is_empty() {
+                    first_item_time = Some(started_at.elapsed());
+                }
+                page_times.push(page.scan_time);
+                retained_pages.push(page.highlights);
+            }
+            previous_batch_finished = Some(Instant::now());
+        }
+
+        let total_time = started_at.elapsed();
+        let memory_after = physical_memory_bytes();
+        let (mean_page, median_page, p95_page) = duration_statistics(&page_times);
+        let mean_batch_wait = duration_mean(&batch_wait_times);
+        let first_batch = batch_times.first().copied().unwrap_or_default();
+        let longest_batch = batch_times.iter().copied().max().unwrap_or_default();
+        assert_eq!(indexed_highlights, page_count * highlights_per_page);
+        assert_eq!(retained_pages.len(), page_count);
+        eprintln!(
+            concat!(
+                "HIGHLIGHT_INDEX_METRIC pages={} highlights_per_page={} batch={} ",
+                "first_batch_ms={:.3} first_item_ms={} total_ms={:.3} page_mean_us={:.3} ",
+                "page_median_us={:.3} page_p95_us={:.3} batch_wait_mean_us={:.3} ",
+                "memory_before={} memory_after={} memory_delta={} longest_batch_ms={:.3}"
+            ),
+            page_count,
+            highlights_per_page,
+            batch_size,
+            first_batch.as_secs_f64() * 1_000.0,
+            first_item_time
+                .map(|duration| format!("{:.3}", duration.as_secs_f64() * 1_000.0))
+                .unwrap_or_else(|| "none".to_owned()),
+            total_time.as_secs_f64() * 1_000.0,
+            mean_page.as_secs_f64() * 1_000_000.0,
+            median_page.as_secs_f64() * 1_000_000.0,
+            p95_page.as_secs_f64() * 1_000_000.0,
+            mean_batch_wait.as_secs_f64() * 1_000_000.0,
+            memory_before
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned()),
+            memory_after
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned()),
+            memory_delta(memory_before, memory_after)
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned()),
+            longest_batch.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    fn duration_statistics(durations: &[Duration]) -> (Duration, Duration, Duration) {
+        let mut sorted = durations.to_vec();
+        sorted.sort_unstable();
+        let median = sorted[sorted.len() / 2];
+        let p95_index = (sorted.len() * 95).div_ceil(100).saturating_sub(1);
+        (duration_mean(&sorted), median, sorted[p95_index])
+    }
+
+    fn duration_mean(durations: &[Duration]) -> Duration {
+        if durations.is_empty() {
+            return Duration::ZERO;
+        }
+        let total_seconds = durations.iter().map(Duration::as_secs_f64).sum::<f64>();
+        Duration::from_secs_f64(total_seconds / durations.len() as f64)
+    }
+
+    fn memory_delta(before: Option<usize>, after: Option<usize>) -> Option<i128> {
+        let before = i128::try_from(before?).ok()?;
+        let after = i128::try_from(after?).ok()?;
+        Some(after - before)
+    }
+
+    #[test]
     fn annotation_flags_limit_only_the_supported_edits() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("locked-highlights.pdf");
