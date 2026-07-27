@@ -1,6 +1,6 @@
 use eframe::egui::{
-    self, Button, Color32, Id, Order, Popup, Pos2, Rect, Response, RichText, ScrollArea,
-    SetOpenCommand, Vec2,
+    self, Button, Color32, Id, Order, Popup, Pos2, Rect, Response, ScrollArea, Sense,
+    SetOpenCommand, Stroke, StrokeKind, Vec2,
 };
 
 use crate::domain::annotation::{
@@ -16,11 +16,12 @@ const OVERLAY_MARGIN: f32 = 12.0;
 // Candidate labels show enough of a comment to distinguish ordinary notes
 // without allowing a long external Contents value to dominate the menu width.
 const ANNOTATION_LABEL_COMMENT_CHARS: usize = 24;
+const COLOR_SWATCH_SIZE: f32 = 18.0;
 
 // These explicit RGB values form the editable UI palette; they are never used
 // as inferred replacements when an existing PDF color cannot be read.
 const COLOR_PRESETS: [(&str, [u8; 3]); 5] = [
-    ("黄色", [255, 235, 59]),
+    ("黄色", [255, 255, 0]),
     ("緑色", [76, 175, 80]),
     ("青色", [66, 133, 244]),
     ("赤色", [239, 83, 80]),
@@ -31,6 +32,7 @@ const COLOR_PRESETS: [(&str, [u8; 3]); 5] = [
 pub(crate) struct AnnotationMenuCandidate {
     pub(crate) id: AnnotationId,
     pub(crate) label: String,
+    pub(crate) color: Option<PdfAnnotationColor>,
     pub(crate) can_edit: bool,
     pub(crate) can_delete: bool,
 }
@@ -160,9 +162,21 @@ pub(crate) fn annotation_menu_candidates(
         .map(|annotation| AnnotationMenuCandidate {
             id: annotation.id,
             label: annotation_candidate_label(annotation),
+            color: annotation.color,
             can_edit: annotation.can_edit_contents || annotation.can_edit_color,
             can_delete: annotation.can_delete,
         })
+        .collect()
+}
+
+/// Returns non-empty stored comments without substituting selected page text.
+pub(crate) fn annotation_hover_comments<'a>(
+    annotations: &[&'a AnnotationSnapshot],
+) -> Vec<&'a str> {
+    annotations
+        .iter()
+        .map(|annotation| annotation.contents.as_str())
+        .filter(|contents| !contents.trim().is_empty())
         .collect()
 }
 
@@ -247,8 +261,7 @@ fn candidate_action_menu(
             ui.add_enabled_ui(candidates.iter().any(&enabled), |ui| {
                 ui.menu_button(label, |ui| {
                     for candidate in candidates {
-                        if ui
-                            .add_enabled(enabled(candidate), Button::new(&candidate.label))
+                        if show_annotation_candidate_button(ui, candidate, enabled(candidate))
                             .clicked()
                         {
                             *action = Some(operation(candidate.id));
@@ -259,6 +272,22 @@ fn candidate_action_menu(
             });
         }
     }
+}
+
+/// Draws one annotation candidate using a swatch plus ordinary foreground text.
+pub(crate) fn show_annotation_candidate_button(
+    ui: &mut egui::Ui,
+    candidate: &AnnotationMenuCandidate,
+    enabled: bool,
+) -> Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            color_swatch(ui, candidate.color, COLOR_SWATCH_SIZE);
+            ui.add(Button::new(&candidate.label).frame(false))
+        })
+        .inner
+    })
+    .inner
 }
 
 /// Computes the right-edge overlay rectangle without participating in panel layout.
@@ -382,43 +411,52 @@ pub(crate) fn annotation_comment_id(document_id: u64, annotation_id: AnnotationI
 
 fn color_menu(ui: &mut egui::Ui, state: &mut AnnotationEditorState) {
     let label = color_label(state.buffer.color);
-    let label_color = color_preview(state.buffer.color).unwrap_or(Color32::GRAY);
     ui.add_enabled_ui(
         state.can_edit_color && !state.stale && !state.mutation_in_flight,
         |ui| {
-            ui.menu_button(
-                RichText::new(format!("● {label}")).color(label_color),
-                |ui| {
+            ui.horizontal(|ui| {
+                color_swatch(ui, state.buffer.color, COLOR_SWATCH_SIZE);
+                ui.menu_button(label, |ui| {
                     for (name, rgb) in COLOR_PRESETS {
-                        let preview = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                        if ui
-                            .button(RichText::new(format!("● {name}")).color(preview))
-                            .clicked()
-                        {
+                        let color = rgb_color(rgb);
+                        let selected = state.buffer.color == Some(color);
+                        let row_label = if selected {
+                            format!("✓ {name}")
+                        } else {
+                            name.to_owned()
+                        };
+                        let clicked = ui
+                            .horizontal(|ui| {
+                                color_swatch(ui, Some(color), COLOR_SWATCH_SIZE);
+                                ui.selectable_label(selected, row_label)
+                            })
+                            .inner
+                            .clicked();
+                        if clicked {
                             state.buffer.color = Some(rgb_color(rgb));
                             ui.close();
                         }
                     }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("任意の色を選択…");
-                        let mut rgb = color_preview(state.buffer.color)
-                            .map(|color| [color.r(), color.g(), color.b()])
-                            .unwrap_or(COLOR_PRESETS[0].1);
-                        // The fallback only seeds the picker display. It becomes PDF
-                        // data solely after an explicit user change, never on open.
-                        if ui.color_edit_button_srgb(&mut rgb).changed() {
-                            state.buffer.color = Some(rgb_color(rgb));
-                        }
-                    });
-                },
-            );
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("任意の色を選択…");
+                let mut rgb = color_preview(state.buffer.color)
+                    .map(|color| [color.r(), color.g(), color.b()])
+                    .unwrap_or(COLOR_PRESETS[0].1);
+                // The picker stays in the persistent editor Area. Nesting its
+                // popup inside the preset menu closes the parent menu on the
+                // activation click, so later drag events never reach the picker.
+                // The fallback seeds only the control and is stored after change.
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    state.buffer.color = Some(rgb_color(rgb));
+                }
+            });
         },
     );
 }
 
 fn annotation_candidate_label(annotation: &AnnotationSnapshot) -> String {
-    let color = color_label(annotation.color);
     let first_line = annotation
         .contents
         .lines()
@@ -435,7 +473,7 @@ fn annotation_candidate_label(annotation: &AnnotationSnapshot) -> String {
     if comment.is_empty() {
         comment = "コメントなし".to_owned();
     }
-    format!("{color}・{comment}・ID {}", annotation.id.xref)
+    format!("{comment}・ID {}", annotation.id.xref)
 }
 
 fn color_label(color: Option<PdfAnnotationColor>) -> String {
@@ -467,6 +505,30 @@ fn color_label(color: Option<PdfAnnotationColor>) -> String {
             key * 100.0
         ),
     }
+}
+
+/// Paints an annotation color without using that color for explanatory text.
+pub(crate) fn color_swatch(
+    ui: &mut egui::Ui,
+    color: Option<PdfAnnotationColor>,
+    size: f32,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let border = Stroke::new(1.0, ui.visuals().widgets.noninteractive.fg_stroke.color);
+    let fill = color_preview(color).unwrap_or(ui.visuals().extreme_bg_color);
+    ui.painter()
+        .rect(rect, 2.0, fill, border, StrokeKind::Inside);
+    if color.is_none() {
+        // A diagonal mark distinguishes an unreadable PDF color from a valid
+        // gray swatch without inventing a replacement color.
+        ui.painter()
+            .line_segment([rect.left_bottom(), rect.right_top()], border);
+    }
+    response
 }
 
 fn color_preview(color: Option<PdfAnnotationColor>) -> Option<Color32> {
@@ -531,19 +593,22 @@ mod tests {
     }
 
     #[test]
-    fn candidate_label_uses_comment_head_and_stable_id() {
+    fn candidate_label_uses_comment_head_and_stable_id_without_color_text() {
         let annotation = annotation(
             "最初の行\n表示しない行",
             Some(PdfAnnotationColor::Rgb {
                 red: 1.0,
-                green: 235.0 / 255.0,
-                blue: 59.0 / 255.0,
+                green: 1.0,
+                blue: 0.0,
             }),
         );
 
         let rows = annotation_menu_candidates(&[&annotation]);
 
-        assert_eq!(rows[0].label, "黄色・最初の行・ID 41");
+        assert_eq!(rows[0].label, "最初の行・ID 41");
+        assert_eq!(rows[0].color, annotation.color);
+        assert!(!rows[0].label.contains('#'));
+        assert!(!rows[0].label.contains("黄色"));
     }
 
     #[test]
@@ -611,5 +676,38 @@ mod tests {
             editor.update_request().unwrap().color,
             Some(rgb_color(arbitrary))
         );
+    }
+
+    #[test]
+    fn yellow_preset_matches_the_backend_default_without_rewriting_legacy_yellow() {
+        let legacy_yellow = PdfAnnotationColor::Rgb {
+            red: 1.0,
+            green: 235.0 / 255.0,
+            blue: 59.0 / 255.0,
+        };
+        let annotation = annotation("", Some(legacy_yellow));
+        let editor = AnnotationEditorState::from_snapshot(7, 3, &annotation);
+
+        assert_eq!(
+            rgb_color(COLOR_PRESETS[0].1),
+            PdfAnnotationColor::Rgb {
+                red: 1.0,
+                green: 1.0,
+                blue: 0.0,
+            }
+        );
+        assert_eq!(editor.buffer.color, Some(legacy_yellow));
+        assert!(!editor.is_dirty());
+    }
+
+    #[test]
+    fn hover_comments_keep_all_nonempty_stored_comments_in_annotation_order() {
+        let first = annotation("最初\n続き", None);
+        let empty = annotation(" \n\t", None);
+        let third = annotation("三番目", None);
+
+        let comments = annotation_hover_comments(&[&first, &empty, &third]);
+
+        assert_eq!(comments, vec!["最初\n続き", "三番目"]);
     }
 }

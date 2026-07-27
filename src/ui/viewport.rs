@@ -12,8 +12,8 @@ use crate::domain::selection::{
     selection_contains_point, snap_to_glyph,
 };
 use crate::ui::annotation_editor::{
-    AnnotationContextTarget, AnnotationUiAction, annotation_menu_candidates,
-    show_annotation_context_menu,
+    AnnotationContextTarget, AnnotationUiAction, annotation_hover_comments,
+    annotation_menu_candidates, show_annotation_context_menu,
 };
 
 #[derive(Default)]
@@ -41,6 +41,7 @@ pub(crate) struct PageInteractionInput<'a> {
     pub(crate) selection: Option<&'a SelectionSnapshot>,
     pub(crate) annotation_page: Option<&'a AnnotationPageSnapshot>,
     pub(crate) can_create_highlight: bool,
+    pub(crate) suppress_annotation_hover: bool,
 }
 
 impl PageViewport {
@@ -110,6 +111,7 @@ impl PageViewport {
             selection,
             annotation_page,
             can_create_highlight,
+            suppress_annotation_hover,
         } = input;
         let response = ui.interact(
             screen_rect,
@@ -255,6 +257,28 @@ impl PageViewport {
         {
             interaction.annotation_action = Some(action);
         }
+        let context_menu_open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&response));
+        if annotation_hover_is_allowed(
+            suppress_annotation_hover,
+            self.drag_active,
+            context_menu_open,
+        )
+            && let Some(point) = pointer_page_point
+            && let Some(page) = annotation_page
+        {
+            let hits = annotations_at_point(&page.annotations, point);
+            let comments = annotation_hover_comments(&hits);
+            if !comments.is_empty() {
+                response.clone().on_hover_ui_at_pointer(|ui| {
+                    for (index, comment) in comments.iter().enumerate() {
+                        if index > 0 {
+                            ui.separator();
+                        }
+                        ui.label(*comment);
+                    }
+                });
+            }
+        }
         interaction
     }
 
@@ -285,6 +309,16 @@ impl PageViewport {
             );
         }
     }
+}
+
+fn annotation_hover_is_allowed(
+    externally_suppressed: bool,
+    selection_drag_active: bool,
+    context_menu_open: bool,
+) -> bool {
+    // Tooltip creation is disabled while another pointer-owned annotation or
+    // document interaction is active, so it cannot compete for the same hit.
+    !externally_suppressed && !selection_drag_active && !context_menu_open
 }
 
 fn selection_drag_exceeds_threshold(origin: Pos2, current: Pos2, threshold: f32) -> bool {
@@ -452,6 +486,7 @@ mod tests {
                         selection: None,
                         annotation_page: None,
                         can_create_highlight: false,
+                        suppress_annotation_hover: false,
                     },
                 )
                 .completed_drag;
@@ -532,6 +567,7 @@ mod tests {
                     selection: None,
                     annotation_page: Some(page),
                     can_create_highlight: true,
+                    suppress_annotation_hover: false,
                 },
             );
         });
@@ -548,6 +584,14 @@ mod tests {
 
         assert!((actual.x - expected.x).abs() < 0.001);
         assert!((actual.y - expected.y).abs() < 0.001);
+    }
+
+    #[test]
+    fn annotation_hover_is_suppressed_by_every_competing_interaction() {
+        assert!(annotation_hover_is_allowed(false, false, false));
+        assert!(!annotation_hover_is_allowed(true, false, false));
+        assert!(!annotation_hover_is_allowed(false, true, false));
+        assert!(!annotation_hover_is_allowed(false, false, true));
     }
 
     #[test]
@@ -910,6 +954,7 @@ mod tests {
                         selection: Some(&selection),
                         annotation_page: None,
                         can_create_highlight: true,
+                        suppress_annotation_hover: false,
                     },
                 );
                 assert!(interaction.completed_drag.is_none());

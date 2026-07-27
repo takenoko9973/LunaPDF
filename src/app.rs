@@ -34,7 +34,8 @@ use crate::render::layout::{ContinuousLayout, PAGE_GAP, PageAnchor};
 use crate::render::tiles::TileGrid;
 use crate::ui::annotation_editor::{
     AnnotationEditorAction, AnnotationEditorState, AnnotationMenuCandidate, AnnotationUiAction,
-    annotation_comment_id, annotation_overlay_rect, show_annotation_editor,
+    annotation_comment_id, annotation_overlay_rect, show_annotation_candidate_button,
+    show_annotation_editor,
 };
 use crate::ui::fonts::install_cjk_fallback;
 use crate::ui::icons::{ToolbarIcon, icon_button};
@@ -3375,7 +3376,8 @@ impl PrototypeApp {
             .show(context, |ui| {
                 ui.label("同じ位置に複数の注釈があります。");
                 for candidate in &candidates {
-                    if ui.button(&candidate.label).clicked() {
+                    if show_annotation_candidate_button(ui, candidate, candidate.can_edit).clicked()
+                    {
                         selected = Some(candidate.id);
                     }
                 }
@@ -3470,6 +3472,16 @@ impl PrototypeApp {
     }
 
     fn continuous_view(&mut self, ui: &mut egui::Ui, index: usize) {
+        let document_id = self.documents[index].document_id;
+        let suppress_annotation_hover = self.documents[index].view.autoscroll.is_some()
+            || self
+                .annotation_editor
+                .as_ref()
+                .is_some_and(|editor| editor.document_id == document_id)
+            || self
+                .annotation_picker
+                .as_ref()
+                .is_some_and(|picker| picker.document_id == document_id);
         let pixels_per_point = ui.ctx().pixels_per_point();
         let viewport_size = ui.available_size();
         let viewport = &mut self.viewport;
@@ -3589,6 +3601,7 @@ impl PrototypeApp {
                                 selection: tab.selection.as_ref(),
                                 annotation_page: tab.annotation_pages.get(&annotation_key),
                                 can_create_highlight,
+                                suppress_annotation_hover,
                             },
                         )
                     })
@@ -3628,6 +3641,15 @@ impl PrototypeApp {
 
     fn single_page_view(&mut self, ui: &mut egui::Ui, index: usize) {
         let document_id = self.documents[index].document_id;
+        let suppress_annotation_hover = self.documents[index].view.autoscroll.is_some()
+            || self
+                .annotation_editor
+                .as_ref()
+                .is_some_and(|editor| editor.document_id == document_id)
+            || self
+                .annotation_picker
+                .as_ref()
+                .is_some_and(|picker| picker.document_id == document_id);
         let editor_input_rect = self
             .annotation_editor
             .as_ref()
@@ -3727,6 +3749,7 @@ impl PrototypeApp {
                             selection: tab.selection.as_ref(),
                             annotation_page: tab.annotation_pages.get(&annotation_key),
                             can_create_highlight,
+                            suppress_annotation_hover,
                         },
                     )
                 })
