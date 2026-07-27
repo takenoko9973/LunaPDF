@@ -94,13 +94,28 @@ pub(crate) struct TextSnapshotRequest {
     pub(crate) expected_revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Identifies why a non-text page region owns pointer interaction.
+pub(crate) enum NonTextTargetKind {
+    Image,
+    Link,
+    Form,
+}
+
+#[derive(Clone, Copy, Debug)]
+/// Preserves non-text hit geometry and its cursor-relevant PDF role.
+pub(crate) struct NonTextTarget {
+    pub(crate) kind: NonTextTargetKind,
+    pub(crate) quad: PageQuad,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TextPageSnapshot {
     pub(crate) page_index: usize,
     pub(crate) revision: u64,
     pub(crate) glyphs: Vec<GlyphSnapshot>,
     /// Page elements that own pointer interaction independently of text selection.
-    pub(crate) non_text_targets: Vec<PageQuad>,
+    pub(crate) non_text_targets: Vec<NonTextTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

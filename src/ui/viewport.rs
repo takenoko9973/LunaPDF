@@ -9,8 +9,9 @@ use crate::domain::annotation::{
 };
 use crate::domain::document::{PageRect, RenderedTile, SearchMatch};
 use crate::domain::selection::{
-    PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, selected_display_quads,
-    selection_contains_point, snap_to_glyph, snap_to_glyph_with_max_distance,
+    NonTextTargetKind, PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot,
+    selected_display_quads, selection_contains_point, snap_to_glyph,
+    snap_to_glyph_with_max_distance,
 };
 use crate::ui::annotation_editor::{
     AnnotationContextTarget, AnnotationUiAction, annotation_hover_comments,
@@ -37,6 +38,17 @@ pub(crate) struct PageInteraction {
     pub(crate) annotation_action: Option<AnnotationUiAction>,
     pub(crate) pan_delta: Option<Vec2>,
     pub(crate) clear_selection: bool,
+    pub(crate) cursor_target: Option<PageCursorTarget>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PageCursorTarget {
+    Text,
+    Link,
+    Annotation,
+    OtherInteractive,
+    Blank,
+    Background,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,7 +80,51 @@ impl BlankPanState {
 enum PagePressKind {
     Text(PagePoint),
     Blank,
-    Blocked,
+    Selection,
+    Link,
+    Annotation,
+    OtherInteractive,
+    Unavailable,
+}
+
+impl PagePressKind {
+    fn cursor_target(self) -> PageCursorTarget {
+        match self {
+            Self::Text(_) | Self::Selection => PageCursorTarget::Text,
+            Self::Link => PageCursorTarget::Link,
+            Self::Annotation => PageCursorTarget::Annotation,
+            Self::OtherInteractive | Self::Unavailable => PageCursorTarget::OtherInteractive,
+            Self::Blank => PageCursorTarget::Blank,
+        }
+    }
+}
+
+/// Returns the cursor for one PDF frame without mutating the interaction state.
+pub(crate) fn pdf_cursor_icon(
+    target: Option<PageCursorTarget>,
+    autoscroll_active: bool,
+    blank_pan_active: bool,
+) -> CursorIcon {
+    // Hit-owned cursors precede navigation states so text, links, annotations,
+    // forms, and images cannot inherit a movement cursor from the page behind.
+    match target {
+        Some(PageCursorTarget::Text) => return CursorIcon::Text,
+        Some(PageCursorTarget::Link) => return CursorIcon::PointingHand,
+        Some(PageCursorTarget::Annotation | PageCursorTarget::OtherInteractive) => {
+            return CursorIcon::Default;
+        }
+        Some(PageCursorTarget::Blank | PageCursorTarget::Background) | None => {}
+    }
+
+    if autoscroll_active {
+        CursorIcon::AllScroll
+    } else if blank_pan_active {
+        CursorIcon::Grabbing
+    } else if target.is_some() {
+        CursorIcon::Grab
+    } else {
+        CursorIcon::Default
+    }
 }
 
 pub(crate) struct PageInteractionInput<'a> {
@@ -274,11 +330,21 @@ impl PageViewport {
                     PrimaryPressSource::Page(page_index),
                     origin,
                 )),
-                PagePressKind::Text(_) | PagePressKind::Blocked => None,
+                PagePressKind::Text(_)
+                | PagePressKind::Selection
+                | PagePressKind::Link
+                | PagePressKind::Annotation
+                | PagePressKind::OtherInteractive
+                | PagePressKind::Unavailable => None,
             };
             self.drag_start = match press_kind {
                 PagePressKind::Text(start) => Some(start),
-                PagePressKind::Blank | PagePressKind::Blocked => None,
+                PagePressKind::Blank
+                | PagePressKind::Selection
+                | PagePressKind::Link
+                | PagePressKind::Annotation
+                | PagePressKind::OtherInteractive
+                | PagePressKind::Unavailable => None,
             };
             self.drag_page = self.drag_start.map(|_| page_index);
             self.drag_current = self.drag_start;
@@ -321,16 +387,9 @@ impl PageViewport {
                     .zip(self.drag_current)
                     .map(|(start, end)| (page_index, start, end))
             });
-            self.drag_page = None;
-            self.drag_start = None;
-            self.drag_current = None;
-            self.drag_origin_screen = None;
-            self.primary_press = None;
-            self.blank_pan = None;
             interaction.clear_selection =
                 self.clear_selection_on_click && !self.drag_active && !pan_was_active;
-            self.clear_selection_on_click = false;
-            self.drag_active = false;
+            self.cancel_primary_interaction();
             interaction.completed_drag = completed.flatten();
         }
         if self.context_page == Some(page_index)
@@ -365,12 +424,7 @@ impl PageViewport {
                 });
             }
         }
-        if self
-            .blank_pan
-            .is_some_and(|pan| pan.source == PrimaryPressSource::Page(page_index) && pan.active)
-        {
-            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-        } else if pointer_page_point.is_some_and(|point| {
+        interaction.cursor_target = pointer_page_point.map(|point| {
             let logical_tolerance = ui
                 .ctx()
                 .options(|options| options.input_options.max_click_dist);
@@ -383,10 +437,9 @@ impl PageViewport {
                 text_snapshot,
                 selection,
                 annotation_page,
-            ) == PagePressKind::Blank
-        }) {
-            ui.ctx().set_cursor_icon(CursorIcon::Grab);
-        }
+            )
+            .cursor_target()
+        });
         interaction
     }
 
@@ -438,25 +491,40 @@ impl PageViewport {
         if primary_released && self.primary_press == Some(PrimaryPressSource::Background) {
             let pan_was_active = self.blank_pan.is_some_and(|pan| pan.active);
             interaction.clear_selection = self.clear_selection_on_click && !pan_was_active;
-            self.primary_press = None;
-            self.clear_selection_on_click = false;
-            self.blank_pan = None;
+            self.cancel_primary_interaction();
         }
 
-        if self
-            .blank_pan
-            .is_some_and(|pan| pan.source == PrimaryPressSource::Background && pan.active)
-        {
-            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-        } else if pointer_position.is_some_and(|position| {
+        if pointer_position.is_some_and(|position| {
             view_rect.contains(position)
                 && page_rects.iter().all(|rect| !rect.contains(position))
                 && excluded_rects.iter().all(|rect| !rect.contains(position))
                 && ui.ctx().layer_id_at(position) == Some(ui.layer_id())
         }) {
-            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+            interaction.cursor_target = Some(PageCursorTarget::Background);
         }
         interaction
+    }
+
+    /// Reports whether the shared viewport currently owns a primary-button gesture.
+    pub(crate) fn primary_interaction_in_progress(&self) -> bool {
+        self.primary_press.is_some()
+    }
+
+    /// Reports whether blank-page panning has crossed the drag threshold.
+    pub(crate) fn blank_pan_in_progress(&self) -> bool {
+        self.blank_pan.is_some_and(|pan| pan.active)
+    }
+
+    /// Cancels page-owned primary input without changing selection or scroll position.
+    pub(crate) fn cancel_primary_interaction(&mut self) {
+        self.drag_page = None;
+        self.drag_start = None;
+        self.drag_current = None;
+        self.drag_origin_screen = None;
+        self.drag_active = false;
+        self.primary_press = None;
+        self.clear_selection_on_click = false;
+        self.blank_pan = None;
     }
 
     fn paint_drag_preview(
@@ -507,10 +575,10 @@ fn classify_page_press(
     annotation_page: Option<&AnnotationPageSnapshot>,
 ) -> PagePressKind {
     if selection.is_some_and(|selection| selection_contains_point(selection, page_index, point)) {
-        return PagePressKind::Blocked;
+        return PagePressKind::Selection;
     }
     let Some(text_snapshot) = text_snapshot else {
-        return PagePressKind::Blocked;
+        return PagePressKind::Unavailable;
     };
     if let Some(glyph) =
         snap_to_glyph_with_max_distance(&text_snapshot.glyphs, point, glyph_tolerance)
@@ -521,17 +589,27 @@ fn classify_page_press(
         // Until annotation metadata arrives, treating non-text page space as
         // occupied avoids panning through a Highlight the worker has not
         // described yet. Glyph selection remains available above.
-        return PagePressKind::Blocked;
+        return PagePressKind::Unavailable;
     };
     let annotation_hit = !annotations_at_point(&annotation_page.annotations, point).is_empty();
-    let non_text_hit = text_snapshot
+    if annotation_hit {
+        return PagePressKind::Annotation;
+    }
+    let link_hit = text_snapshot
         .non_text_targets
         .iter()
-        .any(|target| target.contains(point));
-    // Annotation, link, form, and image geometry owns its pointer region even
-    // though only some of those targets currently have a left-click action.
-    if annotation_hit || non_text_hit {
-        PagePressKind::Blocked
+        .any(|target| target.kind == NonTextTargetKind::Link && target.quad.contains(point));
+    if link_hit {
+        return PagePressKind::Link;
+    }
+    let independent_hit = text_snapshot
+        .non_text_targets
+        .iter()
+        .any(|target| target.quad.contains(point));
+    // Forms and images still own their pointer region even though this viewer
+    // does not currently expose a dedicated left-click action for every type.
+    if independent_hit {
+        PagePressKind::OtherInteractive
     } else {
         PagePressKind::Blank
     }
@@ -650,7 +728,7 @@ mod tests {
         AnnotationId, AnnotationKind, AnnotationPageSnapshot, AnnotationSnapshot,
     };
     use crate::domain::document::TileSpec;
-    use crate::domain::selection::GlyphSnapshot;
+    use crate::domain::selection::{GlyphSnapshot, NonTextTarget};
 
     fn bounds() -> PageRect {
         PageRect {
@@ -980,11 +1058,14 @@ mod tests {
             PagePressKind::Blank
         );
 
-        text.non_text_targets.push(PageQuad {
-            upper_left: PagePoint::new(60.0, 60.0),
-            upper_right: PagePoint::new(90.0, 60.0),
-            lower_left: PagePoint::new(60.0, 90.0),
-            lower_right: PagePoint::new(90.0, 90.0),
+        text.non_text_targets.push(NonTextTarget {
+            kind: NonTextTargetKind::Image,
+            quad: PageQuad {
+                upper_left: PagePoint::new(60.0, 60.0),
+                upper_right: PagePoint::new(90.0, 60.0),
+                lower_left: PagePoint::new(60.0, 90.0),
+                lower_right: PagePoint::new(90.0, 90.0),
+            },
         });
         assert_eq!(
             classify_page_press(
@@ -995,11 +1076,32 @@ mod tests {
                 None,
                 Some(&annotations),
             ),
-            PagePressKind::Blocked
+            PagePressKind::OtherInteractive
         );
 
         let mut no_glyphs = text.clone();
         no_glyphs.glyphs.clear();
+        no_glyphs.non_text_targets.clear();
+        no_glyphs.non_text_targets.push(NonTextTarget {
+            kind: NonTextTargetKind::Link,
+            quad: PageQuad {
+                upper_left: PagePoint::new(60.0, 60.0),
+                upper_right: PagePoint::new(90.0, 60.0),
+                lower_left: PagePoint::new(60.0, 90.0),
+                lower_right: PagePoint::new(90.0, 90.0),
+            },
+        });
+        assert_eq!(
+            classify_page_press(
+                0,
+                PagePoint::new(80.0, 80.0),
+                6.0,
+                Some(&no_glyphs),
+                None,
+                Some(&annotations),
+            ),
+            PagePressKind::Link
+        );
         no_glyphs.non_text_targets.clear();
         let highlight = annotation_page(&[17]);
         assert_eq!(
@@ -1011,7 +1113,7 @@ mod tests {
                 None,
                 Some(&highlight),
             ),
-            PagePressKind::Blocked
+            PagePressKind::Annotation
         );
 
         let selection = SelectionSnapshot {
@@ -1036,8 +1138,95 @@ mod tests {
                 Some(&selection),
                 Some(&annotations),
             ),
-            PagePressKind::Blocked
+            PagePressKind::Selection
         );
+    }
+
+    #[test]
+    fn cursor_priority_preserves_hit_owned_affordances() {
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Text), true, true),
+            CursorIcon::Text
+        );
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Link), true, true),
+            CursorIcon::PointingHand
+        );
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Annotation), true, true),
+            CursorIcon::Default
+        );
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::OtherInteractive), true, true),
+            CursorIcon::Default
+        );
+    }
+
+    #[test]
+    fn cursor_transitions_cover_blank_pan_and_autoscroll() {
+        for target in [PageCursorTarget::Blank, PageCursorTarget::Background] {
+            assert_eq!(
+                pdf_cursor_icon(Some(target), false, false),
+                CursorIcon::Grab
+            );
+            assert_eq!(
+                pdf_cursor_icon(Some(target), false, true),
+                CursorIcon::Grabbing
+            );
+            assert_eq!(
+                pdf_cursor_icon(Some(target), true, false),
+                CursorIcon::AllScroll
+            );
+            assert_ne!(
+                pdf_cursor_icon(Some(target), false, false),
+                CursorIcon::AllScroll
+            );
+        }
+        assert_eq!(pdf_cursor_icon(None, false, false), CursorIcon::Default);
+    }
+
+    #[test]
+    fn selection_target_never_uses_blank_pan_cursor() {
+        let selection = selected_glyph();
+        let target = classify_page_press(
+            0,
+            PagePoint::new(10.0, 10.0),
+            6.0,
+            Some(&text_snapshot()),
+            Some(&selection),
+            Some(&annotation_page(&[])),
+        )
+        .cursor_target();
+
+        assert_eq!(target, PageCursorTarget::Text);
+        assert_eq!(pdf_cursor_icon(Some(target), false, true), CursorIcon::Text);
+    }
+
+    #[test]
+    fn cancelling_primary_interaction_removes_pan_and_selection_drag_state() {
+        let mut viewport = PageViewport {
+            drag_page: Some(0),
+            drag_start: Some(PagePoint::new(1.0, 2.0)),
+            drag_current: Some(PagePoint::new(3.0, 4.0)),
+            drag_origin_screen: Some(Pos2::new(10.0, 20.0)),
+            drag_active: true,
+            primary_press: Some(PrimaryPressSource::Page(0)),
+            clear_selection_on_click: true,
+            blank_pan: Some(BlankPanState {
+                source: PrimaryPressSource::Page(0),
+                origin: Pos2::new(10.0, 20.0),
+                last_position: Pos2::new(30.0, 40.0),
+                active: true,
+            }),
+            ..Default::default()
+        };
+
+        viewport.cancel_primary_interaction();
+
+        assert!(!viewport.primary_interaction_in_progress());
+        assert!(!viewport.blank_pan_in_progress());
+        assert_eq!(viewport.drag_page, None);
+        assert!(!viewport.drag_active);
     }
 
     #[test]
@@ -1049,8 +1238,16 @@ mod tests {
             None
         );
         assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Blank), false, pan.active),
+            CursorIcon::Grab
+        );
+        assert_eq!(
             update_blank_pan(&mut pan, Pos2::new(110.0, 108.0), 6.0),
             Some(Vec2::new(10.0, 8.0))
+        );
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Blank), false, pan.active),
+            CursorIcon::Grabbing
         );
         assert_eq!(
             update_blank_pan(&mut pan, Pos2::new(106.0, 115.0), 6.0),
@@ -1077,6 +1274,15 @@ mod tests {
             &selection,
         );
         assert!(click.clear_selection);
+        assert_eq!(click.cursor_target, Some(PageCursorTarget::Blank));
+        assert_eq!(
+            pdf_cursor_icon(
+                click.cursor_target,
+                false,
+                click_viewport.blank_pan_in_progress()
+            ),
+            CursorIcon::Grab
+        );
 
         let pan_context = egui::Context::default();
         let mut pan_viewport = PageViewport::default();
@@ -1123,11 +1329,20 @@ mod tests {
 
         let context = egui::Context::default();
         let mut viewport = PageViewport::default();
-        background_frame(
+        let pressed = background_frame(
             &context,
             &mut viewport,
             vec![primary_button_event(background, true)],
             true,
+        );
+        assert_eq!(pressed.cursor_target, Some(PageCursorTarget::Background));
+        assert_eq!(
+            pdf_cursor_icon(
+                pressed.cursor_target,
+                false,
+                viewport.blank_pan_in_progress()
+            ),
+            CursorIcon::Grab
         );
         let drag = background_frame(
             &context,
@@ -1136,6 +1351,10 @@ mod tests {
             true,
         );
         assert_eq!(drag.pan_delta, Some(Vec2::new(-20.0, -30.0)));
+        assert_eq!(
+            pdf_cursor_icon(drag.cursor_target, false, viewport.blank_pan_in_progress()),
+            CursorIcon::Grabbing
+        );
     }
 
     #[test]

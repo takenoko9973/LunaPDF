@@ -38,8 +38,8 @@ use crate::domain::document::{
     ThumbnailRequest, TileRequest, TileSpec,
 };
 use crate::domain::selection::{
-    GlyphSnapshot, PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
-    selected_display_quads, selected_quads, selected_text,
+    GlyphSnapshot, NonTextTarget, NonTextTargetKind, PagePoint, PageQuad, SelectionSnapshot,
+    TextPageSnapshot, TextSnapshotRequest, selected_display_quads, selected_quads, selected_text,
 };
 
 // PDF numeric objects can round coordinates while serializing an incremental
@@ -1370,7 +1370,7 @@ fn load_text_snapshot(
     document: &PdfDocument,
     page_index: usize,
     page_count: usize,
-) -> Result<(TextPage, Vec<GlyphSnapshot>, Vec<PageQuad>, Duration)> {
+) -> Result<(TextPage, Vec<GlyphSnapshot>, Vec<NonTextTarget>, Duration)> {
     let page = document.load_pdf_page(page_number(page_index, page_count)?)?;
     let extraction_started = Instant::now();
     // Empty flags record MuPDF's standard extraction baseline. Typst-specific
@@ -1394,19 +1394,26 @@ fn load_text_snapshot(
                 }
             }
             TextBlockContent::Image { .. } => {
-                non_text_targets.push(page_quad_from_mupdf(&Quad::from(block.bounds)));
+                non_text_targets.push(NonTextTarget {
+                    kind: NonTextTargetKind::Image,
+                    quad: page_quad_from_mupdf(&Quad::from(block.bounds)),
+                });
             }
             TextBlockContent::Other => {}
         }
     }
 
     for link in page.resolved_links()? {
-        non_text_targets.push(page_quad_from_mupdf(&Quad::from(link?.bounds)));
+        non_text_targets.push(NonTextTarget {
+            kind: NonTextTargetKind::Link,
+            quad: page_quad_from_mupdf(&Quad::from(link?.bounds)),
+        });
     }
     for widget in page.widgets() {
-        non_text_targets.push(page_quad_from_mupdf(&Quad::from(
-            widget.annotation().bounds()?,
-        )));
+        non_text_targets.push(NonTextTarget {
+            kind: NonTextTargetKind::Form,
+            quad: page_quad_from_mupdf(&Quad::from(widget.annotation().bounds()?)),
+        });
     }
 
     Ok((

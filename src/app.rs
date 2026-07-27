@@ -7,9 +7,9 @@ use std::time::Instant;
 
 use crossbeam_channel::TryRecvError;
 use eframe::egui::{
-    self, Color32, CursorIcon, Event, Id, Key, LayerId, Modifiers, MouseWheelUnit, PointerButton,
-    Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, TouchPhase, UiBuilder,
-    Vec2, ViewportCommand,
+    self, Color32, Event, Id, Key, LayerId, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect,
+    Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, TouchPhase, UiBuilder, Vec2,
+    ViewportCommand,
 };
 
 use crate::domain::annotation::{
@@ -42,7 +42,7 @@ use crate::ui::fonts::install_cjk_fallback;
 use crate::ui::icons::{ToolbarIcon, icon_button};
 use crate::ui::sidebar::{HighlightSidebarAction, SidebarTab, show_highlights, show_outline};
 use crate::ui::viewport::{
-    PageInteraction, PageInteractionInput, PageViewport, screen_rect_for_tile,
+    PageInteraction, PageInteractionInput, PageViewport, pdf_cursor_icon, screen_rect_for_tile,
 };
 
 // These bounds cover detailed inspection and overview use without allowing an
@@ -893,6 +893,10 @@ impl PrototypeApp {
                         }
                     }
                     Ok(DocumentEvent::DocumentChanged(info)) => {
+                        if self.active_index() == Some(index) {
+                            self.documents[index].view.stop_autoscroll();
+                            self.viewport.cancel_primary_interaction();
+                        }
                         let dirty = info.dirty;
                         let revision = info.revision;
                         let page_count = info.page_bounds.len();
@@ -1290,6 +1294,10 @@ impl PrototypeApp {
                         self.documents[index].error = None;
                     }
                     Ok(DocumentEvent::Failed { operation, message }) => {
+                        if self.active_index() == Some(index) {
+                            self.documents[index].view.stop_autoscroll();
+                            self.viewport.cancel_primary_interaction();
+                        }
                         if operation == "open" && self.documents[index].restoring_from_session {
                             // The tab vector cannot be shifted while its event
                             // queues are being traversed. Remove failed restore
@@ -1363,6 +1371,10 @@ impl PrototypeApp {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
+                        if self.active_index() == Some(index) {
+                            self.documents[index].view.stop_autoscroll();
+                            self.viewport.cancel_primary_interaction();
+                        }
                         if self.documents[index].restoring_from_session {
                             let path = self.tabs.tabs()[index].path().to_path_buf();
                             failed_restored_paths.push(path);
@@ -1710,6 +1722,9 @@ impl PrototypeApp {
         }
         if let Some(previous) = previous.filter(|previous| *previous != index) {
             self.documents[previous].view.stop_autoscroll();
+            // PageViewport is shared by tabs, so its primary gesture must not
+            // be interpreted against the newly active document.
+            self.viewport.cancel_primary_interaction();
             // A tab switch changes request ownership, not tile identity. Cancel
             // queued work without discarding the generation or reusable textures.
             self.documents[previous].cancel_rendering_requests();
@@ -1840,6 +1855,9 @@ impl PrototypeApp {
         if let Some(document) = self.documents.get_mut(index) {
             document.view.stop_autoscroll();
         }
+        if self.active_index() == Some(index) {
+            self.viewport.cancel_primary_interaction();
+        }
         let Some(document) = self.documents.get(index) else {
             return;
         };
@@ -1925,6 +1943,9 @@ impl PrototypeApp {
 
     fn remove_tab_now(&mut self, index: usize) -> bool {
         let previous_selection = self.active_index();
+        if previous_selection == Some(index) {
+            self.viewport.cancel_primary_interaction();
+        }
         let document_id = self
             .documents
             .get(index)
@@ -2018,6 +2039,10 @@ impl PrototypeApp {
 
     fn handle_window_close(&mut self, context: &egui::Context) {
         let close_requested = context.input(|input| input.viewport().close_requested());
+        if close_requested {
+            self.stop_active_autoscroll();
+            self.viewport.cancel_primary_interaction();
+        }
         if !close_requested || self.allow_window_close {
             return;
         }
@@ -2908,10 +2933,12 @@ impl PrototypeApp {
                         }
                         ui.separator();
                         if ui.button("連続表示").clicked() {
+                            self.viewport.cancel_primary_interaction();
                             self.documents[index].set_display_mode(DisplayMode::Continuous);
                             ui.close();
                         }
                         if ui.button("単一ページ表示").clicked() {
+                            self.viewport.cancel_primary_interaction();
                             self.documents[index].set_display_mode(DisplayMode::SinglePage);
                             ui.close();
                         }
@@ -3084,6 +3111,7 @@ impl PrototypeApp {
                         if icon_button(ui, ToolbarIcon::Continuous, true, continuous, "連続表示")
                             .clicked()
                         {
+                            self.viewport.cancel_primary_interaction();
                             self.documents[index].set_display_mode(DisplayMode::Continuous);
                         }
                         if icon_button(
@@ -3095,6 +3123,7 @@ impl PrototypeApp {
                         )
                         .clicked()
                         {
+                            self.viewport.cancel_primary_interaction();
                             self.documents[index].set_display_mode(DisplayMode::SinglePage);
                         }
                         let highlight_tooltip = self.documents[index]
@@ -3727,6 +3756,11 @@ impl PrototypeApp {
 
     fn continuous_view(&mut self, ui: &mut egui::Ui, index: usize) {
         let document_id = self.documents[index].document_id;
+        if self.documents[index].view.autoscroll.is_some() {
+            // Autoscroll owns navigation until its stop input is observed, so
+            // a stale primary gesture must not coexist with its anchor.
+            self.viewport.cancel_primary_interaction();
+        }
         let editor_input_rect = self
             .annotation_editor
             .as_ref()
@@ -3785,6 +3819,7 @@ impl PrototypeApp {
         let mut annotation_action = None;
         let mut pan_delta = None;
         let mut clear_selection = false;
+        let mut cursor_target = None;
         let mut page_screen_rects = Vec::new();
         let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
             ui.set_min_size(Vec2::new(content_width, layout.total_height()));
@@ -3880,6 +3915,9 @@ impl PrototypeApp {
                 if interaction.pan_delta.is_some() {
                     pan_delta = interaction.pan_delta;
                 }
+                if interaction.cursor_target.is_some() {
+                    cursor_target = interaction.cursor_target;
+                }
                 clear_selection |= interaction.clear_selection;
             }
         });
@@ -3899,22 +3937,41 @@ impl PrototypeApp {
             tab.selection.is_some(),
         );
         pan_delta = pan_delta.or(background_interaction.pan_delta);
+        cursor_target = cursor_target.or(background_interaction.cursor_target);
         clear_selection |= background_interaction.clear_selection;
         if let Some(delta) = pan_delta {
             let requested_offset = output.state.offset - delta;
             tab.view.pan_requested_offset =
                 Some(clamp_scroll_offset(requested_offset, maximum_offset));
         }
-        if let Some(frame) = update_autoscroll(
+        let autoscroll_frame = update_autoscroll(
             ui.ctx(),
             &mut tab.view,
             output.inner_rect,
             &excluded_rects,
             ui.layer_id(),
-            output.state.offset,
-            maximum_offset,
-        ) {
+            AutoscrollOffsets {
+                current: output.state.offset,
+                maximum: maximum_offset,
+            },
+            viewport.primary_interaction_in_progress(),
+        );
+        let autoscroll_active = autoscroll_frame.is_some();
+        if let Some(frame) = autoscroll_frame {
             paint_autoscroll_marker(ui, output.inner_rect, frame.anchor);
+        }
+        let blank_pan_active = viewport.blank_pan_in_progress();
+        let dedicated_cursor_owner = pointer_over_any_rect(ui.ctx(), &excluded_rects);
+        if !dedicated_cursor_owner
+            && (cursor_target.is_some() || autoscroll_active || blank_pan_active)
+        {
+            // The annotation editor is painted after the PDF. Skipping the PDF
+            // cursor here also covers editor regions whose widgets use Default.
+            ui.ctx().set_cursor_icon(pdf_cursor_icon(
+                cursor_target,
+                autoscroll_active,
+                blank_pan_active,
+            ));
         }
         if let Some((page_index, start, end)) = completed_drag {
             tab.request_selection(page_index, start, end);
@@ -4082,6 +4139,9 @@ impl PrototypeApp {
             &excluded_rects,
             tab.selection.is_some(),
         );
+        let cursor_target = interaction
+            .cursor_target
+            .or(background_interaction.cursor_target);
         let pan_delta = interaction.pan_delta.or(background_interaction.pan_delta);
         if let Some(delta) = pan_delta {
             let requested_offset = output.state.offset - delta;
@@ -4096,6 +4156,13 @@ impl PrototypeApp {
             // bottom so the wheel continues in the direction of travel.
             let y = if wheel_page_delta > 0 { 0.0 } else { 1.0 };
             tab.jump_to_single_page_edge(target, Vec2::new(x, y));
+        }
+
+        let blank_pan_active = viewport.blank_pan_in_progress();
+        let dedicated_cursor_owner = pointer_over_any_rect(ui.ctx(), &excluded_rects);
+        if !dedicated_cursor_owner && (cursor_target.is_some() || blank_pan_active) {
+            ui.ctx()
+                .set_cursor_icon(pdf_cursor_icon(cursor_target, false, blank_pan_active));
         }
 
         if let Some((page_index, start, end)) = interaction.completed_drag {
@@ -4561,6 +4628,11 @@ struct AutoscrollFrame {
     anchor: Pos2,
 }
 
+struct AutoscrollOffsets {
+    current: Vec2,
+    maximum: Vec2,
+}
+
 /// Starts, advances, or stops browser-style autoscroll for one PDF ScrollArea.
 fn update_autoscroll(
     context: &egui::Context,
@@ -4568,8 +4640,8 @@ fn update_autoscroll(
     view_rect: Rect,
     excluded_rects: &[Rect],
     view_layer: LayerId,
-    current_offset: Vec2,
-    maximum_offset: Vec2,
+    offsets: AutoscrollOffsets,
+    primary_interaction_in_progress: bool,
 ) -> Option<AutoscrollFrame> {
     if view.display_mode != DisplayMode::Continuous {
         view.autoscroll = None;
@@ -4596,6 +4668,7 @@ fn update_autoscroll(
             return None;
         }
     } else if middle_clicked
+        && !primary_interaction_in_progress
         && pointer.is_some_and(|position| {
             // Foreground windows and the annotation editor may overlap the
             // central rect. Only the central layer's unexcluded area owns the
@@ -4608,7 +4681,7 @@ fn update_autoscroll(
         let anchor = pointer.expect("the start condition requires a pointer position");
         view.autoscroll = Some(AutoscrollState {
             anchor,
-            requested_offset: Some(current_offset),
+            requested_offset: Some(offsets.current),
         });
     }
 
@@ -4616,9 +4689,8 @@ fn update_autoscroll(
     let velocity = pointer.map_or(Vec2::ZERO, |position| {
         autoscroll_velocity(autoscroll.anchor, position)
     });
-    let desired_offset = current_offset + velocity * dt;
-    autoscroll.requested_offset = Some(clamp_scroll_offset(desired_offset, maximum_offset));
-    context.set_cursor_icon(CursorIcon::AllScroll);
+    let desired_offset = offsets.current + velocity * dt;
+    autoscroll.requested_offset = Some(clamp_scroll_offset(desired_offset, offsets.maximum));
     context.request_repaint();
     Some(AutoscrollFrame {
         anchor: autoscroll.anchor,
@@ -4644,6 +4716,15 @@ fn clamp_scroll_offset(offset: Vec2, maximum: Vec2) -> Vec2 {
         offset.x.clamp(0.0, maximum.x.max(0.0)),
         offset.y.clamp(0.0, maximum.y.max(0.0)),
     )
+}
+
+fn pointer_over_any_rect(context: &egui::Context, rects: &[Rect]) -> bool {
+    context.input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .is_some_and(|position| rects.iter().any(|rect| rect.contains(position)))
+    })
 }
 
 /// Produces the exact persistent ID that `ScrollArea::id_salt` stores.
@@ -5738,6 +5819,11 @@ impl RenderPerformance {
 
 impl eframe::App for PrototypeApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        if !context.input(|input| input.focused) {
+            // Native focus loss may omit a matching button-release event.
+            self.stop_active_autoscroll();
+            self.viewport.cancel_primary_interaction();
+        }
         let modal_open = self.close_confirmation.is_some() || self.session_close_failure.is_some();
         if modal_open {
             // A modal owns pointer intent until it closes; retaining a background
@@ -6175,6 +6261,70 @@ mod tests {
         );
     }
 
+    fn run_autoscroll_frame(
+        context: &egui::Context,
+        view: &mut ViewState,
+        events: Vec<egui::Event>,
+        focused: bool,
+        primary_interaction_in_progress: bool,
+    ) -> bool {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0))),
+            events,
+            focused,
+            ..Default::default()
+        };
+        let mut active = false;
+        let _output = context.run_ui(input, |ui| {
+            let view_rect = ui.max_rect();
+            let _response = ui.allocate_rect(view_rect, Sense::hover());
+            active = update_autoscroll(
+                ui.ctx(),
+                view,
+                view_rect,
+                &[],
+                ui.layer_id(),
+                AutoscrollOffsets {
+                    current: Vec2::ZERO,
+                    maximum: Vec2::splat(1_000.0),
+                },
+                primary_interaction_in_progress,
+            )
+            .is_some();
+        });
+        active
+    }
+
+    #[test]
+    fn excluded_editor_rect_keeps_pdf_from_owning_the_cursor() {
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(Pos2::new(50.0, 50.0))],
+            ..Default::default()
+        };
+        let mut editor_owns_cursor = false;
+        let mut distant_rect_does_not = false;
+        let _output = context.run_ui(input, |ui| {
+            editor_owns_cursor = pointer_over_any_rect(
+                ui.ctx(),
+                &[Rect::from_min_size(
+                    Pos2::new(40.0, 40.0),
+                    Vec2::splat(20.0),
+                )],
+            );
+            distant_rect_does_not = !pointer_over_any_rect(
+                ui.ctx(),
+                &[Rect::from_min_size(
+                    Pos2::new(100.0, 100.0),
+                    Vec2::splat(20.0),
+                )],
+            );
+        });
+
+        assert!(editor_owns_cursor);
+        assert!(distant_rect_does_not);
+    }
+
     #[test]
     fn rgba_upload_releases_the_worker_transfer_allocation() {
         let mut pixels_rgba = Vec::with_capacity(64);
@@ -6326,6 +6476,54 @@ mod tests {
         let _output = context.run_ui(input, |ui| app.handle_shortcuts(ui.ctx()));
 
         assert!(app.documents[0].view.autoscroll.is_none());
+    }
+
+    #[test]
+    fn tab_activation_cancels_navigation_owned_by_previous_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_pdf = directory.path().join("first.pdf");
+        let second_pdf = directory.path().join("second.pdf");
+        write_blank_pdf(&first_pdf);
+        write_blank_pdf(&second_pdf);
+        let session_path = directory.path().join("session.json");
+        let mut app = PrototypeApp::from_startup(
+            vec![first_pdf, second_pdf],
+            SessionStore::new(session_path),
+        );
+        app.documents[0].view.autoscroll = Some(AutoscrollState {
+            anchor: Pos2::ZERO,
+            requested_offset: Some(Vec2::ZERO),
+        });
+        let context = egui::Context::default();
+        for events in [
+            vec![
+                egui::Event::PointerMoved(Pos2::new(50.0, 50.0)),
+                egui::Event::PointerButton {
+                    pos: Pos2::new(50.0, 50.0),
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            vec![egui::Event::PointerMoved(Pos2::new(70.0, 70.0))],
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0))),
+                events,
+                ..Default::default()
+            };
+            let _output = context.run_ui(input, |ui| {
+                app.viewport
+                    .interact_background(ui, ui.max_rect(), &[], &[], false);
+            });
+        }
+        assert!(app.viewport.blank_pan_in_progress());
+
+        app.activate_document(1, Some(0));
+
+        assert!(app.documents[0].view.autoscroll.is_none());
+        assert!(!app.viewport.primary_interaction_in_progress());
+        assert!(!app.viewport.blank_pan_in_progress());
     }
 
     fn h_key_input() -> egui::RawInput {
@@ -7119,11 +7317,110 @@ mod tests {
             Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0)),
             &[],
             LayerId::background(),
-            Vec2::ZERO,
-            Vec2::splat(1_000.0),
+            AutoscrollOffsets {
+                current: Vec2::ZERO,
+                maximum: Vec2::splat(1_000.0),
+            },
+            false,
         );
 
         assert!(frame.is_none());
+        assert!(view.autoscroll.is_none());
+    }
+
+    #[test]
+    fn autoscroll_start_is_rejected_during_primary_page_interaction() {
+        let context = egui::Context::default();
+        let mut view = ViewState::new();
+        let pointer = Pos2::new(100.0, 100.0);
+        let events = vec![
+            egui::Event::PointerMoved(pointer),
+            egui::Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Middle,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Middle,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+
+        let active = run_autoscroll_frame(&context, &mut view, events, true, true);
+
+        assert!(!active);
+        assert!(view.autoscroll.is_none());
+    }
+
+    #[test]
+    fn autoscroll_is_active_only_between_start_and_stop_clicks() {
+        let context = egui::Context::default();
+        let mut view = ViewState::new();
+        let pointer = Pos2::new(100.0, 100.0);
+        let middle_click = vec![
+            egui::Event::PointerMoved(pointer),
+            egui::Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Middle,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Middle,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+        assert!(run_autoscroll_frame(
+            &context,
+            &mut view,
+            middle_click,
+            true,
+            false,
+        ));
+        assert!(view.autoscroll.is_some());
+
+        let primary_click = vec![
+            egui::Event::PointerMoved(pointer),
+            egui::Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+        assert!(!run_autoscroll_frame(
+            &context,
+            &mut view,
+            primary_click,
+            true,
+            false,
+        ));
+        assert!(view.autoscroll.is_none());
+    }
+
+    #[test]
+    fn focus_loss_stops_active_autoscroll() {
+        let context = egui::Context::default();
+        let mut view = ViewState::new();
+        view.autoscroll = Some(AutoscrollState {
+            anchor: Pos2::new(20.0, 30.0),
+            requested_offset: Some(Vec2::new(40.0, 50.0)),
+        });
+
+        let active = run_autoscroll_frame(&context, &mut view, Vec::new(), false, false);
+
+        assert!(!active);
         assert!(view.autoscroll.is_none());
     }
 
