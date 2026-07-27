@@ -155,6 +155,14 @@ pub(crate) enum EditAction {
         page_index: usize,
         annotation_xref: i32,
     },
+    UpdateAnnotation {
+        annotation_id: crate::domain::annotation::AnnotationId,
+        revision_after: u64,
+    },
+    DeleteAnnotation {
+        annotation_id: crate::domain::annotation::AnnotationId,
+        revision_after: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

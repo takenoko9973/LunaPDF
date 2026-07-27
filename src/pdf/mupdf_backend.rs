@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,12 +28,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::domain::annotation::{
-    AnnotationId, AnnotationKind, AnnotationPageRequest, AnnotationPageSnapshot,
-    AnnotationSnapshot, PdfAnnotationColor,
+    AnnotationDeleteRequest, AnnotationId, AnnotationKind, AnnotationPageRequest,
+    AnnotationPageSnapshot, AnnotationSnapshot, AnnotationUpdateRequest, PdfAnnotationColor,
 };
 use crate::domain::document::{
-    DocumentInfo, DocumentVersion, EditAction, HighlightCapability, HighlightRequest, OutlineItem,
-    PageRect, RenderedThumbnail, RenderedTile, SearchMatch, SearchPageResult, TILE_EDGE_PIXELS,
+    DocumentInfo, DocumentVersion, EditAction, HighlightCapability, OutlineItem, PageRect,
+    RenderedThumbnail, RenderedTile, SearchMatch, SearchPageResult, TILE_EDGE_PIXELS,
     ThumbnailRequest, TileRequest, TileSpec,
 };
 use crate::domain::selection::{
@@ -44,6 +45,10 @@ use crate::domain::selection::{
 // update. One hundredth of a PDF point is below display-pixel precision at the
 // supported zoom range while still detecting a materially different Quad.
 const PDF_COORDINATE_TOLERANCE: f32 = 0.01;
+
+// PDF writers can round normalized color and opacity numbers. One thousandth
+// is below an 8-bit channel step while still detecting a visible replacement.
+const PDF_PROPERTY_TOLERANCE: f32 = 0.001;
 
 // 16,384 Quads bound one page snapshot near 512 KiB while covering dense
 // papers. Logical hit boundaries are preserved within that byte-oriented cap.
@@ -57,7 +62,7 @@ pub(super) struct MuPdfBackend {
     open_time: Duration,
     revision: u64,
     highlight_capability: HighlightCapability,
-    pending_highlights: Vec<PendingHighlight>,
+    pending_edits: Vec<PendingEdit>,
     display_list: Option<CachedDisplayList>,
     // A recovery document opened from bytes has no safe association with the
     // original path, so retries must use the full-rewrite path until a fresh
@@ -72,9 +77,31 @@ struct CachedDisplayList {
 }
 
 #[derive(Clone, Debug)]
-struct PendingHighlight {
+struct PendingEdit {
     action: EditAction,
-    request: HighlightRequest,
+    undo: UndoEdit,
+    expected: ExpectedAnnotationMutation,
+}
+
+#[derive(Clone, Debug)]
+enum UndoEdit {
+    DeleteCreatedAnnotation(AnnotationId),
+    RestoreDocument(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+enum ExpectedAnnotationMutation {
+    Present(ExpectedAnnotationState),
+    Absent(AnnotationId),
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedAnnotationState {
+    id: AnnotationId,
+    quads: Vec<PageQuad>,
+    contents: String,
+    color: Option<PdfAnnotationColor>,
+    opacity: f32,
 }
 
 impl MuPdfBackend {
@@ -106,7 +133,7 @@ impl MuPdfBackend {
             open_time,
             revision: 0,
             highlight_capability,
-            pending_highlights: Vec::new(),
+            pending_edits: Vec::new(),
             display_list: None,
             incremental_association_lost: false,
         })
@@ -119,10 +146,10 @@ impl MuPdfBackend {
             highlight_count: highlight_count(&self.document)?,
             can_save_incrementally: self.should_save_incrementally(),
             highlight_capability: self.highlight_capability,
-            // MuPDF keeps an xref dirty bit after an annotation is removed;
-            // the application dirty state therefore follows the still-live
-            // LunaPDF actions so create-then-undo returns to a clean tab.
-            dirty: !self.pending_highlights.is_empty(),
+            // MuPDF keeps xref dirty bits after undo operations. Application
+            // dirty state follows the still-live edit log so a complete LIFO
+            // undo returns to a clean tab without trusting those stale bits.
+            dirty: !self.pending_edits.is_empty(),
             revision: self.revision,
             open_time: self.open_time,
             physical_memory_bytes: physical_memory_bytes(),
@@ -474,61 +501,292 @@ impl MuPdfBackend {
         );
         annotation.update()?;
         page.update()?;
+        let annotation_id = AnnotationId {
+            page_index,
+            xref: annotation_xref,
+        };
         let action = EditAction::CreateHighlight {
             page_index,
             annotation_xref,
         };
-        self.pending_highlights.push(PendingHighlight {
+        let expected = ExpectedAnnotationState {
+            id: annotation_id,
+            quads: annotation
+                .quad_points()?
+                .iter()
+                .map(page_quad_from_mupdf)
+                .collect(),
+            contents: annotation.contents()?.unwrap_or_default().to_owned(),
+            color: annotation.color()?.map(annotation_color_from_mupdf),
+            opacity: annotation.opacity()?,
+        };
+        self.pending_edits.push(PendingEdit {
             action: action.clone(),
-            request: HighlightRequest {
-                page_index,
-                quads: quads.to_vec(),
-            },
+            undo: UndoEdit::DeleteCreatedAnnotation(annotation_id),
+            expected: ExpectedAnnotationMutation::Present(expected),
         });
         self.display_list = None;
         self.revision += 1;
         Ok(action)
     }
 
-    /// Undoes one application-created edit by its stable MuPDF annotation xref.
-    ///
-    /// The pending-action check is deliberate: an xref supplied after save or
-    /// from an existing PDF is not considered LunaPDF-owned and is rejected,
-    /// so undo can never remove a preexisting annotation by coincidence.
-    pub(super) fn undo(&mut self, action: EditAction) -> Result<()> {
-        let (page_index, annotation_xref) = match &action {
-            EditAction::CreateHighlight {
-                page_index,
-                annotation_xref,
-            } => (*page_index, *annotation_xref),
+    /// Updates supported fields on one exact revision-bound annotation xref.
+    pub(super) fn update_annotation(
+        &mut self,
+        request: AnnotationUpdateRequest,
+    ) -> Result<EditAction> {
+        ensure!(
+            request.expected_revision == self.revision,
+            "annotation update revision is stale"
+        );
+        ensure!(
+            request.contents.is_some() || request.color.is_some(),
+            "annotation update contains no changed fields"
+        );
+        ensure!(
+            self.highlight_capability.is_allowed(),
+            "annotation editing is disabled: {}",
+            self.highlight_capability
+                .restriction()
+                .expect("a disallowed capability has a reason")
+        );
+        let flags = self.validate_highlight_target(request.id)?;
+        let properties_locked =
+            flags.intersects(AnnotationFlags::IS_READ_ONLY | AnnotationFlags::IS_LOCKED);
+        let contents_locked =
+            properties_locked || flags.contains(AnnotationFlags::IS_LOCKED_CONTENTS);
+        ensure!(
+            request.contents.is_none() || !contents_locked,
+            "annotation Contents is locked"
+        );
+        ensure!(
+            request.color.is_none() || !properties_locked,
+            "annotation color is locked"
+        );
+
+        let undo_document = self.document_snapshot_for_undo()?;
+        if let Err(error) = self.apply_annotation_update(&request) {
+            return self.rollback_failed_mutation(undo_document, error);
+        }
+        let expected = match self.expected_annotation_state(request.id) {
+            Ok(expected) => expected,
+            Err(error) => return self.rollback_failed_mutation(undo_document, error),
         };
-        let pending_index = self
-            .pending_highlights
-            .iter()
-            .position(|pending| pending.action == action)
-            .context("edit action is not an unsaved application edit")?;
-        let page_number = page_number(page_index, self.page_bounds.len())?;
-        let mut page = self.document.load_pdf_page(page_number)?;
-        let mut target = None;
+        self.display_list = None;
+        self.revision += 1;
+        let action = EditAction::UpdateAnnotation {
+            annotation_id: request.id,
+            revision_after: self.revision,
+        };
+        self.pending_edits.push(PendingEdit {
+            action: action.clone(),
+            undo: UndoEdit::RestoreDocument(undo_document),
+            expected: ExpectedAnnotationMutation::Present(expected),
+        });
+        Ok(action)
+    }
+
+    /// Deletes one exact revision-bound annotation while retaining an exact undo snapshot.
+    pub(super) fn delete_annotation(
+        &mut self,
+        request: AnnotationDeleteRequest,
+    ) -> Result<EditAction> {
+        ensure!(
+            request.expected_revision == self.revision,
+            "annotation delete revision is stale"
+        );
+        ensure!(
+            self.highlight_capability.is_allowed(),
+            "annotation deletion is disabled: {}",
+            self.highlight_capability
+                .restriction()
+                .expect("a disallowed capability has a reason")
+        );
+        let flags = self.validate_highlight_target(request.id)?;
+        ensure!(
+            !flags.intersects(AnnotationFlags::IS_READ_ONLY | AnnotationFlags::IS_LOCKED),
+            "annotation deletion is locked"
+        );
+
+        let undo_document = self.document_snapshot_for_undo()?;
+        if let Err(error) = self.apply_annotation_delete(request.id) {
+            return self.rollback_failed_mutation(undo_document, error);
+        }
+        self.display_list = None;
+        self.revision += 1;
+        let action = EditAction::DeleteAnnotation {
+            annotation_id: request.id,
+            revision_after: self.revision,
+        };
+        self.pending_edits.push(PendingEdit {
+            action: action.clone(),
+            undo: UndoEdit::RestoreDocument(undo_document),
+            expected: ExpectedAnnotationMutation::Absent(request.id),
+        });
+        Ok(action)
+    }
+
+    fn validate_highlight_target(&self, id: AnnotationId) -> Result<AnnotationFlags> {
+        ensure!(id.xref > 0, "annotation xref must be positive");
+        let page_number = page_number(id.page_index, self.page_bounds.len())?;
+        let page = self.document.load_pdf_page(page_number)?;
         for annotation in page.annotations() {
-            if annotation.xref()? == annotation_xref {
-                target = Some(annotation);
-                break;
+            if annotation.xref()? != id.xref {
+                continue;
+            }
+            ensure!(
+                annotation.r#type()? == PdfAnnotationType::Highlight,
+                "annotation xref {} is not a Highlight",
+                id.xref
+            );
+            return Ok(annotation.flags()?);
+        }
+        Err(anyhow!(
+            "Highlight xref {} was not found on page {}",
+            id.xref,
+            id.page_index + 1
+        ))
+    }
+
+    fn apply_annotation_update(&mut self, request: &AnnotationUpdateRequest) -> Result<()> {
+        let page_number = page_number(request.id.page_index, self.page_bounds.len())?;
+        let mut page = self.document.load_pdf_page(page_number)?;
+        for mut annotation in page.annotations() {
+            if annotation.xref()? != request.id.xref {
+                continue;
+            }
+            if let Some(contents) = &request.contents {
+                annotation.set_contents(contents)?;
+            }
+            if let Some(color) = request.color {
+                annotation.set_color(annotation_color_to_mupdf(color))?;
+            }
+            annotation.update()?;
+            page.update()?;
+            return Ok(());
+        }
+        Err(anyhow!(
+            "Highlight xref {} disappeared before update",
+            request.id.xref
+        ))
+    }
+
+    fn apply_annotation_delete(&mut self, id: AnnotationId) -> Result<()> {
+        let page_number = page_number(id.page_index, self.page_bounds.len())?;
+        let mut page = self.document.load_pdf_page(page_number)?;
+        for annotation in page.annotations() {
+            if annotation.xref()? != id.xref {
+                continue;
+            }
+            page.delete_annotation(annotation)?;
+            page.update()?;
+            return Ok(());
+        }
+        Err(anyhow!(
+            "Highlight xref {} disappeared before deletion",
+            id.xref
+        ))
+    }
+
+    fn expected_annotation_state(&self, id: AnnotationId) -> Result<ExpectedAnnotationState> {
+        let page_number = page_number(id.page_index, self.page_bounds.len())?;
+        let page = self.document.load_pdf_page(page_number)?;
+        for annotation in page.annotations() {
+            if annotation.xref()? != id.xref {
+                continue;
+            }
+            ensure!(
+                annotation.r#type()? == PdfAnnotationType::Highlight,
+                "annotation xref {} changed type after mutation",
+                id.xref
+            );
+            return Ok(ExpectedAnnotationState {
+                id,
+                quads: annotation
+                    .quad_points()?
+                    .iter()
+                    .map(page_quad_from_mupdf)
+                    .collect(),
+                contents: annotation.contents()?.unwrap_or_default().to_owned(),
+                color: annotation.color()?.map(annotation_color_from_mupdf),
+                opacity: annotation.opacity()?,
+            });
+        }
+        Err(anyhow!(
+            "Highlight xref {} disappeared after mutation",
+            id.xref
+        ))
+    }
+
+    fn document_snapshot_for_undo(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut options = PdfWriteOptions::default();
+        options
+            .set_incremental(false)
+            // Undo bytes must retain the current security settings; the
+            // default writer option would remove encryption from the snapshot.
+            .set_encryption(Encryption::Keep);
+        self.document
+            .write_to_with_options(&mut bytes, options)
+            .context("failed to snapshot the PDF before annotation mutation")?;
+        Ok(bytes)
+    }
+
+    fn restore_document_snapshot(&mut self, bytes: &[u8]) -> Result<()> {
+        let document = PdfDocument::from_bytes(bytes)
+            .context("failed to reopen the pre-mutation PDF snapshot")?;
+        let page_bounds = load_page_bounds(&document)?;
+        ensure!(
+            page_bounds.len() == self.page_bounds.len(),
+            "undo snapshot page count changed"
+        );
+        self.document = document;
+        self.page_bounds = page_bounds;
+        self.display_list = None;
+        // A memory-backed restored document cannot use MuPDF's path-associated
+        // incremental writer safely; the next save must use verified full rewrite.
+        self.incremental_association_lost = true;
+        Ok(())
+    }
+
+    fn rollback_failed_mutation(
+        &mut self,
+        undo_document: Vec<u8>,
+        mutation_error: anyhow::Error,
+    ) -> Result<EditAction> {
+        match self.restore_document_snapshot(&undo_document) {
+            Ok(()) => Err(mutation_error),
+            Err(rollback_error) => Err(anyhow!(
+                "{mutation_error:#}; additionally failed to restore the pre-mutation PDF: {rollback_error:#}"
+            )),
+        }
+    }
+
+    /// Undoes only the latest unsaved application edit.
+    ///
+    /// Create is reversed by its exact xref. Update and delete restore a
+    /// pre-mutation PDF snapshot so external appearance streams and metadata
+    /// are not reconstructed from an incomplete application model.
+    pub(super) fn undo(&mut self, action: EditAction) -> Result<()> {
+        let pending = self
+            .pending_edits
+            .last()
+            .context("there is no unsaved application edit to undo")?;
+        ensure!(
+            pending.action == action,
+            "edit action is not the latest unsaved application edit"
+        );
+        let undo = pending.undo.clone();
+        match undo {
+            UndoEdit::DeleteCreatedAnnotation(id) => {
+                self.validate_highlight_target(id)?;
+                self.apply_annotation_delete(id)?;
+            }
+            UndoEdit::RestoreDocument(bytes) => {
+                self.restore_document_snapshot(&bytes)?;
             }
         }
-        let annotation = target.with_context(|| {
-            format!(
-                "application-created Highlight xref {annotation_xref} was not found on page {}",
-                page_index + 1
-            )
-        })?;
-        ensure!(
-            annotation.r#type()? == PdfAnnotationType::Highlight,
-            "application edit xref {annotation_xref} is not a Highlight annotation"
-        );
-        page.delete_annotation(annotation)?;
-        page.update()?;
-        self.pending_highlights.remove(pending_index);
+        self.pending_edits.pop();
         self.display_list = None;
         self.revision += 1;
         Ok(())
@@ -576,7 +834,7 @@ impl MuPdfBackend {
             &reopened,
             expected_page_count,
             expected_highlights,
-            &self.pending_highlights,
+            &self.pending_edits,
         )?;
         self.update_after_save(reopened, page_bounds)?;
         Ok(verified_highlights)
@@ -636,7 +894,7 @@ impl MuPdfBackend {
             &temporary_document,
             expected_page_count,
             expected_highlights,
-            &self.pending_highlights,
+            &self.pending_edits,
         ) {
             return Err(cleanup_temp_after_error(temp_path, error));
         }
@@ -664,7 +922,7 @@ impl MuPdfBackend {
             &recovery_document,
             expected_page_count,
             expected_highlights,
-            &self.pending_highlights,
+            &self.pending_edits,
         ) {
             return Err(cleanup_temp_after_error(temp_path, error));
         }
@@ -695,7 +953,7 @@ impl MuPdfBackend {
             &reopened,
             expected_page_count,
             expected_highlights,
-            &self.pending_highlights,
+            &self.pending_edits,
         )
         .map_err(|error| anyhow!("replacement completed but verification failed: {error:#}"))?;
         self.update_after_save(reopened, page_bounds)
@@ -714,7 +972,7 @@ impl MuPdfBackend {
         self.page_bounds = page_bounds;
         self.highlight_capability = highlight_capability;
         self.version = version;
-        self.pending_highlights.clear();
+        self.pending_edits.clear();
         self.display_list = None;
         self.incremental_association_lost = false;
         self.revision += 1;
@@ -854,7 +1112,7 @@ fn verify_saved_document(
     document: &PdfDocument,
     expected_page_count: usize,
     expected_highlights: usize,
-    pending_highlights: &[PendingHighlight],
+    pending_edits: &[PendingEdit],
 ) -> Result<(usize, Vec<PageRect>)> {
     let verified_highlights = highlight_count(document)?;
     ensure!(
@@ -866,12 +1124,18 @@ fn verify_saved_document(
         page_bounds.len() == expected_page_count,
         "saved PDF page count changed during verification"
     );
-    for expected in pending_highlights {
-        ensure!(
-            contains_highlight(document, &expected.request)?,
-            "saved PDF does not contain the Highlight created on page {}",
-            expected.request.page_index + 1
-        );
+    let mut verified_ids = HashSet::new();
+    for pending in pending_edits.iter().rev() {
+        let id = match &pending.expected {
+            ExpectedAnnotationMutation::Present(state) => state.id,
+            ExpectedAnnotationMutation::Absent(id) => *id,
+        };
+        // Several unsaved actions can target one annotation. Only its latest
+        // expected state describes the final PDF; earlier entries remain solely
+        // for LIFO Undo and must not be verified as simultaneous states.
+        if verified_ids.insert(id) {
+            verify_annotation_mutation(document, &pending.expected)?;
+        }
     }
     Ok((verified_highlights, page_bounds))
 }
@@ -1143,27 +1407,125 @@ fn highlight_count(document: &PdfDocument) -> Result<usize> {
     Ok(count)
 }
 
-fn contains_highlight(document: &PdfDocument, expected: &HighlightRequest) -> Result<bool> {
+fn verify_annotation_mutation(
+    document: &PdfDocument,
+    expected: &ExpectedAnnotationMutation,
+) -> Result<()> {
+    let id = match expected {
+        ExpectedAnnotationMutation::Present(state) => state.id,
+        ExpectedAnnotationMutation::Absent(id) => *id,
+    };
     let page_count =
         usize::try_from(document.page_count()?).context("MuPDF returned a negative page count")?;
-    let page = document.load_pdf_page(page_number(expected.page_index, page_count)?)?;
+    let page = document.load_pdf_page(page_number(id.page_index, page_count)?)?;
     for annotation in page.annotations() {
-        if annotation.r#type()? != PdfAnnotationType::Highlight {
+        if annotation.xref()? != id.xref {
             continue;
         }
-        let actual_quads = annotation.quad_points()?;
-        if actual_quads.len() != expected.quads.len() {
-            continue;
-        }
-        let all_quads_match = actual_quads
-            .iter()
-            .zip(&expected.quads)
-            .all(|(actual, expected)| quad_matches(actual, expected));
-        if all_quads_match {
-            return Ok(true);
+        match expected {
+            ExpectedAnnotationMutation::Absent(_) => {
+                return Err(anyhow!(
+                    "saved PDF still contains deleted annotation xref {} on page {}",
+                    id.xref,
+                    id.page_index + 1
+                ));
+            }
+            ExpectedAnnotationMutation::Present(state) => {
+                ensure!(
+                    annotation.r#type()? == PdfAnnotationType::Highlight,
+                    "saved annotation xref {} changed type",
+                    id.xref
+                );
+                let actual_quads = annotation.quad_points()?;
+                ensure!(
+                    actual_quads.len() == state.quads.len()
+                        && actual_quads
+                            .iter()
+                            .zip(&state.quads)
+                            .all(|(actual, expected)| quad_matches(actual, expected)),
+                    "saved annotation xref {} changed Quad geometry",
+                    id.xref
+                );
+                ensure!(
+                    annotation.contents()?.unwrap_or_default() == state.contents,
+                    "saved annotation xref {} changed Contents",
+                    id.xref
+                );
+                let color = annotation.color()?.map(annotation_color_from_mupdf);
+                ensure!(
+                    annotation_colors_match(color, state.color),
+                    "saved annotation xref {} changed color",
+                    id.xref
+                );
+                ensure!(
+                    (annotation.opacity()? - state.opacity).abs() <= PDF_PROPERTY_TOLERANCE,
+                    "saved annotation xref {} changed opacity",
+                    id.xref
+                );
+                return Ok(());
+            }
         }
     }
-    Ok(false)
+    match expected {
+        ExpectedAnnotationMutation::Present(_) => Err(anyhow!(
+            "saved PDF does not contain annotation xref {} on page {}",
+            id.xref,
+            id.page_index + 1
+        )),
+        ExpectedAnnotationMutation::Absent(_) => Ok(()),
+    }
+}
+
+fn annotation_colors_match(
+    actual: Option<PdfAnnotationColor>,
+    expected: Option<PdfAnnotationColor>,
+) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(PdfAnnotationColor::Gray(actual)), Some(PdfAnnotationColor::Gray(expected))) => {
+            property_matches(actual, expected)
+        }
+        (
+            Some(PdfAnnotationColor::Rgb {
+                red: actual_red,
+                green: actual_green,
+                blue: actual_blue,
+            }),
+            Some(PdfAnnotationColor::Rgb {
+                red: expected_red,
+                green: expected_green,
+                blue: expected_blue,
+            }),
+        ) => {
+            property_matches(actual_red, expected_red)
+                && property_matches(actual_green, expected_green)
+                && property_matches(actual_blue, expected_blue)
+        }
+        (
+            Some(PdfAnnotationColor::Cmyk {
+                cyan: actual_cyan,
+                magenta: actual_magenta,
+                yellow: actual_yellow,
+                key: actual_key,
+            }),
+            Some(PdfAnnotationColor::Cmyk {
+                cyan: expected_cyan,
+                magenta: expected_magenta,
+                yellow: expected_yellow,
+                key: expected_key,
+            }),
+        ) => {
+            property_matches(actual_cyan, expected_cyan)
+                && property_matches(actual_magenta, expected_magenta)
+                && property_matches(actual_yellow, expected_yellow)
+                && property_matches(actual_key, expected_key)
+        }
+        _ => false,
+    }
+}
+
+fn property_matches(actual: f32, expected: f32) -> bool {
+    (actual - expected).abs() <= PDF_PROPERTY_TOLERANCE
 }
 
 fn quad_matches(actual: &Quad, expected: &PageQuad) -> bool {
@@ -1225,6 +1587,24 @@ fn annotation_color_from_mupdf(color: AnnotationColor) -> PdfAnnotationColor {
             yellow,
             key,
         } => PdfAnnotationColor::Cmyk {
+            cyan,
+            magenta,
+            yellow,
+            key,
+        },
+    }
+}
+
+fn annotation_color_to_mupdf(color: PdfAnnotationColor) -> AnnotationColor {
+    match color {
+        PdfAnnotationColor::Gray(gray) => AnnotationColor::Gray(gray),
+        PdfAnnotationColor::Rgb { red, green, blue } => AnnotationColor::Rgb { red, green, blue },
+        PdfAnnotationColor::Cmyk {
+            cyan,
+            magenta,
+            yellow,
+            key,
+        } => AnnotationColor::Cmyk {
             cyan,
             magenta,
             yellow,
@@ -1542,7 +1922,7 @@ mod tests {
             document.save(path_text).unwrap();
         }
 
-        let backend = MuPdfBackend::open(path).unwrap();
+        let mut backend = MuPdfBackend::open(path).unwrap();
         let snapshot = backend
             .annotation_page(AnnotationPageRequest {
                 page_index: 0,
@@ -1567,6 +1947,337 @@ mod tests {
         assert!(!properties_locked.can_edit_contents);
         assert!(!properties_locked.can_edit_color);
         assert!(!properties_locked.can_delete);
+        assert!(
+            backend
+                .update_annotation(AnnotationUpdateRequest {
+                    id: contents_locked.id,
+                    expected_revision: 0,
+                    contents: Some("拒否される更新".to_owned()),
+                    color: None,
+                })
+                .is_err()
+        );
+        assert!(
+            backend
+                .update_annotation(AnnotationUpdateRequest {
+                    id: properties_locked.id,
+                    expected_revision: 0,
+                    contents: None,
+                    color: Some(PdfAnnotationColor::Rgb {
+                        red: 1.0,
+                        green: 0.0,
+                        blue: 0.0,
+                    }),
+                })
+                .is_err()
+        );
+        assert!(
+            backend
+                .delete_annotation(AnnotationDeleteRequest {
+                    id: properties_locked.id,
+                    expected_revision: 0,
+                })
+                .is_err()
+        );
+        assert_eq!(backend.info().unwrap().revision, 0);
+        assert!(!backend.info().unwrap().dirty);
+    }
+
+    #[test]
+    fn updates_existing_highlight_and_undo_restores_exact_properties() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("update-highlight.pdf");
+        let path_text = path.to_str().unwrap();
+        let expected_xref;
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut annotation = page
+                .add_highlight_annotation(Quad::from(Rect::new(30.0, 40.0, 130.0, 60.0)))
+                .unwrap();
+            annotation.set_contents("更新前").unwrap();
+            annotation
+                .set_color(AnnotationColor::Rgb {
+                    red: 0.1,
+                    green: 0.2,
+                    blue: 0.8,
+                })
+                .unwrap();
+            annotation.set_opacity(0.65).unwrap();
+            expected_xref = annotation.xref().unwrap();
+            annotation.update().unwrap();
+            page.update().unwrap();
+            drop(annotation);
+            drop(page);
+            document.save(path_text).unwrap();
+        }
+
+        let mut backend = MuPdfBackend::open(path).unwrap();
+        let id = AnnotationId {
+            page_index: 0,
+            xref: expected_xref,
+        };
+        let action = backend
+            .update_annotation(AnnotationUpdateRequest {
+                id,
+                expected_revision: 0,
+                contents: Some("日本語\nupdated".to_owned()),
+                color: Some(PdfAnnotationColor::Rgb {
+                    red: 0.9,
+                    green: 0.1,
+                    blue: 0.2,
+                }),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            action,
+            EditAction::UpdateAnnotation {
+                annotation_id,
+                revision_after: 1
+            } if annotation_id == id
+        ));
+        assert!(backend.info().unwrap().dirty);
+        let updated = backend
+            .annotation_page(AnnotationPageRequest {
+                page_index: 0,
+                expected_revision: 1,
+            })
+            .unwrap()
+            .unwrap();
+        let updated = &updated.annotations[0];
+        assert_eq!(updated.id, id);
+        assert_eq!(updated.contents, "日本語\nupdated");
+        assert!(annotation_colors_match(
+            updated.color,
+            Some(PdfAnnotationColor::Rgb {
+                red: 0.9,
+                green: 0.1,
+                blue: 0.2,
+            })
+        ));
+        assert!(property_matches(updated.opacity, 0.65));
+
+        backend.undo(action).unwrap();
+
+        assert!(!backend.info().unwrap().dirty);
+        let restored = backend
+            .annotation_page(AnnotationPageRequest {
+                page_index: 0,
+                expected_revision: 2,
+            })
+            .unwrap()
+            .unwrap();
+        let restored = &restored.annotations[0];
+        assert_eq!(restored.id, id);
+        assert_eq!(restored.contents, "更新前");
+        assert!(annotation_colors_match(
+            restored.color,
+            Some(PdfAnnotationColor::Rgb {
+                red: 0.1,
+                green: 0.2,
+                blue: 0.8,
+            })
+        ));
+        assert!(property_matches(restored.opacity, 0.65));
+    }
+
+    #[test]
+    fn update_and_delete_survive_save_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("persist-mutations.pdf");
+        let path_text = path.to_str().unwrap();
+        let update_xref;
+        let delete_xref;
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut update_target = page
+                .add_highlight_annotation(Quad::from(Rect::new(20.0, 30.0, 120.0, 50.0)))
+                .unwrap();
+            update_xref = update_target.xref().unwrap();
+            update_target.update().unwrap();
+            drop(update_target);
+            let mut delete_target = page
+                .add_highlight_annotation(Quad::from(Rect::new(20.0, 70.0, 120.0, 90.0)))
+                .unwrap();
+            delete_target.set_contents("削除対象").unwrap();
+            delete_xref = delete_target.xref().unwrap();
+            delete_target.update().unwrap();
+            page.update().unwrap();
+            drop(delete_target);
+            drop(page);
+            document.save(path_text).unwrap();
+        }
+
+        let mut backend = MuPdfBackend::open(path).unwrap();
+        backend
+            .update_annotation(AnnotationUpdateRequest {
+                id: AnnotationId {
+                    page_index: 0,
+                    xref: update_xref,
+                },
+                expected_revision: 0,
+                contents: Some("保存後コメント\nsecond line".to_owned()),
+                color: Some(PdfAnnotationColor::Rgb {
+                    red: 0.2,
+                    green: 0.8,
+                    blue: 0.3,
+                }),
+            })
+            .unwrap();
+        backend
+            .delete_annotation(AnnotationDeleteRequest {
+                id: AnnotationId {
+                    page_index: 0,
+                    xref: delete_xref,
+                },
+                expected_revision: 1,
+            })
+            .unwrap();
+        backend
+            .update_annotation(AnnotationUpdateRequest {
+                id: AnnotationId {
+                    page_index: 0,
+                    xref: update_xref,
+                },
+                expected_revision: 2,
+                contents: Some("最後のコメント\nsecond line".to_owned()),
+                color: None,
+            })
+            .unwrap();
+
+        assert_eq!(backend.save().unwrap(), 1);
+        assert!(!backend.info().unwrap().dirty);
+        let saved = backend
+            .annotation_page(AnnotationPageRequest {
+                page_index: 0,
+                expected_revision: 4,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.annotations.len(), 1);
+        assert_eq!(saved.annotations[0].id.xref, update_xref);
+        assert_eq!(saved.annotations[0].contents, "最後のコメント\nsecond line");
+        assert!(annotation_colors_match(
+            saved.annotations[0].color,
+            Some(PdfAnnotationColor::Rgb {
+                red: 0.2,
+                green: 0.8,
+                blue: 0.3,
+            })
+        ));
+    }
+
+    #[test]
+    fn delete_undo_restores_target_and_leaves_other_annotation_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("delete-undo.pdf");
+        let path_text = path.to_str().unwrap();
+        let target_xref;
+        let other_xref;
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut target = page
+                .add_highlight_annotation(Quad::from(Rect::new(20.0, 30.0, 120.0, 50.0)))
+                .unwrap();
+            target.set_contents("復元対象").unwrap();
+            target.set_opacity(0.4).unwrap();
+            target_xref = target.xref().unwrap();
+            target.update().unwrap();
+            drop(target);
+            let mut other = page
+                .add_highlight_annotation(Quad::from(Rect::new(20.0, 70.0, 120.0, 90.0)))
+                .unwrap();
+            other.set_contents("変更しない").unwrap();
+            other_xref = other.xref().unwrap();
+            other.update().unwrap();
+            page.update().unwrap();
+            drop(other);
+            drop(page);
+            document.save(path_text).unwrap();
+        }
+
+        let mut backend = MuPdfBackend::open(path).unwrap();
+        let target_id = AnnotationId {
+            page_index: 0,
+            xref: target_xref,
+        };
+        let action = backend
+            .delete_annotation(AnnotationDeleteRequest {
+                id: target_id,
+                expected_revision: 0,
+            })
+            .unwrap();
+        let deleted = backend
+            .annotation_page(AnnotationPageRequest {
+                page_index: 0,
+                expected_revision: 1,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(deleted.annotations.len(), 1);
+        assert_eq!(deleted.annotations[0].id.xref, other_xref);
+
+        backend.undo(action).unwrap();
+
+        let restored = backend
+            .annotation_page(AnnotationPageRequest {
+                page_index: 0,
+                expected_revision: 2,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.annotations.len(), 2);
+        let target = restored
+            .annotations
+            .iter()
+            .find(|annotation| annotation.id == target_id)
+            .unwrap();
+        assert_eq!(target.contents, "復元対象");
+        assert!(property_matches(target.opacity, 0.4));
+        assert!(
+            restored
+                .annotations
+                .iter()
+                .any(|annotation| annotation.id.xref == other_xref
+                    && annotation.contents == "変更しない")
+        );
+        assert!(!backend.info().unwrap().dirty);
+    }
+
+    #[test]
+    fn stale_or_wrong_annotation_identity_is_rejected_without_dirtying_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reject-stale-annotation.pdf");
+        write_blank_pdf_for_test(&path);
+        let mut backend = MuPdfBackend::open(path).unwrap();
+
+        let missing = AnnotationId {
+            page_index: 0,
+            xref: 999_999,
+        };
+        assert!(
+            backend
+                .update_annotation(AnnotationUpdateRequest {
+                    id: missing,
+                    expected_revision: 1,
+                    contents: Some("stale".to_owned()),
+                    color: None,
+                })
+                .is_err()
+        );
+        assert!(
+            backend
+                .delete_annotation(AnnotationDeleteRequest {
+                    id: missing,
+                    expected_revision: 0,
+                })
+                .is_err()
+        );
+        assert_eq!(backend.info().unwrap().revision, 0);
+        assert!(!backend.info().unwrap().dirty);
     }
 
     #[test]
@@ -1650,11 +2361,14 @@ mod tests {
                 }],
             )
             .unwrap();
-        let created_xref = match &action {
-            EditAction::CreateHighlight {
-                annotation_xref, ..
-            } => *annotation_xref,
+        let EditAction::CreateHighlight {
+            annotation_xref: created_xref,
+            ..
+        } = &action
+        else {
+            panic!("create_highlight must return a create action");
         };
+        let created_xref = *created_xref;
         assert_ne!(created_xref, existing_xref);
         assert!(backend.info().unwrap().dirty);
         assert!(
@@ -1674,7 +2388,47 @@ mod tests {
             .map(|annotation| annotation.xref().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(remaining_xrefs, vec![existing_xref]);
-        assert!(backend.pending_highlights.is_empty());
+        assert!(backend.pending_edits.is_empty());
+        assert!(!backend.info().unwrap().dirty);
+    }
+
+    #[test]
+    fn undo_rejects_non_latest_edit_and_preserves_history_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("undo-order.pdf");
+        write_blank_pdf_for_test(&path);
+        let mut backend = MuPdfBackend::open(path).unwrap();
+        let first = backend
+            .create_highlight(
+                0,
+                &[PageQuad {
+                    upper_left: PagePoint::new(20.0, 20.0),
+                    upper_right: PagePoint::new(80.0, 20.0),
+                    lower_left: PagePoint::new(20.0, 40.0),
+                    lower_right: PagePoint::new(80.0, 40.0),
+                }],
+            )
+            .unwrap();
+        let second = backend
+            .create_highlight(
+                0,
+                &[PageQuad {
+                    upper_left: PagePoint::new(20.0, 60.0),
+                    upper_right: PagePoint::new(80.0, 60.0),
+                    lower_left: PagePoint::new(20.0, 80.0),
+                    lower_right: PagePoint::new(80.0, 80.0),
+                }],
+            )
+            .unwrap();
+
+        assert!(backend.undo(first.clone()).is_err());
+        assert_eq!(backend.pending_edits.len(), 2);
+        assert_eq!(highlight_count(&backend.document).unwrap(), 2);
+
+        backend.undo(second).unwrap();
+        backend.undo(first).unwrap();
+        assert!(backend.pending_edits.is_empty());
+        assert_eq!(highlight_count(&backend.document).unwrap(), 0);
         assert!(!backend.info().unwrap().dirty);
     }
 

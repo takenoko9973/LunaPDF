@@ -7,7 +7,9 @@ use crossbeam_channel::{
     Receiver, Sender, TryRecvError, TrySendError, bounded, select_biased, unbounded,
 };
 
-use crate::domain::annotation::{AnnotationPageRequest, AnnotationPageSnapshot};
+use crate::domain::annotation::{
+    AnnotationDeleteRequest, AnnotationPageRequest, AnnotationPageSnapshot, AnnotationUpdateRequest,
+};
 use crate::domain::document::{
     DocumentInfo, DocumentVersion, EditAction, HighlightRequest, OutlineItem, RenderPriority,
     RenderedThumbnail, RenderedTile, SearchPageResult, ThumbnailRequest, TileRequest,
@@ -29,6 +31,8 @@ pub(crate) enum DocumentCommand {
     LoadTextSnapshot(TextSnapshotRequest),
     LoadAnnotations(AnnotationPageRequest),
     CreateHighlight(HighlightRequest),
+    UpdateAnnotation(AnnotationUpdateRequest),
+    DeleteAnnotation(AnnotationDeleteRequest),
     /// Removes the exact application-owned edit identified by the backend.
     Undo(EditAction),
     LoadOutline,
@@ -63,7 +67,7 @@ pub(crate) enum DocumentEvent {
         request: AnnotationPageRequest,
         message: String,
     },
-    /// Returns the stable identity produced when a document edit is created.
+    /// Returns the stable identity produced when a document edit completes.
     EditActionCreated(EditAction),
     /// Confirms that the requested edit was removed from the in-memory PDF.
     EditActionUndone(EditAction),
@@ -402,6 +406,29 @@ fn run_worker(
                     Err(error) => send_failure(&event_sender, "highlight", error),
                 }
             }
+            DocumentCommand::UpdateAnnotation(request) => {
+                match backend.update_annotation(request) {
+                    Ok(action) => {
+                        let _ = event_sender.send(DocumentEvent::EditActionCreated(action));
+                        let _ = event_sender.send(DocumentEvent::Status(
+                            "注釈のコメントと色を更新しました".to_owned(),
+                        ));
+                        send_info(&backend, &event_sender, "annotation-update-state");
+                    }
+                    Err(error) => send_failure(&event_sender, "annotation-update", error),
+                }
+            }
+            DocumentCommand::DeleteAnnotation(request) => {
+                match backend.delete_annotation(request) {
+                    Ok(action) => {
+                        let _ = event_sender.send(DocumentEvent::EditActionCreated(action));
+                        let _ = event_sender
+                            .send(DocumentEvent::Status("注釈を削除しました".to_owned()));
+                        send_info(&backend, &event_sender, "annotation-delete-state");
+                    }
+                    Err(error) => send_failure(&event_sender, "annotation-delete", error),
+                }
+            }
             DocumentCommand::Undo(action) => match backend.undo(action.clone()) {
                 Ok(()) => {
                     let _ = event_sender.send(DocumentEvent::EditActionUndone(action));
@@ -650,9 +677,11 @@ fn send_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::annotation::{AnnotationId, PdfAnnotationColor};
     use crate::domain::document::TileSpec;
-    use mupdf::Size;
+    use mupdf::color::AnnotationColor;
     use mupdf::pdf::PdfDocument;
+    use mupdf::{Quad, Rect, Size};
     use std::time::{Duration, Instant};
 
     fn tile_request(priority: RenderPriority) -> TileRequest {
@@ -986,6 +1015,85 @@ mod tests {
                     std::thread::yield_now();
                 }
                 Err(error) => panic!("worker did not return annotations: {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn annotation_update_command_returns_history_action_and_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("annotation-update.pdf");
+        let path_text = path.to_str().unwrap();
+        let xref;
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut annotation = page
+                .add_highlight_annotation(Quad::from(Rect::new(20.0, 30.0, 120.0, 50.0)))
+                .unwrap();
+            annotation
+                .set_color(AnnotationColor::Rgb {
+                    red: 1.0,
+                    green: 1.0,
+                    blue: 0.0,
+                })
+                .unwrap();
+            xref = annotation.xref().unwrap();
+            annotation.update().unwrap();
+            page.update().unwrap();
+            drop(annotation);
+            drop(page);
+            document.save(path_text).unwrap();
+        }
+        let service = DocumentService::spawn(path);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut action_received = false;
+        let mut revision_received = false;
+
+        loop {
+            match service.try_recv() {
+                Ok(DocumentEvent::Opened(_)) => {
+                    assert!(service.send(DocumentCommand::UpdateAnnotation(
+                        AnnotationUpdateRequest {
+                            id: AnnotationId {
+                                page_index: 0,
+                                xref,
+                            },
+                            expected_revision: 0,
+                            contents: Some("worker update".to_owned()),
+                            color: Some(PdfAnnotationColor::Rgb {
+                                red: 0.2,
+                                green: 0.3,
+                                blue: 0.9,
+                            }),
+                        },
+                    )));
+                }
+                Ok(DocumentEvent::EditActionCreated(EditAction::UpdateAnnotation {
+                    annotation_id,
+                    revision_after,
+                })) => {
+                    assert_eq!(annotation_id.xref, xref);
+                    assert_eq!(revision_after, 1);
+                    action_received = true;
+                }
+                Ok(DocumentEvent::DocumentChanged(info)) => {
+                    if info.revision == 1 {
+                        assert!(info.dirty);
+                        revision_received = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    if action_received && revision_received {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("worker did not complete annotation update: {error:?}"),
+            }
+            if action_received && revision_received {
+                break;
             }
         }
     }

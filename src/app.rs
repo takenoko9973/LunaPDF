@@ -12,7 +12,9 @@ use eframe::egui::{
     ViewportCommand,
 };
 
-use crate::domain::annotation::{AnnotationId, AnnotationPageRequest, AnnotationPageSnapshot};
+use crate::domain::annotation::{
+    AnnotationDeleteRequest, AnnotationId, AnnotationPageRequest, AnnotationPageSnapshot,
+};
 use crate::domain::document::{
     DocumentInfo, EditAction, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail,
     RenderedTile, SearchMatch, SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
@@ -171,7 +173,7 @@ struct DocumentTab {
     wanted_annotation_pages: HashSet<AnnotationPageRequest>,
     selection: Option<SelectionSnapshot>,
     selection_generation: u64,
-    pending_highlights: usize,
+    pending_edits: usize,
     edit_history: Vec<EditAction>,
     undo_in_flight: bool,
     save_in_flight: bool,
@@ -777,6 +779,17 @@ impl PrototypeApp {
                     }
                     Ok(DocumentEvent::DocumentChanged(info)) => {
                         let saved_path = (!info.dirty).then(|| info.path.clone());
+                        let document_id = self.documents[index].document_id;
+                        if !info.dirty
+                            && self
+                                .annotation_editor
+                                .as_ref()
+                                .is_some_and(|editor| editor.document_id == document_id)
+                        {
+                            // Save reopens the PDF and begins a new xref/revision
+                            // validity interval; even a clean old editor must not survive it.
+                            self.annotation_editor = None;
+                        }
                         let restart_search = self.active_index() == Some(index)
                             && self.close_confirmation.is_none()
                             && !self.window_close_pending
@@ -894,10 +907,26 @@ impl PrototypeApp {
                         }
                     }
                     Ok(DocumentEvent::EditActionCreated(action)) => {
+                        let completed_annotation = match &action {
+                            EditAction::CreateHighlight { .. } => None,
+                            EditAction::UpdateAnnotation { annotation_id, .. }
+                            | EditAction::DeleteAnnotation { annotation_id, .. } => {
+                                Some(*annotation_id)
+                            }
+                        };
+                        let document_id = self.documents[index].document_id;
                         let tab = &mut self.documents[index];
-                        tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
+                        tab.pending_edits = tab.pending_edits.saturating_sub(1);
                         tab.edit_history.push(action);
                         tab.state = DocumentState::ReadyDirty;
+                        if completed_annotation.is_some_and(|annotation_id| {
+                            self.annotation_editor.as_ref().is_some_and(|editor| {
+                                editor.document_id == document_id
+                                    && editor.annotation_id == annotation_id
+                            })
+                        }) {
+                            self.annotation_editor = None;
+                        }
                     }
                     Ok(DocumentEvent::EditActionUndone(action)) => {
                         let tab = &mut self.documents[index];
@@ -1106,17 +1135,36 @@ impl PrototypeApp {
                             Some(document_failure_message(operation, &message));
                         if operation == "highlight" {
                             let tab = &mut self.documents[index];
-                            tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
+                            tab.pending_edits = tab.pending_edits.saturating_sub(1);
                             if !tab.has_unsaved_changes() && !tab.is_saving() {
                                 tab.state = DocumentState::ReadyClean;
                             }
                         }
                         if operation == "highlight-state" {
                             let tab = &mut self.documents[index];
-                            tab.pending_highlights = tab.pending_highlights.saturating_sub(1);
+                            tab.pending_edits = tab.pending_edits.saturating_sub(1);
                             // MuPDF already created the annotation; only the
                             // follow-up snapshot failed, so remain dirty.
                             tab.state = DocumentState::ReadyDirty;
+                        }
+                        if operation == "annotation-update" || operation == "annotation-delete" {
+                            let document_id = self.documents[index].document_id;
+                            let tab = &mut self.documents[index];
+                            tab.pending_edits = tab.pending_edits.saturating_sub(1);
+                            if !tab.has_unsaved_changes() && !tab.is_saving() {
+                                tab.state = DocumentState::ReadyClean;
+                            }
+                            if let Some(editor) = self
+                                .annotation_editor
+                                .as_mut()
+                                .filter(|editor| editor.document_id == document_id)
+                            {
+                                editor.mutation_in_flight = false;
+                                editor.notice = Some(
+                                    "注釈を変更できませんでした。PDFの編集制限を確認してください。"
+                                        .to_owned(),
+                                );
+                            }
                         }
                         if operation == "search" {
                             // A page error normally repeats for every queued page.
@@ -1154,7 +1202,19 @@ impl PrototypeApp {
                             break;
                         }
                         let failed_path = self.tabs.tabs()[index].path().to_path_buf();
+                        let document_id = self.documents[index].document_id;
                         self.documents[index].mark_worker_disconnected();
+                        if let Some(editor) = self
+                            .annotation_editor
+                            .as_mut()
+                            .filter(|editor| editor.document_id == document_id)
+                        {
+                            editor.mutation_in_flight = false;
+                            editor.notice = Some(
+                                "文書処理が停止したため、注釈の変更を完了できませんでした。"
+                                    .to_owned(),
+                            );
+                        }
                         if let Some(confirmation) = &mut self.close_confirmation
                             && confirmation.path == failed_path
                         {
@@ -1267,7 +1327,9 @@ impl PrototypeApp {
                     .annotation_editor
                     .as_mut()
                     .expect("active document editor checked above");
-                if editor.is_dirty() {
+                if editor.mutation_in_flight {
+                    editor.notice = Some("注釈処理の完了を待っています。".to_owned());
+                } else if editor.is_dirty() {
                     editor.notice = Some(
                         "未保存の変更があります。保存または変更を破棄してください。".to_owned(),
                     );
@@ -1318,7 +1380,20 @@ impl PrototypeApp {
             || self.close_confirmation.is_some();
         let save_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::S));
         if save_pressed && !close_flow_active {
-            self.save();
+            let annotation_editor_can_save = self.active_index().is_some_and(|index| {
+                let document_id = self.documents[index].document_id;
+                self.annotation_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.document_id == document_id && editor.can_save())
+            });
+            if annotation_editor_can_save {
+                self.request_annotation_update(
+                    self.active_index()
+                        .expect("an active annotation editor belongs to an active tab"),
+                );
+            } else {
+                self.save();
+            }
         }
         let print_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::P));
         if print_pressed && !close_flow_active && cfg!(windows) && self.can_print() {
@@ -1327,7 +1402,20 @@ impl PrototypeApp {
         let undo_pressed = !text_input_has_focus
             && context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Z));
         if undo_pressed && !close_flow_active {
-            self.undo();
+            let editor_blocks_undo = self
+                .annotation_editor
+                .as_ref()
+                .is_some_and(|editor| editor.is_dirty() || editor.mutation_in_flight);
+            if editor_blocks_undo {
+                if let Some(editor) = &mut self.annotation_editor {
+                    editor.notice = Some(
+                        "PDFの編集を元に戻す前に、注釈の変更を保存または破棄してください。"
+                            .to_owned(),
+                    );
+                }
+            } else {
+                self.undo();
+            }
         }
         let active_text_input = self.active_text_input_id(context);
         let highlight_pressed = consume_highlight_shortcut(context, active_text_input);
@@ -1500,7 +1588,16 @@ impl PrototypeApp {
         let candidates = self
             .documents
             .iter()
-            .map(|document| (document.is_suspendable(), document.last_selected_sequence))
+            .map(|document| {
+                let owns_editor = self
+                    .annotation_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.document_id == document.document_id);
+                (
+                    document.is_suspendable() && !owns_editor,
+                    document.last_selected_sequence,
+                )
+            })
             .collect::<Vec<_>>();
         let Some(index) = oldest_suspendable_index(self.active_index(), &candidates) else {
             return;
@@ -1540,6 +1637,38 @@ impl PrototypeApp {
         self.select_tab(next);
     }
 
+    fn focus_blocking_annotation_editor(&mut self, only_index: Option<usize>) -> bool {
+        let Some(editor) = self
+            .annotation_editor
+            .as_ref()
+            .filter(|editor| editor.is_dirty() || editor.mutation_in_flight)
+        else {
+            return false;
+        };
+        let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.document_id == editor.document_id)
+        else {
+            return false;
+        };
+        if only_index.is_some_and(|only_index| only_index != index) {
+            return false;
+        }
+        self.select_tab(index);
+        let editor = self
+            .annotation_editor
+            .as_mut()
+            .expect("the blocking editor was found above");
+        editor.notice = Some(if editor.mutation_in_flight {
+            "注釈処理の完了後にタブを閉じてください。".to_owned()
+        } else {
+            "タブを閉じる前に、注釈の変更を保存または破棄してください。".to_owned()
+        });
+        self.status = "注釈編集オーバーレイで変更を確定してください".to_owned();
+        true
+    }
+
     fn close_tab(&mut self, index: usize) {
         if let Some(document) = self.documents.get_mut(index) {
             document.view.stop_autoscroll();
@@ -1557,6 +1686,12 @@ impl PrototypeApp {
             self.status = "印刷処理の完了を待ってからタブを閉じます…".to_owned();
             return;
         }
+        if self.focus_blocking_annotation_editor(Some(index)) {
+            return;
+        }
+        let Some(document) = self.documents.get(index) else {
+            return;
+        };
         if document.has_unsaved_changes() {
             self.close_confirmation = Some(CloseConfirmation {
                 scope: CloseScope::Tab,
@@ -1570,6 +1705,9 @@ impl PrototypeApp {
 
     fn request_close_all(&mut self) {
         if self.window_close_pending || self.close_confirmation.is_some() {
+            return;
+        }
+        if self.focus_blocking_annotation_editor(None) {
             return;
         }
         self.close_all_pending = true;
@@ -1620,6 +1758,10 @@ impl PrototypeApp {
 
     fn remove_tab_now(&mut self, index: usize) -> bool {
         let previous_selection = self.active_index();
+        let document_id = self
+            .documents
+            .get(index)
+            .map(|document| document.document_id);
         if self.tabs.close(index).is_none() {
             return false;
         }
@@ -1631,6 +1773,20 @@ impl PrototypeApp {
             self.thumbnail_lru.remove(key);
         }
         self.documents.remove(index);
+        if document_id.is_some_and(|document_id| {
+            self.annotation_editor
+                .as_ref()
+                .is_some_and(|editor| editor.document_id == document_id)
+        }) {
+            self.annotation_editor = None;
+        }
+        if document_id.is_some_and(|document_id| {
+            self.annotation_picker
+                .as_ref()
+                .is_some_and(|picker| picker.document_id == document_id)
+        }) {
+            self.annotation_picker = None;
+        }
         self.tab_to_reveal = tab_reveal_after_close(previous_selection, index, self.active_index());
         if was_restoring {
             // Closing an opening restore tab consumes its pending result; the
@@ -1702,6 +1858,10 @@ impl PrototypeApp {
         // eframe closes the native window unless cancellation is sent during
         // the same frame in which the OS close request is observed.
         context.send_viewport_cmd(ViewportCommand::CancelClose);
+        if self.focus_blocking_annotation_editor(None) {
+            self.window_close_pending = false;
+            return;
+        }
         self.window_close_pending = true;
         if self.close_confirmation.is_none() {
             self.prompt_next_window_document(context);
@@ -1902,7 +2062,7 @@ impl PrototypeApp {
         let save_in_flight = confirmation.save_in_flight;
 
         let modal = egui::Modal::new(Id::new("unsaved-document-close")).show(context, |ui| {
-            ui.heading("未保存のハイライトがあります");
+            ui.heading("未保存のPDF編集があります");
             ui.label(format!("{file_name} の変更を保存しますか？"));
             ui.horizontal(|ui| {
                 let save = ui
@@ -2051,11 +2211,7 @@ impl PrototypeApp {
                 self.open_annotation_editor(index, revision, annotation_id);
             }
             AnnotationUiAction::DeleteAnnotation(annotation_id) => {
-                self.open_annotation_editor(index, revision, annotation_id);
-                if let Some(editor) = &mut self.annotation_editor {
-                    editor.notice =
-                        Some("削除する場合は下部の「注釈を削除」を選択してください。".to_owned());
-                }
+                self.request_annotation_delete(index, revision, annotation_id);
             }
             AnnotationUiAction::ChooseAnnotation(candidates) => {
                 self.annotation_picker = Some(AnnotationPickerState {
@@ -2113,6 +2269,100 @@ impl PrototypeApp {
         self.annotation_picker = None;
     }
 
+    fn request_annotation_update(&mut self, index: usize) {
+        let document_id = self.documents[index].document_id;
+        let Some(editor) = self
+            .annotation_editor
+            .as_ref()
+            .filter(|editor| editor.document_id == document_id && editor.can_save())
+        else {
+            return;
+        };
+        let request = editor
+            .update_request()
+            .expect("the filtered editor has a valid update request");
+        if self.documents[index].send(DocumentCommand::UpdateAnnotation(request)) {
+            let tab = &mut self.documents[index];
+            tab.pending_edits += 1;
+            tab.state = DocumentState::ReadyDirty;
+            let editor = self
+                .annotation_editor
+                .as_mut()
+                .expect("the update request was built from this editor");
+            editor.mutation_in_flight = true;
+            editor.notice = Some("注釈の変更を反映しています…".to_owned());
+            self.status = "注釈の変更を反映しています…".to_owned();
+        } else {
+            self.error = Some(
+                "注釈を更新できません。文書処理が停止しているため、タブを開き直してください。"
+                    .to_owned(),
+            );
+        }
+    }
+
+    fn request_annotation_delete(
+        &mut self,
+        index: usize,
+        revision: u64,
+        annotation_id: AnnotationId,
+    ) {
+        let document_id = self.documents[index].document_id;
+        if let Some(editor) = &mut self.annotation_editor {
+            let same_target = editor.document_id == document_id
+                && editor.revision == revision
+                && editor.annotation_id == annotation_id;
+            if !same_target && (editor.is_dirty() || editor.mutation_in_flight) {
+                // Context-menu deletion of another annotation must not make an
+                // unrelated edit buffer disappear or become attached to a new target.
+                editor.notice = Some(
+                    "別の注釈を削除する前に、現在の変更を保存または破棄してください。".to_owned(),
+                );
+                return;
+            }
+        }
+        let request_key = AnnotationPageRequest {
+            page_index: annotation_id.page_index,
+            expected_revision: revision,
+        };
+        let can_delete = self.documents[index]
+            .annotation_pages
+            .get(&request_key)
+            .and_then(|page| {
+                page.annotations
+                    .iter()
+                    .find(|annotation| annotation.id == annotation_id)
+            })
+            .is_some_and(|annotation| annotation.can_delete);
+        if !can_delete {
+            self.error = Some(
+                "注釈を削除できません。PDFの編集制限または注釈ロックを確認してください。"
+                    .to_owned(),
+            );
+            return;
+        }
+        let request = AnnotationDeleteRequest {
+            id: annotation_id,
+            expected_revision: revision,
+        };
+        if self.documents[index].send(DocumentCommand::DeleteAnnotation(request)) {
+            let tab = &mut self.documents[index];
+            tab.pending_edits += 1;
+            tab.state = DocumentState::ReadyDirty;
+            if let Some(editor) = self.annotation_editor.as_mut().filter(|editor| {
+                editor.document_id == document_id && editor.annotation_id == annotation_id
+            }) {
+                editor.mutation_in_flight = true;
+                editor.notice = Some("注釈を削除しています…".to_owned());
+            }
+            self.status = "注釈を削除しています…".to_owned();
+        } else {
+            self.error = Some(
+                "注釈を削除できません。文書処理が停止しているため、タブを開き直してください。"
+                    .to_owned(),
+            );
+        }
+    }
+
     fn create_highlight(&mut self) {
         if self.window_close_pending || self.close_all_pending || self.close_confirmation.is_some()
         {
@@ -2154,7 +2404,7 @@ impl PrototypeApp {
         if tab.send(DocumentCommand::CreateHighlight(request)) {
             // This local pending count closes the race before MuPDF reports its
             // dirty flag back from the document worker.
-            tab.pending_highlights += 1;
+            tab.pending_edits += 1;
             tab.state = DocumentState::ReadyDirty;
             self.status = "Creating PDF Highlight annotation…".to_owned();
         } else {
@@ -2209,8 +2459,8 @@ impl PrototypeApp {
         let Some(info) = &tab.info else {
             return;
         };
-        if !info.dirty && tab.pending_highlights == 0 {
-            self.status = "No unsaved Highlight annotations".to_owned();
+        if !info.dirty && tab.pending_edits == 0 {
+            self.status = "保存されていないPDF編集はありません".to_owned();
             return;
         }
 
@@ -2234,6 +2484,11 @@ impl PrototypeApp {
     fn tab_bar(&mut self, root_ui: &mut egui::Ui) {
         let selected_index = self.active_index();
         let tab_to_reveal = self.tab_to_reveal.take();
+        let editor_dirty_document = self
+            .annotation_editor
+            .as_ref()
+            .filter(|editor| editor.is_dirty() || editor.mutation_in_flight)
+            .map(|editor| editor.document_id);
         let mut select_request = None;
         let mut close_request = None;
         egui::Panel::top("tabs").show(root_ui, |ui| {
@@ -2249,7 +2504,8 @@ impl PrototypeApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = TAB_ITEM_SPACING;
                     for (index, tab) in self.tabs.tabs().iter().enumerate() {
-                        let dirty = self.documents[index].has_unsaved_changes();
+                        let dirty = self.documents[index].has_unsaved_changes()
+                            || editor_dirty_document == Some(self.documents[index].document_id);
                         let marker = if dirty { "● " } else { "" };
                         let title = tab
                             .path()
@@ -2753,6 +3009,15 @@ impl PrototypeApp {
         {
             return false;
         }
+        if self.active_index().is_some_and(|index| {
+            let document_id = self.documents[index].document_id;
+            self.annotation_editor.as_ref().is_some_and(|editor| {
+                editor.document_id == document_id
+                    && (editor.is_dirty() || editor.mutation_in_flight)
+            })
+        }) {
+            return false;
+        }
         self.active_index().is_some_and(|index| {
             let tab = &self.documents[index];
             !tab.edit_history.is_empty()
@@ -3154,21 +3419,14 @@ impl PrototypeApp {
                 self.annotation_editor = None;
             }
             Some(AnnotationEditorAction::Save) => {
-                // Backend mutation is connected in the following phase; keep
-                // the edit buffer intact rather than pretending it was saved.
-                if let Some(editor) = &mut self.annotation_editor {
-                    editor.notice = Some(
-                        "注釈更新処理を準備しています。変更はまだPDFへ反映されていません。"
-                            .to_owned(),
-                    );
-                }
+                self.request_annotation_update(index);
             }
             Some(AnnotationEditorAction::Delete) => {
-                if let Some(editor) = &mut self.annotation_editor {
-                    editor.notice = Some(
-                        "注釈削除処理を準備しています。注釈はまだ削除されていません。".to_owned(),
-                    );
-                }
+                let editor = self
+                    .annotation_editor
+                    .as_ref()
+                    .expect("delete action requires an open editor");
+                self.request_annotation_delete(index, editor.revision, editor.annotation_id);
             }
             None => {}
         }
@@ -4387,7 +4645,7 @@ impl DocumentTab {
             wanted_annotation_pages: HashSet::new(),
             selection: None,
             selection_generation: 0,
-            pending_highlights: 0,
+            pending_edits: 0,
             edit_history: Vec::new(),
             undo_in_flight: false,
             save_in_flight: false,
@@ -4439,7 +4697,7 @@ impl DocumentTab {
     fn mark_worker_disconnected(&mut self) {
         // No completion event can arrive after channel disconnection. Clear
         // every response-waiting flag so close and recovery actions remain usable.
-        self.pending_highlights = 0;
+        self.pending_edits = 0;
         self.pending_annotation_pages.clear();
         self.undo_in_flight = false;
         self.save_in_flight = false;
@@ -4602,7 +4860,7 @@ impl DocumentTab {
 
     fn has_unsaved_changes(&self) -> bool {
         self.state == DocumentState::ReadyDirty
-            || self.pending_highlights > 0
+            || self.pending_edits > 0
             || self.info.as_ref().is_some_and(|info| info.dirty)
     }
 
@@ -5127,6 +5385,12 @@ fn document_failure_message(operation: &str, detail: &str) -> String {
         "selection" => "テキストを選択できませんでした。選択し直してください。",
         "highlight" | "highlight-state" => {
             "Highlightを作成できませんでした。PDFの編集制限を確認してください。"
+        }
+        "annotation-update" | "annotation-update-state" => {
+            "注釈を更新できませんでした。PDFの編集制限と注釈ロックを確認してください。"
+        }
+        "annotation-delete" | "annotation-delete-state" => {
+            "注釈を削除できませんでした。PDFの編集制限と注釈ロックを確認してください。"
         }
         "undo" | "undo-state" => {
             "編集を元に戻せませんでした。PDFを開き直して状態を確認してください。"
@@ -6560,7 +6824,7 @@ mod tests {
     fn worker_disconnect_clears_every_close_blocking_operation() {
         let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None, false);
         tab.state = DocumentState::Saving;
-        tab.pending_highlights = 1;
+        tab.pending_edits = 1;
         tab.pending_annotation_pages.insert(AnnotationPageRequest {
             page_index: 0,
             expected_revision: 0,
@@ -6571,7 +6835,7 @@ mod tests {
 
         tab.mark_worker_disconnected();
 
-        assert_eq!(tab.pending_highlights, 0);
+        assert_eq!(tab.pending_edits, 0);
         assert!(tab.pending_annotation_pages.is_empty());
         assert!(!tab.undo_in_flight);
         assert!(!tab.is_saving());

@@ -311,3 +311,64 @@ cargo clippy --all-targets
 - Clippy：警告なし
 
 実際のコンテキストメニュー操作、IME、foreground Areaによる背後入力遮断、開閉前後の倍率・スクロール位置は最終実機受入で確認する。
+
+## 6. コメント／色更新、削除、Undo、dirty、revision、保存
+
+### 修正前の状態と原因
+
+フェーズ5時点では、オーバーレイの保存・削除ボタンは編集バッファを保持したまま「まだPDFへ反映されていない」と表示する入口だけだった。backendの編集履歴も`CreateHighlight`だけであり、dirty判定は未保存の新規Highlight件数、Undoは作成したxrefの削除だけを扱っていた。
+
+このまま既存注釈を更新すると、次が欠ける状態だった。
+
+- コメント／色のworkerコマンドとrevision指定。
+- 削除対象のstable ID検証。
+- 外部注釈を削除した後、外観ストリームや未モデル化メタデータを推測せずに戻すUndo情報。
+- 更新・削除を含むdirtyと保存後検証。
+- 同じ注釈へ複数回変更した場合の最終状態検証。
+
+### 変更
+
+- `AnnotationUpdateRequest`と`AnnotationDeleteRequest`へ文書内のページ＋xref、expected revision、実際に変更したフィールドだけを格納した。
+- 更新・削除前に、文書全体の編集可否、ページ範囲、正のxref、Highlight種別、個別の`ReadOnly`／`Locked`／`LockedContents`を再検証する。UIキャッシュの可否だけを信用しない。
+- コメントはPDF注釈のContents、色はGray／RGB／CMYKへ設定する。色変更を要求しない場合は既存値を読み書きせず、透明度も変更しない。
+- コメントと色を一回の保存操作で変更した場合は一つの`EditAction::UpdateAnnotation`にする。
+- backendの未保存履歴を作成・更新・削除共通のLIFOログへ変更し、dirtyをログの有無から判定する。
+- 作成Undoは従来どおり正確な作成xrefだけを削除する。更新・削除Undoは変更直前のPDFをMuPDFでメモリへシリアライズし、そのsnapshotを復元する。外部注釈の外観ストリーム、作者・日時などアプリがモデル化していない情報を推測再作成しないためである。
+- snapshot復元後の文書はpath associationを持たないため、次回保存は既存の検証付きfull rewriteへ送る。incremental saveへ黙って流さない。
+- LIFO最上位でないUndo、保存で履歴を破棄した後のUndo、別ページ・不存在xref・古いrevisionを拒否する。
+- 保存後はHighlight総数、ページ数に加え、最終xref、Quad、Contents、色、透明度、削除対象の不在を再オープンしたPDFで検証する。同じ注釈の履歴が複数ある場合は、IDごとの最後の期待状態だけを最終PDFと比較する。
+- workerの更新・削除はforeground処理とし、成功したstable actionを既存のタブ別Undo履歴へ積んでから新しい`DocumentInfo`を返す。
+- UIは送信直後からpending editとしてdirty表示し、成功時に編集オーバーレイを閉じる。失敗時はbufferを残して再操作可能にし、worker切断時もin-flight状態を解除する。
+- コンテキストメニューの削除とフォーム下部の削除を同じ`DeleteAnnotation`コマンドへ接続した。
+- `Ctrl+S`は開いている編集bufferがdirtyなら注釈更新を先に実行する。コメント欄フォーカス中の`Ctrl+Z`はTextEditを優先し、dirty bufferがある状態のPDF Undoは無効化して案内する。
+- dirty bufferまたは注釈処理中に、別注釈選択、タブを閉じる、全タブを閉じる、ウィンドウを閉じる操作を行っても無言破棄しない。対象タブと右端オーバーレイを表示し、保存または明示的破棄を促す。タブのdirtyマーカーにも未送信bufferを含める。
+- 保存による再オープンでは、cleanなものも含め旧revisionの編集UIを閉じる。文書変更後に古いxref bufferを適用しない。
+
+Undo snapshotは未モデル化情報を保つ代わりに、更新・削除の未保存履歴1件ごとに現在のPDF全体と同程度のメモリを一時保持する。大きいPDFでの連続編集は最終性能確認の注意点として残す。件数制限や不完全な注釈再作成fallbackは、仕様にないため追加していない。
+
+### 自動検証
+
+```text
+cargo test annotation -- --nocapture
+cargo test update -- --nocapture
+cargo test undo -- --nocapture
+cargo test
+cargo clippy --all-targets
+```
+
+実結果：
+
+- 外部作成相当Highlightの日本語・改行コメントとRGB色更新：成功
+- 更新前後でxref、Quad、透明度を維持：成功
+- プリセット5色と任意RGBを明示的patchへ変換：成功
+- コメント＋色更新を一つのUndoで元値へ復元：成功
+- 2件中1件の削除、他注釈非変更、削除Undoで同じxref・コメント・透明度を復元：成功
+- 更新と削除を保存し、再オープン後に最終コメント・色・削除不在を確認：成功
+- 同一注釈の複数更新は最後の状態で保存検証：成功
+- Locked Contents、Locked annotation、stale revision、不存在xrefを拒否し、revision 0・cleanを維持：成功
+- LIFOでないUndoを拒否し、履歴と注釈件数を維持：成功
+- worker更新コマンドからstable actionとdirty revision 1を返す：成功
+- 全体：165 passed、0 failed、1 ignored
+- Clippy：警告なし
+
+外部ソフト固有の外観ストリームがUndo前後で視覚的に完全一致すること、非常に大きいPDFでのsnapshotメモリ量、外部ビューアーでの表示は最終受入の未確認候補として扱う。

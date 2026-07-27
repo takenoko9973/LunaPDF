@@ -53,6 +53,22 @@ pub(crate) struct AnnotationPageRequest {
     pub(crate) expected_revision: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AnnotationUpdateRequest {
+    pub(crate) id: AnnotationId,
+    pub(crate) expected_revision: u64,
+    /// `None` means unchanged; the editor has no operation that removes Contents.
+    pub(crate) contents: Option<String>,
+    /// `None` means unchanged, preserving unreadable or non-RGB external colors.
+    pub(crate) color: Option<PdfAnnotationColor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AnnotationDeleteRequest {
+    pub(crate) id: AnnotationId,
+    pub(crate) expected_revision: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AnnotationCandidateDecision {
     None,

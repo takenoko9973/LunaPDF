@@ -3,7 +3,9 @@ use eframe::egui::{
     SetOpenCommand, Vec2,
 };
 
-use crate::domain::annotation::{AnnotationId, AnnotationSnapshot, PdfAnnotationColor};
+use crate::domain::annotation::{
+    AnnotationId, AnnotationSnapshot, AnnotationUpdateRequest, PdfAnnotationColor,
+};
 
 // The panel is deliberately bounded in logical points. It remains usable on
 // narrow windows by shrinking inside the view and scrolling its own contents.
@@ -70,6 +72,7 @@ pub(crate) struct AnnotationEditorState {
     pub(crate) can_edit_color: bool,
     pub(crate) can_delete: bool,
     pub(crate) stale: bool,
+    pub(crate) mutation_in_flight: bool,
     pub(crate) placement: AnnotationOverlayPlacement,
     pub(crate) notice: Option<String>,
 }
@@ -95,6 +98,7 @@ impl AnnotationEditorState {
             can_edit_color: annotation.can_edit_color,
             can_delete: annotation.can_delete,
             stale: false,
+            mutation_in_flight: false,
             placement: AnnotationOverlayPlacement::RightEdge,
             notice: None,
         }
@@ -107,10 +111,35 @@ impl AnnotationEditorState {
     pub(crate) fn can_save(&self) -> bool {
         let contents_allowed =
             self.buffer.contents == self.original.contents || self.can_edit_contents;
-        let color_allowed = self.buffer.color == self.original.color || self.can_edit_color;
+        let color_allowed = self.buffer.color == self.original.color
+            || (self.can_edit_color && self.buffer.color.is_some());
         // A mixed editable/read-only annotation is saved only when every
         // changed field is allowed; silently dropping one change is forbidden.
-        !self.stale && self.is_dirty() && contents_allowed && color_allowed
+        !self.stale
+            && !self.mutation_in_flight
+            && self.is_dirty()
+            && contents_allowed
+            && color_allowed
+    }
+
+    /// Builds a minimal revision-bound patch from fields the user actually changed.
+    pub(crate) fn update_request(&self) -> Option<AnnotationUpdateRequest> {
+        if !self.can_save() {
+            return None;
+        }
+        let contents =
+            (self.buffer.contents != self.original.contents).then(|| self.buffer.contents.clone());
+        let color = if self.buffer.color != self.original.color {
+            self.buffer.color
+        } else {
+            None
+        };
+        Some(AnnotationUpdateRequest {
+            id: self.annotation_id,
+            expected_revision: self.revision,
+            contents,
+            color,
+        })
     }
 }
 
@@ -275,7 +304,10 @@ pub(crate) fn show_annotation_editor(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui.button("×").on_hover_text("閉じる").clicked() {
-                                        if state.is_dirty() {
+                                        if state.mutation_in_flight {
+                                            state.notice =
+                                                Some("注釈処理の完了を待っています。".to_owned());
+                                        } else if state.is_dirty() {
                                             state.notice = Some(
                                                 "未保存の変更があります。保存または変更を破棄してください。"
                                                     .to_owned(),
@@ -290,7 +322,7 @@ pub(crate) fn show_annotation_editor(
                         ui.separator();
                         ui.label("コメント／メモ");
                         ui.add_enabled(
-                            state.can_edit_contents && !state.stale,
+                            state.can_edit_contents && !state.stale && !state.mutation_in_flight,
                             egui::TextEdit::multiline(&mut state.buffer.contents)
                                 .id(annotation_comment_id(
                                     state.document_id,
@@ -313,14 +345,20 @@ pub(crate) fn show_annotation_editor(
                             {
                                 action = Some(AnnotationEditorAction::Save);
                             }
-                            if ui.button("変更を破棄").clicked() {
+                            if ui
+                                .add_enabled(
+                                    !state.mutation_in_flight,
+                                    Button::new("変更を破棄"),
+                                )
+                                .clicked()
+                            {
                                 action = Some(AnnotationEditorAction::Discard);
                             }
                         });
                         ui.separator();
                         if ui
                             .add_enabled(
-                                state.can_delete && !state.stale,
+                                state.can_delete && !state.stale && !state.mutation_in_flight,
                                 Button::new("注釈を削除"),
                             )
                             .clicked()
@@ -345,35 +383,38 @@ pub(crate) fn annotation_comment_id(document_id: u64, annotation_id: AnnotationI
 fn color_menu(ui: &mut egui::Ui, state: &mut AnnotationEditorState) {
     let label = color_label(state.buffer.color);
     let label_color = color_preview(state.buffer.color).unwrap_or(Color32::GRAY);
-    ui.add_enabled_ui(state.can_edit_color && !state.stale, |ui| {
-        ui.menu_button(
-            RichText::new(format!("● {label}")).color(label_color),
-            |ui| {
-                for (name, rgb) in COLOR_PRESETS {
-                    let preview = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                    if ui
-                        .button(RichText::new(format!("● {name}")).color(preview))
-                        .clicked()
-                    {
-                        state.buffer.color = Some(rgb_color(rgb));
-                        ui.close();
+    ui.add_enabled_ui(
+        state.can_edit_color && !state.stale && !state.mutation_in_flight,
+        |ui| {
+            ui.menu_button(
+                RichText::new(format!("● {label}")).color(label_color),
+                |ui| {
+                    for (name, rgb) in COLOR_PRESETS {
+                        let preview = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                        if ui
+                            .button(RichText::new(format!("● {name}")).color(preview))
+                            .clicked()
+                        {
+                            state.buffer.color = Some(rgb_color(rgb));
+                            ui.close();
+                        }
                     }
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("任意の色を選択…");
-                    let mut rgb = color_preview(state.buffer.color)
-                        .map(|color| [color.r(), color.g(), color.b()])
-                        .unwrap_or(COLOR_PRESETS[0].1);
-                    // The fallback only seeds the picker display. It becomes PDF
-                    // data solely after an explicit user change, never on open.
-                    if ui.color_edit_button_srgb(&mut rgb).changed() {
-                        state.buffer.color = Some(rgb_color(rgb));
-                    }
-                });
-            },
-        );
-    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("任意の色を選択…");
+                        let mut rgb = color_preview(state.buffer.color)
+                            .map(|color| [color.r(), color.g(), color.b()])
+                            .unwrap_or(COLOR_PRESETS[0].1);
+                        // The fallback only seeds the picker display. It becomes PDF
+                        // data solely after an explicit user change, never on open.
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            state.buffer.color = Some(rgb_color(rgb));
+                        }
+                    });
+                },
+            );
+        },
+    );
 }
 
 fn annotation_candidate_label(annotation: &AnnotationSnapshot) -> String {
@@ -524,5 +565,51 @@ mod tests {
 
         assert!(bounds.contains_rect(overlay));
         assert_eq!(overlay.right(), bounds.right() - OVERLAY_MARGIN);
+    }
+
+    #[test]
+    fn editor_builds_only_changed_fields_and_blocks_stale_or_pending_save() {
+        let annotation = annotation(
+            "before",
+            Some(PdfAnnotationColor::Rgb {
+                red: 1.0,
+                green: 1.0,
+                blue: 0.0,
+            }),
+        );
+        let mut editor = AnnotationEditorState::from_snapshot(7, 3, &annotation);
+        editor.buffer.contents = "after".to_owned();
+
+        let request = editor.update_request().unwrap();
+        assert_eq!(request.id, annotation.id);
+        assert_eq!(request.expected_revision, 3);
+        assert_eq!(request.contents.as_deref(), Some("after"));
+        assert_eq!(request.color, None);
+
+        editor.mutation_in_flight = true;
+        assert!(editor.update_request().is_none());
+        editor.mutation_in_flight = false;
+        editor.stale = true;
+        assert!(editor.update_request().is_none());
+    }
+
+    #[test]
+    fn preset_and_arbitrary_rgb_values_become_explicit_color_patches() {
+        let annotation = annotation("", None);
+        for (_, rgb) in COLOR_PRESETS {
+            let mut editor = AnnotationEditorState::from_snapshot(7, 3, &annotation);
+            editor.buffer.color = Some(rgb_color(rgb));
+
+            assert_eq!(editor.update_request().unwrap().color, Some(rgb_color(rgb)));
+        }
+
+        let arbitrary = [12, 34, 56];
+        let mut editor = AnnotationEditorState::from_snapshot(7, 3, &annotation);
+        editor.buffer.color = Some(rgb_color(arbitrary));
+
+        assert_eq!(
+            editor.update_request().unwrap().color,
+            Some(rgb_color(arbitrary))
+        );
     }
 }
