@@ -8,7 +8,8 @@ use crossbeam_channel::{
 };
 
 use crate::domain::annotation::{
-    AnnotationDeleteRequest, AnnotationPageRequest, AnnotationPageSnapshot, AnnotationUpdateRequest,
+    AnnotationDeleteRequest, AnnotationPageRequest, AnnotationPageSnapshot,
+    AnnotationUpdateRequest, HighlightIndexBatch, HighlightIndexRequest,
 };
 use crate::domain::document::{
     DocumentInfo, DocumentVersion, EditAction, HighlightRequest, OutlineItem, RenderPriority,
@@ -30,6 +31,8 @@ pub(crate) enum DocumentCommand {
     },
     LoadTextSnapshot(TextSnapshotRequest),
     LoadAnnotations(AnnotationPageRequest),
+    SetHighlightIndexGeneration(u64),
+    LoadHighlightIndexBatch(HighlightIndexRequest),
     CreateHighlight(HighlightRequest),
     UpdateAnnotation(AnnotationUpdateRequest),
     DeleteAnnotation(AnnotationDeleteRequest),
@@ -65,6 +68,12 @@ pub(crate) enum DocumentEvent {
     AnnotationsSkipped(AnnotationPageRequest),
     AnnotationsFailed {
         request: AnnotationPageRequest,
+        message: String,
+    },
+    HighlightIndexReady(HighlightIndexBatch),
+    HighlightIndexSkipped(HighlightIndexRequest),
+    HighlightIndexFailed {
+        request: HighlightIndexRequest,
         message: String,
     },
     /// Returns the stable identity produced when a document edit completes.
@@ -227,7 +236,9 @@ impl DocumentService {
         match command {
             DocumentCommand::RenderTile(request) => self.queue_render(request),
             DocumentCommand::LoadTextSnapshot(request) => self.queue_text_snapshot(request),
-            DocumentCommand::SearchPage { .. } | DocumentCommand::LoadThumbnail(_) => {
+            DocumentCommand::SearchPage { .. }
+            | DocumentCommand::LoadThumbnail(_)
+            | DocumentCommand::LoadHighlightIndexBatch(_) => {
                 self.background_sender.send(command).is_ok()
             }
             command => self.foreground_sender.send(command).is_ok(),
@@ -340,6 +351,7 @@ fn run_worker(
         return;
     }
     let mut active_search_generation = 0;
+    let mut active_highlight_index_generation = 0;
 
     while let Some(command) = next_worker_command(&channels) {
         match command {
@@ -394,6 +406,32 @@ fn run_worker(
                     });
                 }
             },
+            DocumentCommand::SetHighlightIndexGeneration(generation) => {
+                active_highlight_index_generation = generation;
+            }
+            DocumentCommand::LoadHighlightIndexBatch(request) => {
+                if !highlight_index_generation_is_current(
+                    active_highlight_index_generation,
+                    request.generation,
+                ) {
+                    let _ = event_sender.send(DocumentEvent::HighlightIndexSkipped(request));
+                    continue;
+                }
+                match backend.highlight_index_batch(request) {
+                    Ok(Some(batch)) => {
+                        let _ = event_sender.send(DocumentEvent::HighlightIndexReady(batch));
+                    }
+                    Ok(None) => {
+                        let _ = event_sender.send(DocumentEvent::HighlightIndexSkipped(request));
+                    }
+                    Err(error) => {
+                        let _ = event_sender.send(DocumentEvent::HighlightIndexFailed {
+                            request,
+                            message: format!("{error:#}"),
+                        });
+                    }
+                }
+            }
             DocumentCommand::CreateHighlight(request) => {
                 match backend.create_highlight(request.page_index, &request.quads) {
                     Ok(action) => {
@@ -626,6 +664,10 @@ fn search_generation_is_current(active_generation: u64, request_generation: u64)
     active_generation == request_generation
 }
 
+fn highlight_index_generation_is_current(active_generation: u64, request_generation: u64) -> bool {
+    active_generation == request_generation
+}
+
 fn send_opened_info(
     backend: &MuPdfBackend,
     expected_version: Option<DocumentVersion>,
@@ -704,6 +746,15 @@ mod tests {
 
     fn prefetch_tile(priority: RenderPriority) -> DocumentCommand {
         DocumentCommand::RenderTile(tile_request(priority))
+    }
+
+    fn highlight_index_request(generation: u64) -> HighlightIndexRequest {
+        HighlightIndexRequest {
+            generation,
+            expected_revision: 0,
+            first_page: 0,
+            page_count: 1,
+        }
     }
 
     #[test]
@@ -839,6 +890,36 @@ mod tests {
     }
 
     #[test]
+    fn visible_render_precedes_background_highlight_index() {
+        let (foreground_sender, foreground_receiver) = unbounded();
+        let (_current_sender, current_receiver) = unbounded();
+        let (_next_sender, next_receiver) = unbounded();
+        let (_previous_sender, previous_receiver) = unbounded();
+        let (background_sender, background_receiver) = unbounded();
+        background_sender
+            .send(DocumentCommand::LoadHighlightIndexBatch(
+                highlight_index_request(2),
+            ))
+            .unwrap();
+        foreground_sender
+            .send(DocumentCommand::RenderTile(tile_request(
+                RenderPriority::Visible,
+            )))
+            .unwrap();
+
+        let command = next_command(
+            &foreground_receiver,
+            &current_receiver,
+            &next_receiver,
+            &previous_receiver,
+            &background_receiver,
+        )
+        .unwrap();
+
+        assert!(matches!(command, DocumentCommand::RenderTile(_)));
+    }
+
+    #[test]
     fn promoted_visible_tile_invalidates_older_prefetch_message() {
         let prefetch = tile_request(RenderPriority::NextViewport);
         let visible = tile_request(RenderPriority::Visible);
@@ -957,6 +1038,12 @@ mod tests {
     }
 
     #[test]
+    fn stale_highlight_index_generation_is_rejected_before_backend_work() {
+        assert!(highlight_index_generation_is_current(3, 3));
+        assert!(!highlight_index_generation_is_current(4, 3));
+    }
+
+    #[test]
     fn corrupt_pdf_open_failure_reaches_event_queue() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("corrupt.pdf");
@@ -1015,6 +1102,47 @@ mod tests {
                     std::thread::yield_now();
                 }
                 Err(error) => panic!("worker did not return annotations: {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn highlight_index_worker_skips_old_generation_then_returns_current_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("highlight-index.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            document.save(path_text).unwrap();
+        }
+        let service = DocumentService::spawn(path);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stale = highlight_index_request(1);
+        let current = highlight_index_request(2);
+        let mut stale_skipped = false;
+
+        loop {
+            match service.try_recv() {
+                Ok(DocumentEvent::Opened(_)) => {
+                    assert!(service.send(DocumentCommand::SetHighlightIndexGeneration(2)));
+                    assert!(service.send(DocumentCommand::LoadHighlightIndexBatch(stale)));
+                    assert!(service.send(DocumentCommand::LoadHighlightIndexBatch(current)));
+                }
+                Ok(DocumentEvent::HighlightIndexSkipped(request)) if request == stale => {
+                    stale_skipped = true;
+                }
+                Ok(DocumentEvent::HighlightIndexReady(batch)) if batch.generation == 2 => {
+                    assert!(stale_skipped);
+                    assert_eq!(batch.pages.len(), 1);
+                    assert_eq!(batch.pages[0].page_index, 0);
+                    break;
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("worker did not return the Highlight index batch: {error:?}"),
             }
         }
     }

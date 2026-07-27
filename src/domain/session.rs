@@ -41,6 +41,7 @@ pub(crate) struct SessionView {
 pub(crate) enum SidebarTab {
     Outline,
     Thumbnails,
+    Highlights,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -221,5 +222,19 @@ mod tests {
         state.tabs = vec![repeated.clone(), repeated];
 
         assert!(state.validate().is_err());
+    }
+
+    #[test]
+    fn highlight_sidebar_tab_round_trips_in_schema_one() {
+        let state = SessionState {
+            sidebar_tab: SidebarTab::Highlights,
+            ..SessionState::default()
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: SessionState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.sidebar_tab, SidebarTab::Highlights);
+        assert_eq!(restored.schema_version, 1);
     }
 }

@@ -14,6 +14,7 @@ use eframe::egui::{
 
 use crate::domain::annotation::{
     AnnotationDeleteRequest, AnnotationId, AnnotationPageRequest, AnnotationPageSnapshot,
+    AnnotationSummary, HighlightIndexBatch, HighlightIndexRequest,
 };
 use crate::domain::document::{
     DocumentInfo, EditAction, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail,
@@ -39,7 +40,7 @@ use crate::ui::annotation_editor::{
 };
 use crate::ui::fonts::install_cjk_fallback;
 use crate::ui::icons::{ToolbarIcon, icon_button};
-use crate::ui::sidebar::{SidebarTab, show_outline};
+use crate::ui::sidebar::{HighlightSidebarAction, SidebarTab, show_highlights, show_outline};
 use crate::ui::viewport::{
     PageInteraction, PageInteractionInput, PageViewport, screen_rect_for_tile,
 };
@@ -84,6 +85,10 @@ const THUMBNAIL_BUDGET_BYTES: usize = 32 * 1_024 * 1_024;
 const THUMBNAIL_MAX_WIDTH: u32 = 160;
 const THUMBNAIL_MAX_HEIGHT: u32 = 220;
 const THUMBNAIL_ROW_HEIGHT: f32 = 248.0;
+
+// A batch bounds the longest non-preemptible sidebar scan while amortizing
+// MuPDF page setup. The follow-up performance matrix compares 8/16/32 pages.
+const HIGHLIGHT_INDEX_BATCH_PAGES: usize = 16;
 
 // High-precision devices emit point deltas rather than discrete wheel steps.
 // Twenty-four logical points filters incidental edge motion without delaying a
@@ -169,6 +174,8 @@ struct DocumentTab {
     pending_annotation_pages: HashSet<AnnotationPageRequest>,
     failed_annotation_pages: HashSet<AnnotationPageRequest>,
     wanted_annotation_pages: HashSet<AnnotationPageRequest>,
+    highlight_index: HighlightIndexState,
+    pending_highlight_refresh_page: Option<usize>,
     selection: Option<SelectionSnapshot>,
     selection_generation: u64,
     pending_edits: usize,
@@ -188,6 +195,56 @@ struct DocumentTab {
     render_performance: RenderPerformance,
     restoring_from_session: bool,
     select_after_restore: bool,
+}
+
+struct HighlightIndexState {
+    generation: u64,
+    revision: Option<u64>,
+    total_pages: usize,
+    pages: BTreeMap<usize, Vec<AnnotationSummary>>,
+    in_flight: Option<HighlightIndexRequest>,
+    refresh_page: Option<usize>,
+    started: bool,
+    error: Option<String>,
+}
+
+impl Default for HighlightIndexState {
+    fn default() -> Self {
+        Self {
+            generation: 1,
+            revision: None,
+            total_pages: 0,
+            pages: BTreeMap::new(),
+            in_flight: None,
+            refresh_page: None,
+            started: false,
+            error: None,
+        }
+    }
+}
+
+fn next_highlight_index_request(index: &HighlightIndexState) -> Option<HighlightIndexRequest> {
+    if !index.started || index.in_flight.is_some() || index.error.is_some() {
+        return None;
+    }
+    let revision = index.revision?;
+    let (first_page, page_count) = if let Some(page_index) = index.refresh_page {
+        (page_index, 1)
+    } else {
+        let first_page =
+            (0..index.total_pages).find(|page_index| !index.pages.contains_key(page_index))?;
+        let page_count = (first_page..index.total_pages)
+            .take_while(|page_index| !index.pages.contains_key(page_index))
+            .take(HIGHLIGHT_INDEX_BATCH_PAGES)
+            .count();
+        (first_page, page_count)
+    };
+    Some(HighlightIndexRequest {
+        generation: index.generation,
+        expected_revision: revision,
+        first_page,
+        page_count,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -639,6 +696,7 @@ impl PrototypeApp {
         self.sidebar_tab = match session.sidebar_tab {
             SessionSidebarTab::Outline => SidebarTab::Outline,
             SessionSidebarTab::Thumbnails => SidebarTab::Thumbnails,
+            SessionSidebarTab::Highlights => SidebarTab::Highlights,
         };
 
         let saved_tab_count = session.tabs.len();
@@ -759,6 +817,12 @@ impl PrototypeApp {
             {
                 match event {
                     Ok(DocumentEvent::Opened(info)) => {
+                        let highlight_index_needs_reset =
+                            self.documents[index].highlight_index.started
+                                && self.documents[index].highlight_index.revision
+                                    != Some(info.revision);
+                        let revision = info.revision;
+                        let page_count = info.page_bounds.len();
                         let restored_open = self.documents[index].restoring_from_session;
                         let select_after_restore = self.documents[index].select_after_restore;
                         self.documents[index].restoring_from_session = false;
@@ -774,6 +838,11 @@ impl PrototypeApp {
                         };
                         self.documents[index].error = None;
                         self.documents[index].info = Some(info);
+                        if highlight_index_needs_reset {
+                            self.documents[index].reset_highlight_index(revision, page_count);
+                        } else {
+                            self.documents[index].reconnect_highlight_index();
+                        }
                         if !self.documents[index].outline_requested
                             && self.documents[index].send(DocumentCommand::LoadOutline)
                         {
@@ -792,6 +861,9 @@ impl PrototypeApp {
                         }
                     }
                     Ok(DocumentEvent::DocumentChanged(info)) => {
+                        let dirty = info.dirty;
+                        let revision = info.revision;
+                        let page_count = info.page_bounds.len();
                         let saved_path = (!info.dirty).then(|| info.path.clone());
                         let document_id = self.documents[index].document_id;
                         if !info.dirty
@@ -810,6 +882,7 @@ impl PrototypeApp {
                             && !self.close_all_pending
                             && !self.documents[index].search.query.trim().is_empty();
                         let tab = &mut self.documents[index];
+                        let changed_highlight_page = tab.pending_highlight_refresh_page.take();
                         if info.dirty {
                             tab.state = state_after_document_info(tab.state, true);
                         } else {
@@ -821,6 +894,19 @@ impl PrototypeApp {
                         tab.invalidate_rendering();
                         tab.invalidate_text_snapshots();
                         tab.invalidate_annotation_pages();
+                        if dirty {
+                            if let Some(page_index) = changed_highlight_page {
+                                tab.refresh_highlight_index_page(page_index, revision, page_count);
+                            } else {
+                                // A revision change without an application edit
+                                // has no page identity whose xrefs can be retained.
+                                tab.reset_highlight_index(revision, page_count);
+                            }
+                        } else {
+                            // Save reopens MuPDF and may assign new xrefs even
+                            // when every visible annotation looks unchanged.
+                            tab.reset_highlight_index(revision, page_count);
+                        }
                         let thumbnail_keys = tab.invalidate_thumbnails();
                         for key in thumbnail_keys {
                             self.thumbnail_lru.remove(&key);
@@ -921,16 +1007,17 @@ impl PrototypeApp {
                         }
                     }
                     Ok(DocumentEvent::EditActionCreated(action)) => {
-                        let completed_annotation = match &action {
-                            EditAction::CreateHighlight { .. } => None,
+                        let (completed_annotation, changed_page) = match &action {
+                            EditAction::CreateHighlight { page_index, .. } => (None, *page_index),
                             EditAction::UpdateAnnotation { annotation_id, .. }
                             | EditAction::DeleteAnnotation { annotation_id, .. } => {
-                                Some(*annotation_id)
+                                (Some(*annotation_id), annotation_id.page_index)
                             }
                         };
                         let document_id = self.documents[index].document_id;
                         let tab = &mut self.documents[index];
                         tab.pending_edits = tab.pending_edits.saturating_sub(1);
+                        tab.pending_highlight_refresh_page = Some(changed_page);
                         tab.edit_history.push(action);
                         tab.state = DocumentState::ReadyDirty;
                         if completed_annotation.is_some_and(|annotation_id| {
@@ -943,10 +1030,18 @@ impl PrototypeApp {
                         }
                     }
                     Ok(DocumentEvent::EditActionUndone(action)) => {
+                        let changed_page = match &action {
+                            EditAction::CreateHighlight { page_index, .. } => *page_index,
+                            EditAction::UpdateAnnotation { annotation_id, .. }
+                            | EditAction::DeleteAnnotation { annotation_id, .. } => {
+                                annotation_id.page_index
+                            }
+                        };
                         let tab = &mut self.documents[index];
                         tab.undo_in_flight = false;
                         if tab.edit_history.last() == Some(&action) {
                             tab.edit_history.pop();
+                            tab.pending_highlight_refresh_page = Some(changed_page);
                             self.status = "編集を元に戻しました".to_owned();
                         } else {
                             // A worker response must correspond to the action at the
@@ -1042,6 +1137,32 @@ impl PrototypeApp {
                             tab.failed_annotation_pages.insert(request);
                             tab.error = Some(format!(
                                 "注釈情報を読み取れませんでした。PDFを開き直してください。詳細: {message}"
+                            ));
+                        }
+                    }
+                    Ok(DocumentEvent::HighlightIndexReady(batch)) => {
+                        self.documents[index].receive_highlight_index_batch(batch);
+                    }
+                    Ok(DocumentEvent::HighlightIndexSkipped(request)) => {
+                        let tab = &mut self.documents[index];
+                        if tab.highlight_index.in_flight == Some(request)
+                            && tab.highlight_index.generation == request.generation
+                        {
+                            tab.highlight_index.in_flight = None;
+                            tab.highlight_index.error = Some(
+                                "文書が更新されたため、ハイライト一覧の読み込みを中止しました。"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    Ok(DocumentEvent::HighlightIndexFailed { request, message }) => {
+                        let tab = &mut self.documents[index];
+                        if tab.highlight_index.in_flight == Some(request)
+                            && tab.highlight_index.generation == request.generation
+                        {
+                            tab.highlight_index.in_flight = None;
+                            tab.highlight_index.error = Some(format!(
+                                "ハイライト一覧を読み込めませんでした。詳細: {message}"
                             ));
                         }
                     }
@@ -1961,6 +2082,7 @@ impl PrototypeApp {
             sidebar_tab: match self.sidebar_tab {
                 SidebarTab::Outline => SessionSidebarTab::Outline,
                 SidebarTab::Thumbnails => SessionSidebarTab::Thumbnails,
+                SidebarTab::Highlights => SessionSidebarTab::Highlights,
             },
             ..SessionState::default()
         };
@@ -2238,24 +2360,6 @@ impl PrototypeApp {
     }
 
     fn open_annotation_editor(&mut self, index: usize, revision: u64, annotation_id: AnnotationId) {
-        let document_id = self.documents[index].document_id;
-        if let Some(editor) = &mut self.annotation_editor {
-            let same_target = editor.document_id == document_id
-                && editor.revision == revision
-                && editor.annotation_id == annotation_id;
-            if same_target {
-                editor.notice = None;
-                return;
-            }
-            if editor.is_dirty() {
-                // Switching targets must never silently discard a long comment
-                // or implicitly save it into another annotation.
-                editor.notice =
-                    Some("別の注釈を開く前に、現在の変更を保存または破棄してください。".to_owned());
-                return;
-            }
-        }
-
         let request = AnnotationPageRequest {
             page_index: annotation_id.page_index,
             expected_revision: revision,
@@ -2275,12 +2379,64 @@ impl PrototypeApp {
             );
             return;
         };
-        self.annotation_editor = Some(AnnotationEditorState::from_snapshot(
+        self.open_annotation_editor_from_summary(index, revision, &annotation.summary());
+    }
+
+    fn open_annotation_editor_from_summary(
+        &mut self,
+        index: usize,
+        revision: u64,
+        annotation: &AnnotationSummary,
+    ) {
+        let document_id = self.documents[index].document_id;
+        if let Some(editor) = &mut self.annotation_editor {
+            let same_target = editor.document_id == document_id
+                && editor.revision == revision
+                && editor.annotation_id == annotation.id;
+            if same_target {
+                editor.notice = None;
+                return;
+            }
+            if editor.is_dirty() || editor.mutation_in_flight {
+                // Switching targets must never silently discard a long comment
+                // or implicitly save it into another annotation.
+                editor.notice =
+                    Some("別の注釈を開く前に、現在の変更を保存または破棄してください。".to_owned());
+                return;
+            }
+        }
+
+        self.annotation_editor = Some(AnnotationEditorState::from_summary(
             document_id,
             revision,
-            &annotation,
+            annotation,
         ));
         self.annotation_picker = None;
+    }
+
+    fn handle_highlight_sidebar_action(
+        &mut self,
+        index: usize,
+        revision: u64,
+        action: HighlightSidebarAction,
+    ) {
+        match action {
+            HighlightSidebarAction::Jump(page_index) => {
+                self.documents[index].jump_to_page(page_index);
+            }
+            HighlightSidebarAction::Edit(annotation) => {
+                self.documents[index].jump_to_page(annotation.id.page_index);
+                self.open_annotation_editor_from_summary(index, revision, &annotation);
+            }
+            HighlightSidebarAction::Delete(annotation) => {
+                self.request_annotation_delete_known(
+                    index,
+                    revision,
+                    annotation.id,
+                    annotation.can_delete,
+                );
+            }
+        }
     }
 
     fn request_annotation_update(&mut self, index: usize) {
@@ -2320,6 +2476,29 @@ impl PrototypeApp {
         revision: u64,
         annotation_id: AnnotationId,
     ) {
+        let request_key = AnnotationPageRequest {
+            page_index: annotation_id.page_index,
+            expected_revision: revision,
+        };
+        let can_delete = self.documents[index]
+            .annotation_pages
+            .get(&request_key)
+            .and_then(|page| {
+                page.annotations
+                    .iter()
+                    .find(|annotation| annotation.id == annotation_id)
+            })
+            .is_some_and(|annotation| annotation.can_delete);
+        self.request_annotation_delete_known(index, revision, annotation_id, can_delete);
+    }
+
+    fn request_annotation_delete_known(
+        &mut self,
+        index: usize,
+        revision: u64,
+        annotation_id: AnnotationId,
+        can_delete: bool,
+    ) {
         let document_id = self.documents[index].document_id;
         if let Some(editor) = &mut self.annotation_editor {
             let same_target = editor.document_id == document_id
@@ -2334,19 +2513,6 @@ impl PrototypeApp {
                 return;
             }
         }
-        let request_key = AnnotationPageRequest {
-            page_index: annotation_id.page_index,
-            expected_revision: revision,
-        };
-        let can_delete = self.documents[index]
-            .annotation_pages
-            .get(&request_key)
-            .and_then(|page| {
-                page.annotations
-                    .iter()
-                    .find(|annotation| annotation.id == annotation_id)
-            })
-            .is_some_and(|annotation| annotation.can_delete);
         if !can_delete {
             self.error = Some(
                 "注釈を削除できません。PDFの編集制限または注釈ロックを確認してください。"
@@ -2692,6 +2858,11 @@ impl PrototypeApp {
                         if ui.button("サムネイル").clicked() {
                             self.sidebar_open = true;
                             self.sidebar_tab = SidebarTab::Thumbnails;
+                            ui.close();
+                        }
+                        if ui.button("ハイライト一覧").clicked() {
+                            self.sidebar_open = true;
+                            self.sidebar_tab = SidebarTab::Highlights;
                             ui.close();
                         }
                         ui.separator();
@@ -3203,6 +3374,7 @@ impl PrototypeApp {
             return;
         }
         let mut selected_page = None;
+        let mut highlight_action = None;
         egui::Panel::left("document-sidebar")
             .default_size(220.0)
             .size_range(180.0..=360.0)
@@ -3231,6 +3403,17 @@ impl PrototypeApp {
                     {
                         self.sidebar_tab = SidebarTab::Thumbnails;
                     }
+                    if icon_button(
+                        ui,
+                        ToolbarIcon::Highlight,
+                        true,
+                        self.sidebar_tab == SidebarTab::Highlights,
+                        "ハイライト一覧",
+                    )
+                    .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::Highlights;
+                    }
                 });
                 ui.separator();
                 let Some(index) = self.active_index() else {
@@ -3252,12 +3435,31 @@ impl PrototypeApp {
                     SidebarTab::Thumbnails => {
                         selected_page = self.thumbnail_sidebar(ui, index);
                     }
+                    SidebarTab::Highlights => {
+                        self.documents[index].start_highlight_index();
+                        let index_state = &self.documents[index].highlight_index;
+                        let action = show_highlights(
+                            ui,
+                            &index_state.pages,
+                            index_state.total_pages,
+                            index_state.in_flight.is_some(),
+                            index_state.error.as_deref(),
+                        );
+                        if let (Some(revision), Some(action)) = (index_state.revision, action) {
+                            highlight_action = Some((revision, action));
+                        }
+                    }
                 }
             });
         if let Some(index) = self.active_index()
             && let Some(page) = selected_page
         {
             self.documents[index].jump_to_page(page);
+        }
+        if let Some(index) = self.active_index()
+            && let Some((revision, action)) = highlight_action
+        {
+            self.handle_highlight_sidebar_action(index, revision, action);
         }
     }
 
@@ -4687,6 +4889,8 @@ impl DocumentTab {
             pending_annotation_pages: HashSet::new(),
             failed_annotation_pages: HashSet::new(),
             wanted_annotation_pages: HashSet::new(),
+            highlight_index: HighlightIndexState::default(),
+            pending_highlight_refresh_page: None,
             selection: None,
             selection_generation: 0,
             pending_edits: 0,
@@ -4741,6 +4945,7 @@ impl DocumentTab {
     fn mark_worker_disconnected(&mut self) {
         // No completion event can arrive after channel disconnection. Clear
         // every response-waiting flag so close and recovery actions remain usable.
+        self.cancel_highlight_index_work();
         self.pending_edits = 0;
         self.pending_annotation_pages.clear();
         self.undo_in_flight = false;
@@ -4764,6 +4969,7 @@ impl DocumentTab {
     }
 
     fn suspend(&mut self) {
+        self.cancel_highlight_index_work();
         self.invalidate_rendering();
         self.invalidate_text_snapshots();
         self.invalidate_annotation_pages();
@@ -4952,6 +5158,138 @@ impl DocumentTab {
         self.pending_annotation_pages.clear();
         self.failed_annotation_pages.clear();
         self.wanted_annotation_pages.clear();
+    }
+
+    /// Starts the tab-local Highlight scan only after its sidebar is first shown.
+    fn start_highlight_index(&mut self) {
+        if !self.highlight_index.started {
+            let Some(info) = &self.info else {
+                return;
+            };
+            self.highlight_index.started = true;
+            self.highlight_index.revision = Some(info.revision);
+            self.highlight_index.total_pages = info.page_bounds.len();
+            if !self.send(DocumentCommand::SetHighlightIndexGeneration(
+                self.highlight_index.generation,
+            )) {
+                self.highlight_index.error =
+                    Some("ハイライト一覧の読み込みを開始できませんでした。".to_owned());
+                return;
+            }
+        }
+        self.queue_next_highlight_index_batch();
+    }
+
+    /// Cancels all old batches and rebuilds the index after xrefs may have changed.
+    fn reset_highlight_index(&mut self, revision: u64, total_pages: usize) {
+        if !self.highlight_index.started {
+            return;
+        }
+        self.highlight_index.generation = self.highlight_index.generation.wrapping_add(1);
+        self.highlight_index.revision = Some(revision);
+        self.highlight_index.total_pages = total_pages;
+        self.highlight_index.pages.clear();
+        self.highlight_index.in_flight = None;
+        self.highlight_index.refresh_page = None;
+        self.highlight_index.error = None;
+        let _queued = self.send(DocumentCommand::SetHighlightIndexGeneration(
+            self.highlight_index.generation,
+        ));
+        self.queue_next_highlight_index_batch();
+    }
+
+    /// Refreshes one edited page while preserving completed pages from the same document.
+    fn refresh_highlight_index_page(
+        &mut self,
+        page_index: usize,
+        revision: u64,
+        total_pages: usize,
+    ) {
+        if !self.highlight_index.started {
+            return;
+        }
+        self.highlight_index.generation = self.highlight_index.generation.wrapping_add(1);
+        self.highlight_index.revision = Some(revision);
+        self.highlight_index.total_pages = total_pages;
+        self.highlight_index
+            .pages
+            .retain(|indexed_page, _| *indexed_page < total_pages);
+        self.highlight_index.pages.remove(&page_index);
+        self.highlight_index.in_flight = None;
+        self.highlight_index.refresh_page = (page_index < total_pages).then_some(page_index);
+        self.highlight_index.error = None;
+        let _queued = self.send(DocumentCommand::SetHighlightIndexGeneration(
+            self.highlight_index.generation,
+        ));
+        self.queue_next_highlight_index_batch();
+    }
+
+    fn cancel_highlight_index_work(&mut self) {
+        if !self.highlight_index.started {
+            return;
+        }
+        self.highlight_index.generation = self.highlight_index.generation.wrapping_add(1);
+        self.highlight_index.in_flight = None;
+        let _queued = self.send(DocumentCommand::SetHighlightIndexGeneration(
+            self.highlight_index.generation,
+        ));
+    }
+
+    fn reconnect_highlight_index(&mut self) {
+        if !self.highlight_index.started {
+            return;
+        }
+        if !self.send(DocumentCommand::SetHighlightIndexGeneration(
+            self.highlight_index.generation,
+        )) {
+            self.highlight_index.error =
+                Some("ハイライト一覧の読み込みを再開できませんでした。".to_owned());
+            return;
+        }
+        self.highlight_index.error = None;
+        self.queue_next_highlight_index_batch();
+    }
+
+    fn queue_next_highlight_index_batch(&mut self) {
+        let Some(request) = next_highlight_index_request(&self.highlight_index) else {
+            return;
+        };
+
+        if self.send(DocumentCommand::LoadHighlightIndexBatch(request)) {
+            self.highlight_index.in_flight = Some(request);
+        } else {
+            self.highlight_index.error = Some("ハイライト一覧を読み込めませんでした。".to_owned());
+        }
+    }
+
+    fn receive_highlight_index_batch(&mut self, batch: HighlightIndexBatch) {
+        let request = HighlightIndexRequest {
+            generation: batch.generation,
+            expected_revision: batch.revision,
+            first_page: batch
+                .pages
+                .first()
+                .map_or(batch.total_pages, |page| page.page_index),
+            page_count: batch.pages.len(),
+        };
+        let current = self.highlight_index.in_flight == Some(request)
+            && self.highlight_index.generation == batch.generation
+            && self.highlight_index.revision == Some(batch.revision)
+            && self.highlight_index.total_pages == batch.total_pages;
+        if !current {
+            return;
+        }
+
+        self.highlight_index.in_flight = None;
+        for page in batch.pages {
+            if self.highlight_index.refresh_page == Some(page.page_index) {
+                self.highlight_index.refresh_page = None;
+            }
+            self.highlight_index
+                .pages
+                .insert(page.page_index, page.highlights);
+        }
+        self.queue_next_highlight_index_batch();
     }
 
     fn prepare_text_snapshots(&mut self, page_indices: impl Iterator<Item = usize>, revision: u64) {
@@ -7392,5 +7730,54 @@ mod tests {
         assert_eq!(app.documents.len(), 1);
         assert_eq!(app.tabs.tabs()[0].path(), explicit);
         assert!(app.session_restore_progress.is_none());
+    }
+
+    #[test]
+    fn highlight_index_batches_only_the_first_contiguous_missing_pages() {
+        let mut state = HighlightIndexState {
+            started: true,
+            revision: Some(7),
+            total_pages: 40,
+            ..HighlightIndexState::default()
+        };
+
+        let first = next_highlight_index_request(&state).unwrap();
+        assert_eq!(first.first_page, 0);
+        assert_eq!(first.page_count, HIGHLIGHT_INDEX_BATCH_PAGES);
+
+        for page_index in 0..HIGHLIGHT_INDEX_BATCH_PAGES {
+            state.pages.insert(page_index, Vec::new());
+        }
+        state
+            .pages
+            .insert(HIGHLIGHT_INDEX_BATCH_PAGES + 2, Vec::new());
+        let second = next_highlight_index_request(&state).unwrap();
+        assert_eq!(second.first_page, HIGHLIGHT_INDEX_BATCH_PAGES);
+        assert_eq!(second.page_count, 2);
+    }
+
+    #[test]
+    fn edited_highlight_page_is_refreshed_as_one_page_batch() {
+        let mut state = HighlightIndexState {
+            generation: 4,
+            revision: Some(8),
+            total_pages: 100,
+            refresh_page: Some(73),
+            started: true,
+            ..HighlightIndexState::default()
+        };
+        state.pages.insert(0, Vec::new());
+
+        let request = next_highlight_index_request(&state).unwrap();
+
+        assert_eq!(
+            request,
+            HighlightIndexRequest {
+                generation: 4,
+                expected_revision: 8,
+                first_page: 73,
+                page_count: 1,
+            }
+        );
     }
 }

@@ -4,7 +4,8 @@ use eframe::egui::{
 };
 
 use crate::domain::annotation::{
-    AnnotationId, AnnotationSnapshot, AnnotationUpdateRequest, PdfAnnotationColor,
+    AnnotationId, AnnotationSnapshot, AnnotationSummary, AnnotationUpdateRequest,
+    PdfAnnotationColor,
 };
 
 // The panel is deliberately bounded in logical points. It remains usable on
@@ -81,10 +82,20 @@ pub(crate) struct AnnotationEditorState {
 
 impl AnnotationEditorState {
     /// Creates an edit buffer without exposing the selected text as annotation content.
+    #[cfg(test)]
     pub(crate) fn from_snapshot(
         document_id: u64,
         revision: u64,
         annotation: &AnnotationSnapshot,
+    ) -> Self {
+        Self::from_summary(document_id, revision, &annotation.summary())
+    }
+
+    /// Creates an editor from sidebar metadata without waiting for page geometry.
+    pub(crate) fn from_summary(
+        document_id: u64,
+        revision: u64,
+        annotation: &AnnotationSummary,
     ) -> Self {
         let values = AnnotationEditorValues {
             contents: annotation.contents.clone(),

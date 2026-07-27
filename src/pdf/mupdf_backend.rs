@@ -13,8 +13,8 @@ use std::os::windows::io::AsRawHandle as _;
 use anyhow::{Context, Result, anyhow, ensure};
 use mupdf::color::AnnotationColor;
 use mupdf::pdf::{
-    AnnotationFlags, AnnotationQuadPoints, Encryption, PdfAnnotationType, PdfDocument,
-    PdfWriteOptions, Permission, WidgetType,
+    AnnotationFlags, AnnotationQuadPoints, Encryption, PdfAnnotation, PdfAnnotationType,
+    PdfDocument, PdfWriteOptions, Permission, WidgetType,
 };
 use mupdf::text_page::SearchHitResponse;
 use mupdf::{
@@ -29,7 +29,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::domain::annotation::{
     AnnotationDeleteRequest, AnnotationId, AnnotationKind, AnnotationPageRequest,
-    AnnotationPageSnapshot, AnnotationSnapshot, AnnotationUpdateRequest, PdfAnnotationColor,
+    AnnotationPageSnapshot, AnnotationSnapshot, AnnotationSummary, AnnotationUpdateRequest,
+    HighlightIndexBatch, HighlightIndexPage, HighlightIndexRequest, PdfAnnotationColor,
 };
 use crate::domain::document::{
     DocumentInfo, DocumentVersion, EditAction, HighlightCapability, OutlineItem, PageRect,
@@ -405,42 +406,85 @@ impl MuPdfBackend {
         let document_allows_edits = self.highlight_capability.is_allowed();
         let mut annotations = Vec::new();
         for annotation in page.annotations() {
-            if annotation.r#type()? != PdfAnnotationType::Highlight {
+            let Some(summary) =
+                annotation_summary(request.page_index, &annotation, document_allows_edits)?
+            else {
                 continue;
-            }
-            let xref = annotation.xref()?;
-            ensure!(
-                xref > 0,
-                "MuPDF returned an invalid xref for an existing Highlight"
-            );
-            let flags = annotation.flags()?;
-            let properties_locked =
-                flags.intersects(AnnotationFlags::IS_READ_ONLY | AnnotationFlags::IS_LOCKED);
-            let contents_locked =
-                properties_locked || flags.contains(AnnotationFlags::IS_LOCKED_CONTENTS);
+            };
             annotations.push(AnnotationSnapshot {
-                id: AnnotationId {
-                    page_index: request.page_index,
-                    xref,
-                },
-                kind: AnnotationKind::Highlight,
+                id: summary.id,
+                kind: summary.kind,
                 quads: annotation
                     .quad_points()?
                     .iter()
                     .map(page_quad_from_mupdf)
                     .collect(),
-                contents: annotation.contents()?.unwrap_or_default().to_owned(),
-                color: annotation.color()?.map(annotation_color_from_mupdf),
+                contents: summary.contents,
+                color: summary.color,
                 opacity: annotation.opacity()?,
-                can_edit_contents: document_allows_edits && !contents_locked,
-                can_edit_color: document_allows_edits && !properties_locked,
-                can_delete: document_allows_edits && !properties_locked,
+                can_edit_contents: summary.can_edit_contents,
+                can_edit_color: summary.can_edit_color,
+                can_delete: summary.can_delete,
             });
         }
         Ok(Some(AnnotationPageSnapshot {
             page_index: request.page_index,
             revision: self.revision,
             annotations,
+        }))
+    }
+
+    /// Reads a bounded, revision-bound batch for the persistent Highlight list.
+    ///
+    /// Geometry is deliberately omitted because sidebar rows never paint PDF
+    /// annotation quads. Keeping batches page-bounded limits cancellation delay.
+    pub(super) fn highlight_index_batch(
+        &self,
+        request: HighlightIndexRequest,
+    ) -> Result<Option<HighlightIndexBatch>> {
+        if request.expected_revision != self.revision {
+            return Ok(None);
+        }
+        ensure!(
+            request.page_count > 0,
+            "Highlight index batch must contain at least one page"
+        );
+        let last_page = request
+            .first_page
+            .checked_add(request.page_count)
+            .context("Highlight index batch page range overflowed")?;
+        ensure!(
+            last_page <= self.page_bounds.len(),
+            "Highlight index batch exceeds the document page count"
+        );
+
+        let document_allows_edits = self.highlight_capability.is_allowed();
+        let mut pages = Vec::with_capacity(request.page_count);
+        for page_index in request.first_page..last_page {
+            let started_at = Instant::now();
+            let page = self
+                .document
+                .load_pdf_page(page_number(page_index, self.page_bounds.len())?)?;
+            let mut highlights = Vec::new();
+            for annotation in page.annotations() {
+                if let Some(summary) =
+                    annotation_summary(page_index, &annotation, document_allows_edits)?
+                {
+                    highlights.push(summary);
+                }
+            }
+            pages.push(HighlightIndexPage {
+                page_index,
+                highlights,
+                scan_time: started_at.elapsed(),
+            });
+        }
+
+        Ok(Some(HighlightIndexBatch {
+            generation: request.generation,
+            revision: self.revision,
+            total_pages: self.page_bounds.len(),
+            pages,
         }))
     }
 
@@ -1598,6 +1642,34 @@ fn page_quad_from_mupdf(quad: &Quad) -> PageQuad {
     }
 }
 
+fn annotation_summary(
+    page_index: usize,
+    annotation: &PdfAnnotation,
+    document_allows_edits: bool,
+) -> Result<Option<AnnotationSummary>> {
+    if annotation.r#type()? != PdfAnnotationType::Highlight {
+        return Ok(None);
+    }
+    let xref = annotation.xref()?;
+    ensure!(
+        xref > 0,
+        "MuPDF returned an invalid xref for an existing Highlight"
+    );
+    let flags = annotation.flags()?;
+    let properties_locked =
+        flags.intersects(AnnotationFlags::IS_READ_ONLY | AnnotationFlags::IS_LOCKED);
+    let contents_locked = properties_locked || flags.contains(AnnotationFlags::IS_LOCKED_CONTENTS);
+    Ok(Some(AnnotationSummary {
+        id: AnnotationId { page_index, xref },
+        kind: AnnotationKind::Highlight,
+        contents: annotation.contents()?.unwrap_or_default().to_owned(),
+        color: annotation.color()?.map(annotation_color_from_mupdf),
+        can_edit_contents: document_allows_edits && !contents_locked,
+        can_edit_color: document_allows_edits && !properties_locked,
+        can_delete: document_allows_edits && !properties_locked,
+    }))
+}
+
 fn annotation_color_from_mupdf(color: AnnotationColor) -> PdfAnnotationColor {
     match color {
         AnnotationColor::Gray(gray) => PdfAnnotationColor::Gray(gray),
@@ -1903,6 +1975,104 @@ mod tests {
                 .annotation_page(AnnotationPageRequest {
                     page_index: 0,
                     expected_revision: 1,
+                })
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn highlight_index_batch_keeps_page_and_pdf_annotation_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("highlight-index.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let mut first_page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut first = first_page
+                .add_highlight_annotation(Quad::from(Rect::new(20.0, 30.0, 120.0, 50.0)))
+                .unwrap();
+            first.set_contents("first").unwrap();
+            first.update().unwrap();
+            drop(first);
+            let mut ignored = first_page
+                .add_underline_annotation(Quad::from(Rect::new(20.0, 60.0, 120.0, 80.0)))
+                .unwrap();
+            ignored.set_contents("not a Highlight").unwrap();
+            ignored.update().unwrap();
+            drop(ignored);
+            let mut second = first_page
+                .add_highlight_annotation(Quad::from(Rect::new(20.0, 90.0, 120.0, 110.0)))
+                .unwrap();
+            second.set_contents("second").unwrap();
+            second.update().unwrap();
+            first_page.update().unwrap();
+            drop(second);
+            drop(first_page);
+
+            let _empty_page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut third_page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut third = third_page
+                .add_highlight_annotation(Quad::from(Rect::new(20.0, 30.0, 120.0, 50.0)))
+                .unwrap();
+            third.set_contents("third").unwrap();
+            third.update().unwrap();
+            third_page.update().unwrap();
+            drop(third);
+            drop(third_page);
+            document.save(path_text).unwrap();
+        }
+
+        let backend = MuPdfBackend::open(path).unwrap();
+        let batch = backend
+            .highlight_index_batch(HighlightIndexRequest {
+                generation: 9,
+                expected_revision: 0,
+                first_page: 0,
+                page_count: 3,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(batch.generation, 9);
+        assert_eq!(batch.total_pages, 3);
+        assert_eq!(
+            batch
+                .pages
+                .iter()
+                .map(|page| page.page_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            batch.pages[0]
+                .highlights
+                .iter()
+                .map(|summary| summary.contents.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(batch.pages[1].highlights.is_empty());
+        assert_eq!(batch.pages[2].highlights[0].contents, "third");
+
+        let partial = backend
+            .highlight_index_batch(HighlightIndexRequest {
+                generation: 10,
+                expected_revision: 0,
+                first_page: 1,
+                page_count: 1,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.pages.len(), 1);
+        assert_eq!(partial.pages[0].page_index, 1);
+        assert!(
+            backend
+                .highlight_index_batch(HighlightIndexRequest {
+                    generation: 10,
+                    expected_revision: 1,
+                    first_page: 0,
+                    page_count: 1,
                 })
                 .unwrap()
                 .is_none()

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::domain::selection::{PagePoint, PageQuad};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -41,6 +43,32 @@ pub(crate) struct AnnotationSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AnnotationSummary {
+    pub(crate) id: AnnotationId,
+    pub(crate) kind: AnnotationKind,
+    pub(crate) contents: String,
+    pub(crate) color: Option<PdfAnnotationColor>,
+    pub(crate) can_edit_contents: bool,
+    pub(crate) can_edit_color: bool,
+    pub(crate) can_delete: bool,
+}
+
+impl AnnotationSnapshot {
+    /// Drops page-rendering geometry while preserving stable edit capabilities.
+    pub(crate) fn summary(&self) -> AnnotationSummary {
+        AnnotationSummary {
+            id: self.id,
+            kind: self.kind,
+            contents: self.contents.clone(),
+            color: self.color,
+            can_edit_contents: self.can_edit_contents,
+            can_edit_color: self.can_edit_color,
+            can_delete: self.can_delete,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AnnotationPageSnapshot {
     pub(crate) page_index: usize,
     pub(crate) revision: u64,
@@ -51,6 +79,29 @@ pub(crate) struct AnnotationPageSnapshot {
 pub(crate) struct AnnotationPageRequest {
     pub(crate) page_index: usize,
     pub(crate) expected_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct HighlightIndexRequest {
+    pub(crate) generation: u64,
+    pub(crate) expected_revision: u64,
+    pub(crate) first_page: usize,
+    pub(crate) page_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HighlightIndexPage {
+    pub(crate) page_index: usize,
+    pub(crate) highlights: Vec<AnnotationSummary>,
+    pub(crate) scan_time: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HighlightIndexBatch {
+    pub(crate) generation: u64,
+    pub(crate) revision: u64,
+    pub(crate) total_pages: usize,
+    pub(crate) pages: Vec<HighlightIndexPage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
