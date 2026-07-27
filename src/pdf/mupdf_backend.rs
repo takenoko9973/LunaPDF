@@ -381,12 +381,13 @@ impl MuPdfBackend {
         if request.expected_revision != self.revision {
             return Ok(None);
         }
-        let (_text_page, glyphs, _extraction_time) =
+        let (_text_page, glyphs, non_text_targets, _extraction_time) =
             load_text_snapshot(&self.document, request.page_index, self.page_bounds.len())?;
         Ok(Some(TextPageSnapshot {
             page_index: request.page_index,
             revision: self.revision,
             glyphs,
+            non_text_targets,
         }))
     }
 
@@ -450,7 +451,7 @@ impl MuPdfBackend {
         start: PagePoint,
         end: PagePoint,
     ) -> Result<SelectionSnapshot> {
-        let (_text_page, glyphs, extraction_time) =
+        let (_text_page, glyphs, _non_text_targets, extraction_time) =
             load_text_snapshot(&self.document, page_index, self.page_bounds.len())?;
         // The drag preview already resolves pointer positions to snapshot glyphs.
         // Re-running MuPDF's point selection here excludes endpoint glyphs, so
@@ -1325,7 +1326,7 @@ fn load_text_snapshot(
     document: &PdfDocument,
     page_index: usize,
     page_count: usize,
-) -> Result<(TextPage, Vec<GlyphSnapshot>, Duration)> {
+) -> Result<(TextPage, Vec<GlyphSnapshot>, Vec<PageQuad>, Duration)> {
     let page = document.load_pdf_page(page_number(page_index, page_count)?)?;
     let extraction_started = Instant::now();
     // Empty flags record MuPDF's standard extraction baseline. Typst-specific
@@ -1333,23 +1334,43 @@ fn load_text_snapshot(
     let text_page = page.to_text_page(TextPageFlags::empty())?;
     let structured = text_page.structured();
     let mut glyphs = Vec::new();
+    let mut non_text_targets = Vec::new();
     let mut line_index = 0;
 
     for block in structured.blocks {
-        let TextBlockContent::Text { lines } = block.content else {
-            continue;
-        };
-        for line in lines {
-            glyphs.extend(line.chars.into_iter().map(|character| GlyphSnapshot {
-                character: character.ch,
-                quad: page_quad_from_mupdf(&character.quad),
-                line_index,
-            }));
-            line_index += 1;
+        match block.content {
+            TextBlockContent::Text { lines } => {
+                for line in lines {
+                    glyphs.extend(line.chars.into_iter().map(|character| GlyphSnapshot {
+                        character: character.ch,
+                        quad: page_quad_from_mupdf(&character.quad),
+                        line_index,
+                    }));
+                    line_index += 1;
+                }
+            }
+            TextBlockContent::Image { .. } => {
+                non_text_targets.push(page_quad_from_mupdf(&Quad::from(block.bounds)));
+            }
+            TextBlockContent::Other => {}
         }
     }
 
-    Ok((text_page, glyphs, extraction_started.elapsed()))
+    for link in page.resolved_links()? {
+        non_text_targets.push(page_quad_from_mupdf(&Quad::from(link?.bounds)));
+    }
+    for widget in page.widgets() {
+        non_text_targets.push(page_quad_from_mupdf(&Quad::from(
+            widget.annotation().bounds()?,
+        )));
+    }
+
+    Ok((
+        text_page,
+        glyphs,
+        non_text_targets,
+        extraction_started.elapsed(),
+    ))
 }
 
 fn pixmap_samples_to_rgba(

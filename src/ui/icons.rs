@@ -3,6 +3,20 @@ use eframe::egui::{Color32, Rect, Response, Sense, Ui, Vec2};
 const ICON_SIZE: f32 = 18.0;
 const BUTTON_SIZE: f32 = 28.0;
 
+macro_rules! embedded_icon {
+    ($name:literal) => {
+        eframe::egui::ImageSource::Bytes {
+            uri: std::borrow::Cow::Borrowed(concat!("bytes://assets/icons/", $name, ".svg")),
+            bytes: eframe::egui::load::Bytes::Static(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/icons/",
+                $name,
+                ".svg"
+            ))),
+        }
+    };
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ToolbarIcon {
     Open,
@@ -24,26 +38,20 @@ pub(crate) enum ToolbarIcon {
 impl ToolbarIcon {
     fn source(self) -> eframe::egui::ImageSource<'static> {
         match self {
-            Self::Open => eframe::egui::include_image!("../../assets/icons/open.svg"),
-            Self::Print => eframe::egui::include_image!("../../assets/icons/print.svg"),
-            Self::Sidebar => eframe::egui::include_image!("../../assets/icons/sidebar.svg"),
-            Self::Previous => eframe::egui::include_image!("../../assets/icons/previous.svg"),
-            Self::Next => eframe::egui::include_image!("../../assets/icons/next.svg"),
-            Self::ZoomOut => eframe::egui::include_image!("../../assets/icons/zoom-out.svg"),
-            Self::ZoomIn => eframe::egui::include_image!("../../assets/icons/zoom-in.svg"),
-            Self::FitWidth => eframe::egui::include_image!("../../assets/icons/fit-width.svg"),
-            Self::FitPage => eframe::egui::include_image!("../../assets/icons/fit-page.svg"),
-            Self::Continuous => {
-                eframe::egui::include_image!("../../assets/icons/continuous.svg")
-            }
-            Self::SinglePage => {
-                eframe::egui::include_image!("../../assets/icons/single-page.svg")
-            }
-            Self::Highlight => eframe::egui::include_image!("../../assets/icons/highlight.svg"),
-            Self::Outline => eframe::egui::include_image!("../../assets/icons/outline.svg"),
-            Self::Thumbnails => {
-                eframe::egui::include_image!("../../assets/icons/thumbnails.svg")
-            }
+            Self::Open => embedded_icon!("open"),
+            Self::Print => embedded_icon!("print"),
+            Self::Sidebar => embedded_icon!("sidebar"),
+            Self::Previous => embedded_icon!("previous"),
+            Self::Next => embedded_icon!("next"),
+            Self::ZoomOut => embedded_icon!("zoom-out"),
+            Self::ZoomIn => embedded_icon!("zoom-in"),
+            Self::FitWidth => embedded_icon!("fit-width"),
+            Self::FitPage => embedded_icon!("fit-page"),
+            Self::Continuous => embedded_icon!("continuous"),
+            Self::SinglePage => embedded_icon!("single-page"),
+            Self::Highlight => embedded_icon!("highlight"),
+            Self::Outline => embedded_icon!("outline"),
+            Self::Thumbnails => embedded_icon!("thumbnails"),
         }
     }
 }
@@ -95,4 +103,46 @@ pub(crate) fn icon_button(
         image.paint_at(ui, icon_rect);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn every_toolbar_icon_has_embedded_bytes_and_a_stable_asset_uri() {
+        let icons = [
+            ToolbarIcon::Open,
+            ToolbarIcon::Print,
+            ToolbarIcon::Sidebar,
+            ToolbarIcon::Previous,
+            ToolbarIcon::Next,
+            ToolbarIcon::ZoomOut,
+            ToolbarIcon::ZoomIn,
+            ToolbarIcon::FitWidth,
+            ToolbarIcon::FitPage,
+            ToolbarIcon::Continuous,
+            ToolbarIcon::SinglePage,
+            ToolbarIcon::Highlight,
+            ToolbarIcon::Outline,
+            ToolbarIcon::Thumbnails,
+        ];
+        let mut uris = HashSet::new();
+
+        for icon in icons {
+            let eframe::egui::ImageSource::Bytes { uri, bytes } = icon.source() else {
+                panic!("toolbar icons must remain compile-time embedded bytes");
+            };
+            assert!(uri.starts_with("bytes://assets/icons/"));
+            assert!(uri.ends_with(".svg"));
+            assert!(!uri.contains(".."));
+            assert!(uris.insert(uri.into_owned()));
+            let eframe::egui::load::Bytes::Static(bytes) = bytes else {
+                panic!("toolbar icon bytes must have static storage");
+            };
+            assert!(!bytes.is_empty());
+        }
+    }
 }

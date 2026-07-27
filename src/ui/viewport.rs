@@ -1,5 +1,6 @@
 use eframe::egui::{
-    Color32, PointerButton, Popup, Pos2, Rect, Sense, Shape, Stroke, TextureHandle, Ui,
+    Color32, CursorIcon, PointerButton, Popup, Pos2, Rect, Sense, Shape, Stroke, TextureHandle, Ui,
+    Vec2,
 };
 
 use crate::domain::annotation::{
@@ -9,7 +10,7 @@ use crate::domain::annotation::{
 use crate::domain::document::{PageRect, RenderedTile, SearchMatch};
 use crate::domain::selection::{
     PagePoint, PageQuad, SelectionSnapshot, TextPageSnapshot, selected_display_quads,
-    selection_contains_point, snap_to_glyph,
+    selection_contains_point, snap_to_glyph, snap_to_glyph_with_max_distance,
 };
 use crate::ui::annotation_editor::{
     AnnotationContextTarget, AnnotationUiAction, annotation_hover_comments,
@@ -25,12 +26,49 @@ pub(crate) struct PageViewport {
     drag_active: bool,
     context_page: Option<usize>,
     context_target: Option<AnnotationContextTarget>,
+    primary_press: Option<PrimaryPressSource>,
+    clear_selection_on_click: bool,
+    blank_pan: Option<BlankPanState>,
 }
 
 #[derive(Default)]
 pub(crate) struct PageInteraction {
     pub(crate) completed_drag: Option<(usize, PagePoint, PagePoint)>,
     pub(crate) annotation_action: Option<AnnotationUiAction>,
+    pub(crate) pan_delta: Option<Vec2>,
+    pub(crate) clear_selection: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimaryPressSource {
+    Page(usize),
+    Background,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlankPanState {
+    source: PrimaryPressSource,
+    origin: Pos2,
+    last_position: Pos2,
+    active: bool,
+}
+
+impl BlankPanState {
+    fn new(source: PrimaryPressSource, origin: Pos2) -> Self {
+        Self {
+            source,
+            origin,
+            last_position: origin,
+            active: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PagePressKind {
+    Text(PagePoint),
+    Blank,
+    Blocked,
 }
 
 pub(crate) struct PageInteractionInput<'a> {
@@ -42,6 +80,7 @@ pub(crate) struct PageInteractionInput<'a> {
     pub(crate) annotation_page: Option<&'a AnnotationPageSnapshot>,
     pub(crate) can_create_highlight: bool,
     pub(crate) suppress_annotation_hover: bool,
+    pub(crate) input_excluded_rect: Option<Rect>,
 }
 
 impl PageViewport {
@@ -112,6 +151,7 @@ impl PageViewport {
             annotation_page,
             can_create_highlight,
             suppress_annotation_hover,
+            input_excluded_rect,
         } = input;
         let response = ui.interact(
             screen_rect,
@@ -136,14 +176,21 @@ impl PageViewport {
             .interact_pointer_pos()
             .or_else(|| ui.input(|input| input.pointer.latest_pos()))
             .filter(|position| response.rect.contains(*position))
+            .filter(|position| input_excluded_rect.is_none_or(|rect| !rect.contains(*position)))
+            .filter(|position| ui.ctx().layer_id_at(*position) == Some(ui.layer_id()))
             .map(|position| page_point_from_screen(position, screen_rect, bounds));
-        let secondary_released_here = ui.input(|input| {
-            input.pointer.button_released(PointerButton::Secondary)
-                && input
-                    .pointer
-                    .latest_pos()
-                    .is_some_and(|position| response.rect.contains(position))
+        let (secondary_released, secondary_position) = ui.input(|input| {
+            (
+                input.pointer.button_released(PointerButton::Secondary),
+                input.pointer.latest_pos(),
+            )
         });
+        let secondary_released_here = secondary_released
+            && secondary_position.is_some_and(|position| {
+                response.rect.contains(position)
+                    && input_excluded_rect.is_none_or(|rect| !rect.contains(position))
+                    && ui.ctx().layer_id_at(position) == Some(ui.layer_id())
+            });
         if secondary_released_here {
             let selection_available =
                 pointer_page_point
@@ -195,30 +242,56 @@ impl PageViewport {
                 )
             });
         let origin = press_origin.or(pointer_position);
-        if primary_pressed && origin.is_some_and(|position| response.rect.contains(position)) {
-            self.drag_start = origin
-                .map(|position| page_point_from_screen(position, screen_rect, bounds))
-                .and_then(|point| {
-                    text_snapshot.and_then(|snapshot| snap_to_glyph(&snapshot.glyphs, point))
-                });
+        if primary_pressed
+            && origin.is_some_and(|position| {
+                response.rect.contains(position)
+                    && input_excluded_rect.is_none_or(|rect| !rect.contains(position))
+                    && ui.ctx().layer_id_at(position) == Some(ui.layer_id())
+            })
+        {
+            let origin = origin.expect("the page contains the checked pointer origin");
+            let point = page_point_from_screen(origin, screen_rect, bounds);
+            let inside_selection = selection
+                .is_some_and(|selection| selection_contains_point(selection, page_index, point));
+            let logical_tolerance = ui
+                .ctx()
+                .options(|options| options.input_options.max_click_dist);
+            let page_tolerance =
+                glyph_hit_tolerance_in_page_points(screen_rect, bounds, logical_tolerance);
+            let press_kind = classify_page_press(
+                page_index,
+                point,
+                page_tolerance,
+                text_snapshot,
+                selection,
+                annotation_page,
+            );
+
+            self.primary_press = Some(PrimaryPressSource::Page(page_index));
+            self.clear_selection_on_click = selection.is_some() && !inside_selection;
+            self.blank_pan = match press_kind {
+                PagePressKind::Blank => Some(BlankPanState::new(
+                    PrimaryPressSource::Page(page_index),
+                    origin,
+                )),
+                PagePressKind::Text(_) | PagePressKind::Blocked => None,
+            };
+            self.drag_start = match press_kind {
+                PagePressKind::Text(start) => Some(start),
+                PagePressKind::Blank | PagePressKind::Blocked => None,
+            };
             self.drag_page = self.drag_start.map(|_| page_index);
             self.drag_current = self.drag_start;
-            // A press without a text glyph must not leave an origin that a
-            // later move could activate as a selection on another page.
-            self.drag_origin_screen = if self.drag_page.is_some() {
-                origin
-            } else {
-                None
-            };
+            self.drag_origin_screen = self.drag_start.map(|_| origin);
             self.drag_active = false;
         }
 
+        let drag_threshold = ui
+            .ctx()
+            .options(|options| options.input_options.max_click_dist);
         if self.drag_page == Some(page_index)
             && let (Some(origin), Some(position)) = (self.drag_origin_screen, pointer_position)
         {
-            let drag_threshold = ui
-                .ctx()
-                .options(|options| options.input_options.max_click_dist);
             self.drag_active |= selection_drag_exceeds_threshold(origin, position, drag_threshold);
         }
         if self.drag_active && self.drag_page == Some(page_index) {
@@ -230,10 +303,19 @@ impl PageViewport {
                     text_snapshot.and_then(|snapshot| snap_to_glyph(&snapshot.glyphs, point))
                 });
         }
+        if let Some(pan) = self
+            .blank_pan
+            .as_mut()
+            .filter(|pan| pan.source == PrimaryPressSource::Page(page_index))
+            && let Some(position) = pointer_position
+        {
+            interaction.pan_delta = update_blank_pan(pan, position, drag_threshold);
+        }
 
         self.paint_drag_preview(ui, screen_rect, page_index, bounds, text_snapshot);
 
-        if primary_released && self.drag_page == Some(page_index) {
+        if primary_released && self.primary_press == Some(PrimaryPressSource::Page(page_index)) {
+            let pan_was_active = self.blank_pan.is_some_and(|pan| pan.active);
             let completed = self.drag_active.then(|| {
                 self.drag_start
                     .zip(self.drag_current)
@@ -243,6 +325,11 @@ impl PageViewport {
             self.drag_start = None;
             self.drag_current = None;
             self.drag_origin_screen = None;
+            self.primary_press = None;
+            self.blank_pan = None;
+            interaction.clear_selection =
+                self.clear_selection_on_click && !self.drag_active && !pan_was_active;
+            self.clear_selection_on_click = false;
             self.drag_active = false;
             interaction.completed_drag = completed.flatten();
         }
@@ -260,10 +347,9 @@ impl PageViewport {
         let context_menu_open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&response));
         if annotation_hover_is_allowed(
             suppress_annotation_hover,
-            self.drag_active,
+            self.drag_active || self.blank_pan.is_some(),
             context_menu_open,
-        )
-            && let Some(point) = pointer_page_point
+        ) && let Some(point) = pointer_page_point
             && let Some(page) = annotation_page
         {
             let hits = annotations_at_point(&page.annotations, point);
@@ -278,6 +364,97 @@ impl PageViewport {
                     }
                 });
             }
+        }
+        if self
+            .blank_pan
+            .is_some_and(|pan| pan.source == PrimaryPressSource::Page(page_index) && pan.active)
+        {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if pointer_page_point.is_some_and(|point| {
+            let logical_tolerance = ui
+                .ctx()
+                .options(|options| options.input_options.max_click_dist);
+            let page_tolerance =
+                glyph_hit_tolerance_in_page_points(screen_rect, bounds, logical_tolerance);
+            classify_page_press(
+                page_index,
+                point,
+                page_tolerance,
+                text_snapshot,
+                selection,
+                annotation_page,
+            ) == PagePressKind::Blank
+        }) {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+        interaction
+    }
+
+    /// Handles the gray viewport area that is outside every rendered PDF page.
+    pub(crate) fn interact_background(
+        &mut self,
+        ui: &mut Ui,
+        view_rect: Rect,
+        page_rects: &[Rect],
+        excluded_rects: &[Rect],
+        selection_present: bool,
+    ) -> PageInteraction {
+        let mut interaction = PageInteraction::default();
+        let (primary_pressed, primary_released, pointer_position, press_origin) =
+            ui.input(|input| {
+                (
+                    input.pointer.button_pressed(PointerButton::Primary),
+                    input.pointer.button_released(PointerButton::Primary),
+                    input.pointer.latest_pos(),
+                    input.pointer.press_origin(),
+                )
+            });
+        let origin = press_origin.or(pointer_position);
+        let starts_on_background = origin.is_some_and(|position| {
+            view_rect.contains(position)
+                && page_rects.iter().all(|rect| !rect.contains(position))
+                && excluded_rects.iter().all(|rect| !rect.contains(position))
+                && ui.ctx().layer_id_at(position) == Some(ui.layer_id())
+        });
+        if primary_pressed && self.primary_press.is_none() && starts_on_background {
+            let origin = origin.expect("the checked background press has an origin");
+            self.primary_press = Some(PrimaryPressSource::Background);
+            self.clear_selection_on_click = selection_present;
+            self.blank_pan = Some(BlankPanState::new(PrimaryPressSource::Background, origin));
+        }
+
+        let drag_threshold = ui
+            .ctx()
+            .options(|options| options.input_options.max_click_dist);
+        if let Some(pan) = self
+            .blank_pan
+            .as_mut()
+            .filter(|pan| pan.source == PrimaryPressSource::Background)
+            && let Some(position) = pointer_position
+        {
+            interaction.pan_delta = update_blank_pan(pan, position, drag_threshold);
+        }
+
+        if primary_released && self.primary_press == Some(PrimaryPressSource::Background) {
+            let pan_was_active = self.blank_pan.is_some_and(|pan| pan.active);
+            interaction.clear_selection = self.clear_selection_on_click && !pan_was_active;
+            self.primary_press = None;
+            self.clear_selection_on_click = false;
+            self.blank_pan = None;
+        }
+
+        if self
+            .blank_pan
+            .is_some_and(|pan| pan.source == PrimaryPressSource::Background && pan.active)
+        {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if pointer_position.is_some_and(|position| {
+            view_rect.contains(position)
+                && page_rects.iter().all(|rect| !rect.contains(position))
+                && excluded_rects.iter().all(|rect| !rect.contains(position))
+                && ui.ctx().layer_id_at(position) == Some(ui.layer_id())
+        }) {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
         }
         interaction
     }
@@ -319,6 +496,81 @@ fn annotation_hover_is_allowed(
     // Tooltip creation is disabled while another pointer-owned annotation or
     // document interaction is active, so it cannot compete for the same hit.
     !externally_suppressed && !selection_drag_active && !context_menu_open
+}
+
+fn classify_page_press(
+    page_index: usize,
+    point: PagePoint,
+    glyph_tolerance: f32,
+    text_snapshot: Option<&TextPageSnapshot>,
+    selection: Option<&SelectionSnapshot>,
+    annotation_page: Option<&AnnotationPageSnapshot>,
+) -> PagePressKind {
+    if selection.is_some_and(|selection| selection_contains_point(selection, page_index, point)) {
+        return PagePressKind::Blocked;
+    }
+    let Some(text_snapshot) = text_snapshot else {
+        return PagePressKind::Blocked;
+    };
+    if let Some(glyph) =
+        snap_to_glyph_with_max_distance(&text_snapshot.glyphs, point, glyph_tolerance)
+    {
+        return PagePressKind::Text(glyph);
+    }
+    let Some(annotation_page) = annotation_page else {
+        // Until annotation metadata arrives, treating non-text page space as
+        // occupied avoids panning through a Highlight the worker has not
+        // described yet. Glyph selection remains available above.
+        return PagePressKind::Blocked;
+    };
+    let annotation_hit = !annotations_at_point(&annotation_page.annotations, point).is_empty();
+    let non_text_hit = text_snapshot
+        .non_text_targets
+        .iter()
+        .any(|target| target.contains(point));
+    // Annotation, link, form, and image geometry owns its pointer region even
+    // though only some of those targets currently have a left-click action.
+    if annotation_hit || non_text_hit {
+        PagePressKind::Blocked
+    } else {
+        PagePressKind::Blank
+    }
+}
+
+fn glyph_hit_tolerance_in_page_points(
+    screen_rect: Rect,
+    bounds: PageRect,
+    logical_tolerance: f32,
+) -> f32 {
+    if screen_rect.width() <= 0.0 || screen_rect.height() <= 0.0 {
+        return 0.0;
+    }
+    // egui's click tolerance is already expressed in DPI-independent logical
+    // points. Converting through the rendered page scale keeps the same screen
+    // hit radius at every PDF zoom without a fixed device-pixel threshold.
+    let page_units_per_screen_x = bounds.width() / screen_rect.width();
+    let page_units_per_screen_y = bounds.height() / screen_rect.height();
+    logical_tolerance * page_units_per_screen_x.max(page_units_per_screen_y)
+}
+
+fn update_blank_pan(
+    pan: &mut BlankPanState,
+    pointer_position: Pos2,
+    drag_threshold: f32,
+) -> Option<Vec2> {
+    if !pan.active {
+        if !selection_drag_exceeds_threshold(pan.origin, pointer_position, drag_threshold) {
+            return None;
+        }
+        pan.active = true;
+        let delta = pointer_position - pan.origin;
+        pan.last_position = pointer_position;
+        return (delta != Vec2::ZERO).then_some(delta);
+    }
+
+    let delta = pointer_position - pan.last_position;
+    pan.last_position = pointer_position;
+    (delta != Vec2::ZERO).then_some(delta)
 }
 
 fn selection_drag_exceeds_threshold(origin: Pos2, current: Pos2, threshold: f32) -> bool {
@@ -441,6 +693,7 @@ mod tests {
                 },
                 line_index: 0,
             }],
+            non_text_targets: Vec::new(),
         }
     }
 
@@ -487,6 +740,7 @@ mod tests {
                         annotation_page: None,
                         can_create_highlight: false,
                         suppress_annotation_hover: false,
+                        input_excluded_rect: None,
                     },
                 )
                 .completed_drag;
@@ -568,7 +822,89 @@ mod tests {
                     annotation_page: Some(page),
                     can_create_highlight: true,
                     suppress_annotation_hover: false,
+                    input_excluded_rect: None,
                 },
+            );
+        });
+        interaction
+    }
+
+    fn selected_glyph() -> SelectionSnapshot {
+        SelectionSnapshot {
+            page_index: 0,
+            generation: 1,
+            text: "A".to_owned(),
+            display_quads: vec![PageQuad {
+                upper_left: PagePoint::new(0.0, 0.0),
+                upper_right: PagePoint::new(20.0, 0.0),
+                lower_left: PagePoint::new(0.0, 20.0),
+                lower_right: PagePoint::new(20.0, 20.0),
+            }],
+            quads: Vec::new(),
+            extraction_time: Duration::ZERO,
+        }
+    }
+
+    fn page_frame_with_selection(
+        context: &egui::Context,
+        viewport: &mut PageViewport,
+        events: Vec<egui::Event>,
+        selection: &SelectionSnapshot,
+    ) -> PageInteraction {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0))),
+            events,
+            ..Default::default()
+        };
+        let text = text_snapshot();
+        let annotations = annotation_page(&[]);
+        let mut interaction = PageInteraction::default();
+        let _output = context.run_ui(input, |ui| {
+            interaction = viewport.interact_at(
+                ui,
+                PageInteractionInput {
+                    screen_rect: Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::splat(100.0)),
+                    page_index: 0,
+                    bounds: PageRect {
+                        x0: 0.0,
+                        y0: 0.0,
+                        x1: 100.0,
+                        y1: 100.0,
+                    },
+                    text_snapshot: Some(&text),
+                    selection: Some(selection),
+                    annotation_page: Some(&annotations),
+                    can_create_highlight: true,
+                    suppress_annotation_hover: false,
+                    input_excluded_rect: None,
+                },
+            );
+        });
+        interaction
+    }
+
+    fn background_frame(
+        context: &egui::Context,
+        viewport: &mut PageViewport,
+        events: Vec<egui::Event>,
+        selection_present: bool,
+    ) -> PageInteraction {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(240.0))),
+            events,
+            ..Default::default()
+        };
+        let mut interaction = PageInteraction::default();
+        let _output = context.run_ui(input, |ui| {
+            interaction = viewport.interact_background(
+                ui,
+                Rect::from_min_size(Pos2::ZERO, Vec2::splat(220.0)),
+                &[Rect::from_min_size(
+                    Pos2::new(20.0, 20.0),
+                    Vec2::splat(100.0),
+                )],
+                &[],
+                selection_present,
             );
         });
         interaction
@@ -592,6 +928,214 @@ mod tests {
         assert!(!annotation_hover_is_allowed(true, false, false));
         assert!(!annotation_hover_is_allowed(false, true, false));
         assert!(!annotation_hover_is_allowed(false, false, true));
+    }
+
+    #[test]
+    fn glyph_hit_tolerance_tracks_logical_points_across_zoom() {
+        let page = PageRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 100.0,
+            y1: 100.0,
+        };
+        let at_one_to_one = glyph_hit_tolerance_in_page_points(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
+            page,
+            6.0,
+        );
+        let at_two_times_zoom = glyph_hit_tolerance_in_page_points(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0)),
+            page,
+            6.0,
+        );
+
+        assert_eq!(at_one_to_one, 6.0);
+        assert_eq!(at_two_times_zoom, 3.0);
+    }
+
+    #[test]
+    fn page_press_distinguishes_text_blank_and_non_text_targets() {
+        let mut text = text_snapshot();
+        let annotations = annotation_page(&[]);
+        assert!(matches!(
+            classify_page_press(
+                0,
+                PagePoint::new(10.0, 10.0),
+                6.0,
+                Some(&text),
+                None,
+                Some(&annotations),
+            ),
+            PagePressKind::Text(_)
+        ));
+        assert_eq!(
+            classify_page_press(
+                0,
+                PagePoint::new(80.0, 80.0),
+                6.0,
+                Some(&text),
+                None,
+                Some(&annotations),
+            ),
+            PagePressKind::Blank
+        );
+
+        text.non_text_targets.push(PageQuad {
+            upper_left: PagePoint::new(60.0, 60.0),
+            upper_right: PagePoint::new(90.0, 60.0),
+            lower_left: PagePoint::new(60.0, 90.0),
+            lower_right: PagePoint::new(90.0, 90.0),
+        });
+        assert_eq!(
+            classify_page_press(
+                0,
+                PagePoint::new(80.0, 80.0),
+                6.0,
+                Some(&text),
+                None,
+                Some(&annotations),
+            ),
+            PagePressKind::Blocked
+        );
+
+        let mut no_glyphs = text.clone();
+        no_glyphs.glyphs.clear();
+        no_glyphs.non_text_targets.clear();
+        let highlight = annotation_page(&[17]);
+        assert_eq!(
+            classify_page_press(
+                0,
+                PagePoint::new(10.0, 10.0),
+                6.0,
+                Some(&no_glyphs),
+                None,
+                Some(&highlight),
+            ),
+            PagePressKind::Blocked
+        );
+
+        let selection = SelectionSnapshot {
+            page_index: 0,
+            generation: 1,
+            text: "selected".to_owned(),
+            display_quads: vec![PageQuad {
+                upper_left: PagePoint::new(70.0, 70.0),
+                upper_right: PagePoint::new(90.0, 70.0),
+                lower_left: PagePoint::new(70.0, 90.0),
+                lower_right: PagePoint::new(90.0, 90.0),
+            }],
+            quads: Vec::new(),
+            extraction_time: Duration::ZERO,
+        };
+        assert_eq!(
+            classify_page_press(
+                0,
+                PagePoint::new(80.0, 80.0),
+                6.0,
+                Some(&no_glyphs),
+                Some(&selection),
+                Some(&annotations),
+            ),
+            PagePressKind::Blocked
+        );
+    }
+
+    #[test]
+    fn blank_pan_waits_for_threshold_then_reports_two_axis_pointer_delta() {
+        let mut pan = BlankPanState::new(PrimaryPressSource::Page(0), Pos2::new(100.0, 100.0));
+
+        assert_eq!(
+            update_blank_pan(&mut pan, Pos2::new(104.0, 103.0), 6.0),
+            None
+        );
+        assert_eq!(
+            update_blank_pan(&mut pan, Pos2::new(110.0, 108.0), 6.0),
+            Some(Vec2::new(10.0, 8.0))
+        );
+        assert_eq!(
+            update_blank_pan(&mut pan, Pos2::new(106.0, 115.0), 6.0),
+            Some(Vec2::new(-4.0, 7.0))
+        );
+    }
+
+    #[test]
+    fn blank_click_clears_selection_but_blank_pan_keeps_it() {
+        let selection = selected_glyph();
+        let click_context = egui::Context::default();
+        let mut click_viewport = PageViewport::default();
+        let blank = Pos2::new(100.0, 100.0);
+        page_frame_with_selection(
+            &click_context,
+            &mut click_viewport,
+            vec![primary_button_event(blank, true)],
+            &selection,
+        );
+        let click = page_frame_with_selection(
+            &click_context,
+            &mut click_viewport,
+            vec![primary_button_event(blank, false)],
+            &selection,
+        );
+        assert!(click.clear_selection);
+
+        let pan_context = egui::Context::default();
+        let mut pan_viewport = PageViewport::default();
+        page_frame_with_selection(
+            &pan_context,
+            &mut pan_viewport,
+            vec![primary_button_event(blank, true)],
+            &selection,
+        );
+        let moved = page_frame_with_selection(
+            &pan_context,
+            &mut pan_viewport,
+            vec![egui::Event::PointerMoved(Pos2::new(85.0, 90.0))],
+            &selection,
+        );
+        assert_eq!(moved.pan_delta, Some(Vec2::new(-15.0, -10.0)));
+        let release = page_frame_with_selection(
+            &pan_context,
+            &mut pan_viewport,
+            vec![primary_button_event(Pos2::new(85.0, 90.0), false)],
+            &selection,
+        );
+        assert!(!release.clear_selection);
+    }
+
+    #[test]
+    fn gray_background_click_clears_and_drag_pans_in_two_axes() {
+        let background = Pos2::new(180.0, 180.0);
+        let context = egui::Context::default();
+        let mut viewport = PageViewport::default();
+        background_frame(
+            &context,
+            &mut viewport,
+            vec![primary_button_event(background, true)],
+            true,
+        );
+        let click = background_frame(
+            &context,
+            &mut viewport,
+            vec![primary_button_event(background, false)],
+            true,
+        );
+        assert!(click.clear_selection);
+
+        let context = egui::Context::default();
+        let mut viewport = PageViewport::default();
+        background_frame(
+            &context,
+            &mut viewport,
+            vec![primary_button_event(background, true)],
+            true,
+        );
+        let drag = background_frame(
+            &context,
+            &mut viewport,
+            vec![egui::Event::PointerMoved(Pos2::new(160.0, 150.0))],
+            true,
+        );
+        assert_eq!(drag.pan_delta, Some(Vec2::new(-20.0, -30.0)));
     }
 
     #[test]
@@ -955,6 +1499,7 @@ mod tests {
                         annotation_page: None,
                         can_create_highlight: true,
                         suppress_annotation_hover: false,
+                        input_excluded_rect: None,
                     },
                 );
                 assert!(interaction.completed_drag.is_none());

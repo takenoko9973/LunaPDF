@@ -99,6 +99,8 @@ pub(crate) struct TextPageSnapshot {
     pub(crate) page_index: usize,
     pub(crate) revision: u64,
     pub(crate) glyphs: Vec<GlyphSnapshot>,
+    /// Page elements that own pointer interaction independently of text selection.
+    pub(crate) non_text_targets: Vec<PageQuad>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -249,8 +251,28 @@ pub(crate) fn selected_glyphs(
 /// Maps a pointer to a stable character center in the Rust-owned text snapshot.
 pub(crate) fn snap_to_glyph(glyphs: &[GlyphSnapshot], point: PagePoint) -> Option<PagePoint> {
     let glyph = glyphs.get(nearest_glyph_index(glyphs, point)?)?;
+    Some(glyph_center(glyph))
+}
+
+/// Maps a pointer only when it is within the caller's page-space hit tolerance.
+pub(crate) fn snap_to_glyph_with_max_distance(
+    glyphs: &[GlyphSnapshot],
+    point: PagePoint,
+    maximum_distance: f32,
+) -> Option<PagePoint> {
+    if !maximum_distance.is_finite() || maximum_distance < 0.0 {
+        return None;
+    }
+    let (index, squared_distance) = nearest_glyph(glyphs, point)?;
+    if squared_distance > maximum_distance * maximum_distance {
+        return None;
+    }
+    glyphs.get(index).map(glyph_center)
+}
+
+fn glyph_center(glyph: &GlyphSnapshot) -> PagePoint {
     let (x0, y0, x1, y1) = glyph.quad.bounds();
-    Some(PagePoint::new((x0 + x1) / 2.0, (y0 + y1) / 2.0))
+    PagePoint::new((x0 + x1) / 2.0, (y0 + y1) / 2.0)
 }
 
 /// Returns the logical glyph range selected by two already page-local points.
@@ -265,6 +287,10 @@ pub(crate) fn selected_glyph_range(
 }
 
 fn nearest_glyph_index(glyphs: &[GlyphSnapshot], point: PagePoint) -> Option<usize> {
+    nearest_glyph(glyphs, point).map(|(index, _)| index)
+}
+
+fn nearest_glyph(glyphs: &[GlyphSnapshot], point: PagePoint) -> Option<(usize, f32)> {
     glyphs
         .iter()
         .enumerate()
@@ -273,7 +299,7 @@ fn nearest_glyph_index(glyphs: &[GlyphSnapshot], point: PagePoint) -> Option<usi
             let right_distance = squared_distance_to_quad_bounds(right.quad, point);
             left_distance.total_cmp(&right_distance)
         })
-        .map(|(index, _)| index)
+        .map(|(index, glyph)| (index, squared_distance_to_quad_bounds(glyph.quad, point)))
 }
 
 fn squared_distance_to_quad_bounds(quad: PageQuad, point: PagePoint) -> f32 {
@@ -330,6 +356,20 @@ mod tests {
         assert_eq!(
             selected_glyph_range(&glyphs, snapped, PagePoint::new(1.0, 5.0)),
             Some(0..=1)
+        );
+    }
+
+    #[test]
+    fn bounded_pointer_hit_rejects_page_space_far_from_text() {
+        let glyphs = vec![glyph('A', 0.0, 0), glyph('B', 20.0, 0)];
+
+        assert_eq!(
+            snap_to_glyph_with_max_distance(&glyphs, PagePoint::new(31.0, 5.0), 4.0),
+            Some(PagePoint::new(24.0, 5.0))
+        );
+        assert_eq!(
+            snap_to_glyph_with_max_distance(&glyphs, PagePoint::new(80.0, 80.0), 4.0),
+            None
         );
     }
 

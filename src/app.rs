@@ -7,9 +7,9 @@ use std::time::Instant;
 
 use crossbeam_channel::TryRecvError;
 use eframe::egui::{
-    self, Color32, CursorIcon, Event, Id, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2,
-    Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, TouchPhase, UiBuilder, Vec2,
-    ViewportCommand,
+    self, Color32, CursorIcon, Event, Id, Key, LayerId, Modifiers, MouseWheelUnit, PointerButton,
+    Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, TouchPhase, UiBuilder,
+    Vec2, ViewportCommand,
 };
 
 use crate::domain::annotation::{
@@ -104,13 +104,10 @@ const AUTOSCROLL_DEAD_ZONE_POINTS: f32 = 12.0;
 const AUTOSCROLL_SPEED_PER_POINT: f32 = 12.0;
 
 // Bound both long pointer excursions and a stalled frame: the former prevents
-// uncontrollable jumps, while 100 ms keeps one frame below 160 logical points.
-const AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND: f32 = 1_600.0;
+// uncontrollable jumps, while 100 ms keeps one frame below 480 logical points.
+const AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND: f32 = 4_800.0;
 const AUTOSCROLL_MAX_FRAME_SECONDS: f32 = 0.100;
 
-// A 200 ms page cooldown is visibly brief at 30-60 Hz but prevents one held
-// outward pointer position from crossing several single pages immediately.
-const AUTOSCROLL_PAGE_COOLDOWN_SECONDS: f64 = 0.200;
 const AUTOSCROLL_MARKER_RADIUS_POINTS: f32 = 8.0;
 
 // Inputs no more than 250 ms apart are one continuous zoom gesture for debug
@@ -337,6 +334,7 @@ struct ViewState {
     restore_single_anchor: Option<Vec2>,
     single_wheel: SinglePageWheelState,
     autoscroll: Option<AutoscrollState>,
+    pan_requested_offset: Option<Vec2>,
     render_pixels_per_point_bits: Option<u32>,
     generation: u64,
 }
@@ -353,7 +351,6 @@ struct SinglePageWheelState {
 struct AutoscrollState {
     anchor: Pos2,
     requested_offset: Option<Vec2>,
-    last_page_change_time: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -401,6 +398,22 @@ struct TabPaintState<'a> {
     can_close: bool,
     select_response: &'a egui::Response,
     close_response: &'a egui::Response,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TabPointerAction {
+    Select,
+    Close,
+}
+
+fn tab_pointer_action(primary_clicked: bool, middle_clicked: bool) -> Option<TabPointerAction> {
+    if middle_clicked {
+        Some(TabPointerAction::Close)
+    } else if primary_clicked {
+        Some(TabPointerAction::Select)
+    } else {
+        None
+    }
 }
 
 /// Returns one equal tab width, including the transition to horizontal scroll.
@@ -2550,8 +2563,15 @@ impl PrototypeApp {
                         if selected && tab_to_reveal == Some(index) {
                             tab_response.scroll_to_me(None);
                         }
-                        if select_response.clicked() {
-                            select_request = Some(index);
+                        match tab_pointer_action(
+                            select_response.clicked(),
+                            select_response.clicked_by(PointerButton::Middle),
+                        ) {
+                            Some(TabPointerAction::Select) => select_request = Some(index),
+                            Some(TabPointerAction::Close) if can_close => {
+                                close_request = Some(index)
+                            }
+                            Some(TabPointerAction::Close) | None => {}
                         }
                         if can_close && close_response.clicked() {
                             close_request = Some(index);
@@ -3473,6 +3493,11 @@ impl PrototypeApp {
 
     fn continuous_view(&mut self, ui: &mut egui::Ui, index: usize) {
         let document_id = self.documents[index].document_id;
+        let editor_input_rect = self
+            .annotation_editor
+            .as_ref()
+            .filter(|editor| editor.document_id == document_id)
+            .map(|_| annotation_overlay_rect(ui.max_rect()));
         let suppress_annotation_hover = self.documents[index].view.autoscroll.is_some()
             || self
                 .annotation_editor
@@ -3514,15 +3539,19 @@ impl PrototypeApp {
             .view
             .autoscroll
             .and_then(|autoscroll| autoscroll.requested_offset);
+        let pan_offset = tab.view.pan_requested_offset.take();
         let mut scroll_area = egui::ScrollArea::both()
             .id_salt(("continuous-pdf", &path))
             .auto_shrink([false, false]);
-        if let Some(offset) = jump_offset.or(autoscroll_offset) {
+        if let Some(offset) = jump_offset.or(pan_offset).or(autoscroll_offset) {
             scroll_area = scroll_area.scroll_offset(offset);
         }
 
         let mut completed_drag = None;
         let mut annotation_action = None;
+        let mut pan_delta = None;
+        let mut clear_selection = false;
+        let mut page_screen_rects = Vec::new();
         let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
             ui.set_min_size(Vec2::new(content_width, layout.total_height()));
             let visible_text_pages =
@@ -3566,6 +3595,7 @@ impl PrototypeApp {
                     ui.max_rect().min + Vec2::new(placement.x, placement.y),
                     Vec2::new(placement.width, placement.height),
                 );
+                page_screen_rects.push(screen_rect);
                 paint_page_tiles(ui, screen_rect, page_index, tab, gpu_lru);
                 if let Some(matches) = tab.search.pages.get(&page_index) {
                     let selected_match = tab
@@ -3602,6 +3632,7 @@ impl PrototypeApp {
                                 annotation_page: tab.annotation_pages.get(&annotation_key),
                                 can_create_highlight,
                                 suppress_annotation_hover,
+                                input_excluded_rect: editor_input_rect,
                             },
                         )
                     })
@@ -3612,6 +3643,10 @@ impl PrototypeApp {
                 if interaction.annotation_action.is_some() {
                     annotation_action = interaction.annotation_action;
                 }
+                if interaction.pan_delta.is_some() {
+                    pan_delta = interaction.pan_delta;
+                }
+                clear_selection |= interaction.clear_selection;
             }
         });
 
@@ -3621,10 +3656,27 @@ impl PrototypeApp {
         let viewport_center = output.state.offset + output.inner_rect.size() / 2.0;
         tab.view.center_anchor = layout.anchor_at(viewport_center.x, viewport_center.y);
         let maximum_offset = (output.content_size - output.inner_rect.size()).max(Vec2::ZERO);
+        let excluded_rects = editor_input_rect.into_iter().collect::<Vec<_>>();
+        let background_interaction = viewport.interact_background(
+            ui,
+            output.inner_rect,
+            &page_screen_rects,
+            &excluded_rects,
+            tab.selection.is_some(),
+        );
+        pan_delta = pan_delta.or(background_interaction.pan_delta);
+        clear_selection |= background_interaction.clear_selection;
+        if let Some(delta) = pan_delta {
+            let requested_offset = output.state.offset - delta;
+            tab.view.pan_requested_offset =
+                Some(clamp_scroll_offset(requested_offset, maximum_offset));
+        }
         if let Some(frame) = update_autoscroll(
             ui.ctx(),
             &mut tab.view,
             output.inner_rect,
+            &excluded_rects,
+            ui.layer_id(),
             output.state.offset,
             maximum_offset,
         ) {
@@ -3633,6 +3685,8 @@ impl PrototypeApp {
         if let Some((page_index, start, end)) = completed_drag {
             tab.request_selection(page_index, start, end);
             self.status = "Resolving selection on the document worker…".to_owned();
+        } else if clear_selection {
+            tab.clear_selection();
         }
         if let Some(action) = annotation_action {
             self.handle_annotation_ui_action(index, revision, action, ui.ctx());
@@ -3685,15 +3739,13 @@ impl PrototypeApp {
         let was_at_bottom =
             starting_offset.y >= maximum_offset.y - SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
         let page_fits_vertically = maximum_offset.y <= SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
-        let autoscroll_offset = tab
-            .view
-            .autoscroll
-            .and_then(|autoscroll| autoscroll.requested_offset);
+        let pan_offset = tab.view.pan_requested_offset.take();
         let mut interaction = PageInteraction::default();
+        let mut page_screen_rect = None;
         let mut scroll_area = egui::ScrollArea::both()
             .id_salt(("single-pdf", &path))
             .auto_shrink([false, false]);
-        if let Some(offset) = restored_offset.or(autoscroll_offset) {
+        if let Some(offset) = restored_offset.or(pan_offset) {
             scroll_area = scroll_area.scroll_offset(offset);
         }
         let output = scroll_area.show_viewport(ui, |ui, visible_viewport| {
@@ -3704,6 +3756,7 @@ impl PrototypeApp {
                 ui.max_rect().min + page_content_rect.min.to_vec2(),
                 page_content_rect.size(),
             );
+            page_screen_rect = Some(screen_rect);
             let requests = single_page_tile_requests(
                 tab,
                 &page_bounds,
@@ -3750,6 +3803,7 @@ impl PrototypeApp {
                             annotation_page: tab.annotation_pages.get(&annotation_key),
                             can_create_highlight,
                             suppress_annotation_hover,
+                            input_excluded_rect: editor_input_rect,
                         },
                     )
                 })
@@ -3785,56 +3839,36 @@ impl PrototypeApp {
 
         let maximum_output_offset =
             (output.content_size - output.inner_rect.size()).max(Vec2::ZERO);
-        let at_top = output.state.offset.y <= SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
-        let at_bottom =
-            output.state.offset.y >= maximum_output_offset.y - SINGLE_PAGE_EDGE_TOLERANCE_POINTS;
-        let autoscroll_frame = update_autoscroll(
-            ui.ctx(),
-            &mut tab.view,
+        let excluded_rects = editor_input_rect.into_iter().collect::<Vec<_>>();
+        let page_screen_rects = page_screen_rect.into_iter().collect::<Vec<_>>();
+        let background_interaction = viewport.interact_background(
+            ui,
             output.inner_rect,
-            output.state.offset,
-            maximum_output_offset,
+            &page_screen_rects,
+            &excluded_rects,
+            tab.selection.is_some(),
         );
-        if let Some(frame) = &autoscroll_frame {
-            paint_autoscroll_marker(ui, output.inner_rect, frame.anchor);
+        let pan_delta = interaction.pan_delta.or(background_interaction.pan_delta);
+        if let Some(delta) = pan_delta {
+            let requested_offset = output.state.offset - delta;
+            tab.view.pan_requested_offset =
+                Some(clamp_scroll_offset(requested_offset, maximum_output_offset));
         }
-        let autoscroll_page_delta = autoscroll_frame.as_ref().and_then(|frame| {
-            let last_page_change = tab
-                .view
-                .autoscroll
-                .and_then(|autoscroll| autoscroll.last_page_change_time);
-            autoscroll_page_delta(
-                frame.velocity.y,
-                at_top,
-                at_bottom,
-                frame.now,
-                last_page_change,
-            )
-        });
-        let page_delta = if wheel_page_delta != 0 {
-            Some(wheel_page_delta)
-        } else {
-            autoscroll_page_delta
-        };
-        if let Some(page_delta) = page_delta
-            && let Some(target) = adjacent_page_index(page_index, page_count, page_delta)
+        if wheel_page_delta != 0
+            && let Some(target) = adjacent_page_index(page_index, page_count, wheel_page_delta)
         {
             let x = tab.view.single_center_anchor.unwrap_or(Vec2::splat(0.5)).x;
             // Enter the next page at its top and the previous page at its
             // bottom so the wheel continues in the direction of travel.
-            let y = if page_delta > 0 { 0.0 } else { 1.0 };
+            let y = if wheel_page_delta > 0 { 0.0 } else { 1.0 };
             tab.jump_to_single_page_edge(target, Vec2::new(x, y));
-            if let Some(autoscroll) = &mut tab.view.autoscroll {
-                // The new page has a different scroll extent. Recompute its
-                // offset next frame and apply the same cooldown to wheel/auto races.
-                autoscroll.requested_offset = None;
-                autoscroll.last_page_change_time = Some(now);
-            }
         }
 
         if let Some((page_index, start, end)) = interaction.completed_drag {
             tab.request_selection(page_index, start, end);
             self.status = "Resolving selection on the document worker…".to_owned();
+        } else if interaction.clear_selection || background_interaction.clear_selection {
+            tab.clear_selection();
         }
         if let Some(action) = interaction.annotation_action {
             self.handle_annotation_ui_action(index, revision, action, ui.ctx());
@@ -4291,8 +4325,6 @@ fn reset_wheel_gesture(state: &mut SinglePageWheelState) {
 
 struct AutoscrollFrame {
     anchor: Pos2,
-    velocity: Vec2,
-    now: f64,
 }
 
 /// Starts, advances, or stops browser-style autoscroll for one PDF ScrollArea.
@@ -4300,9 +4332,15 @@ fn update_autoscroll(
     context: &egui::Context,
     view: &mut ViewState,
     view_rect: Rect,
+    excluded_rects: &[Rect],
+    view_layer: LayerId,
     current_offset: Vec2,
     maximum_offset: Vec2,
 ) -> Option<AutoscrollFrame> {
+    if view.display_mode != DisplayMode::Continuous {
+        view.autoscroll = None;
+        return None;
+    }
     let input = context.input(|input| {
         (
             input.pointer.button_clicked(PointerButton::Middle),
@@ -4311,12 +4349,10 @@ fn update_autoscroll(
             input.key_pressed(Key::Escape),
             input.focused,
             input.pointer.hover_pos(),
-            input.time,
             input.stable_dt.min(AUTOSCROLL_MAX_FRAME_SECONDS),
         )
     });
-    let (middle_clicked, primary_clicked, secondary_clicked, escape, focused, pointer, now, dt) =
-        input;
+    let (middle_clicked, primary_clicked, secondary_clicked, escape, focused, pointer, dt) = input;
 
     if view.autoscroll.is_some() {
         let stop_requested =
@@ -4325,12 +4361,20 @@ fn update_autoscroll(
             view.autoscroll = None;
             return None;
         }
-    } else if middle_clicked && pointer.is_some_and(|position| view_rect.contains(position)) {
+    } else if middle_clicked
+        && pointer.is_some_and(|position| {
+            // Foreground windows and the annotation editor may overlap the
+            // central rect. Only the central layer's unexcluded area owns the
+            // middle-click start.
+            view_rect.contains(position)
+                && excluded_rects.iter().all(|rect| !rect.contains(position))
+                && context.layer_id_at(position) == Some(view_layer)
+        })
+    {
         let anchor = pointer.expect("the start condition requires a pointer position");
         view.autoscroll = Some(AutoscrollState {
             anchor,
             requested_offset: Some(current_offset),
-            last_page_change_time: None,
         });
     }
 
@@ -4344,8 +4388,6 @@ fn update_autoscroll(
     context.request_repaint();
     Some(AutoscrollFrame {
         anchor: autoscroll.anchor,
-        velocity,
-        now,
     })
 }
 
@@ -4376,27 +4418,6 @@ fn scroll_area_state_id(ui: &egui::Ui, id_salt: impl egui::AsIdSalt) -> Id {
     // the parent. Passing the raw tuple directly to make_persistent_id hashes
     // a different value and reads a permanently empty scroll state.
     ui.make_persistent_id(egui::IdSalt::new(id_salt))
-}
-
-fn autoscroll_page_delta(
-    velocity_y: f32,
-    at_top: bool,
-    at_bottom: bool,
-    now: f64,
-    last_page_change_time: Option<f64>,
-) -> Option<isize> {
-    let cooling_down =
-        last_page_change_time.is_some_and(|last| now - last < AUTOSCROLL_PAGE_COOLDOWN_SECONDS);
-    if cooling_down {
-        return None;
-    }
-    if velocity_y > 0.0 && at_bottom {
-        Some(1)
-    } else if velocity_y < 0.0 && at_top {
-        Some(-1)
-    } else {
-        None
-    }
 }
 
 fn paint_autoscroll_marker(ui: &egui::Ui, view_rect: Rect, anchor: Pos2) {
@@ -5082,6 +5103,13 @@ impl DocumentTab {
             end,
         });
     }
+
+    fn clear_selection(&mut self) {
+        // Advancing the generation prevents a worker result from an earlier
+        // drag from restoring a selection after this explicit click-clear.
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.selection = None;
+    }
 }
 
 impl ViewState {
@@ -5113,6 +5141,7 @@ impl ViewState {
             restore_single_anchor: None,
             single_wheel: SinglePageWheelState::default(),
             autoscroll: None,
+            pan_requested_offset: None,
             render_pixels_per_point_bits: None,
             generation: 1,
         }
@@ -5149,6 +5178,7 @@ impl ViewState {
                 .then_some(single_anchor),
             single_wheel: SinglePageWheelState::default(),
             autoscroll: None,
+            pan_requested_offset: None,
             render_pixels_per_point_bits: None,
             generation: 1,
         }
@@ -5252,6 +5282,11 @@ impl ViewState {
             _ => unreachable!("LunaPDF has exactly two display modes"),
         }
         self.display_mode = mode;
+        // Both pointer-scroll modes store offsets in the current ScrollArea's
+        // coordinate system. A mode switch must discard the anchor and any
+        // pending two-axis movement before the other layout is shown.
+        self.autoscroll = None;
+        self.pan_requested_offset = None;
         true
     }
 }
@@ -5854,6 +5889,22 @@ mod tests {
     }
 
     #[test]
+    fn tab_middle_click_closes_without_selecting_first() {
+        assert_eq!(
+            tab_pointer_action(false, true),
+            Some(TabPointerAction::Close)
+        );
+        assert_eq!(
+            tab_pointer_action(true, false),
+            Some(TabPointerAction::Select)
+        );
+        assert_eq!(
+            tab_pointer_action(true, true),
+            Some(TabPointerAction::Close)
+        );
+    }
+
+    #[test]
     fn tab_close_icon_uses_two_equal_vector_strokes() {
         let close_rect = Rect::from_min_size(Pos2::new(10.0, 5.0), Vec2::splat(24.0));
         let segments = close_icon_segments(close_rect);
@@ -5909,7 +5960,6 @@ mod tests {
         app.documents[0].view.autoscroll = Some(AutoscrollState {
             anchor: Pos2::ZERO,
             requested_offset: Some(Vec2::ZERO),
-            last_page_change_time: None,
         });
         let context = egui::Context::default();
         let input = egui::RawInput {
@@ -6691,6 +6741,7 @@ mod tests {
     #[test]
     fn autoscroll_velocity_has_dead_zone_and_speed_ceiling() {
         let anchor = Pos2::new(100.0, 100.0);
+        assert_eq!(AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND, 4_800.0);
         assert_eq!(
             autoscroll_velocity(anchor, Pos2::new(110.0, 100.0)),
             Vec2::ZERO
@@ -6704,23 +6755,26 @@ mod tests {
     }
 
     #[test]
-    fn single_page_autoscroll_respects_edge_direction_and_cooldown() {
-        assert_eq!(
-            autoscroll_page_delta(100.0, false, true, 1.0, None),
-            Some(1)
+    fn single_page_mode_rejects_and_clears_autoscroll_state() {
+        let mut view = ViewState::new();
+        view.display_mode = DisplayMode::SinglePage;
+        view.autoscroll = Some(AutoscrollState {
+            anchor: Pos2::new(20.0, 30.0),
+            requested_offset: Some(Vec2::new(40.0, 50.0)),
+        });
+
+        let frame = update_autoscroll(
+            &egui::Context::default(),
+            &mut view,
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0)),
+            &[],
+            LayerId::background(),
+            Vec2::ZERO,
+            Vec2::splat(1_000.0),
         );
-        assert_eq!(
-            autoscroll_page_delta(-100.0, true, false, 1.0, None),
-            Some(-1)
-        );
-        assert_eq!(
-            autoscroll_page_delta(100.0, false, true, 1.1, Some(1.0)),
-            None
-        );
-        assert_eq!(
-            autoscroll_page_delta(100.0, true, false, 1.3, Some(1.0)),
-            None
-        );
+
+        assert!(frame.is_none());
+        assert!(view.autoscroll.is_none());
     }
 
     #[test]
@@ -6810,11 +6864,19 @@ mod tests {
             restore_single_anchor: None,
             single_wheel: SinglePageWheelState::default(),
             autoscroll: None,
+            pan_requested_offset: None,
             render_pixels_per_point_bits: None,
             generation: 1,
         };
+        view.autoscroll = Some(AutoscrollState {
+            anchor: Pos2::new(10.0, 20.0),
+            requested_offset: Some(Vec2::new(30.0, 40.0)),
+        });
+        view.pan_requested_offset = Some(Vec2::new(50.0, 60.0));
 
         assert!(view.switch_display_mode(DisplayMode::SinglePage));
+        assert!(view.autoscroll.is_none());
+        assert!(view.pan_requested_offset.is_none());
         assert_eq!(view.current_page, expected.page_index);
         assert_eq!(
             view.restore_single_anchor,
