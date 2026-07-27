@@ -2484,7 +2484,48 @@ mod tests {
             )
             .unwrap();
         assert!(!selection.quads.is_empty());
-        backend.create_highlight(0, &selection.quads).unwrap();
+        let first_action = backend.create_highlight(0, &selection.quads).unwrap();
+        let EditAction::CreateHighlight {
+            annotation_xref: first_xref,
+            ..
+        } = first_action
+        else {
+            panic!("create_highlight must return a create action");
+        };
+        let second_action = backend
+            .create_highlight(0, std::slice::from_ref(&selection.quads[0]))
+            .unwrap();
+        let EditAction::CreateHighlight {
+            annotation_xref: second_xref,
+            ..
+        } = second_action
+        else {
+            panic!("create_highlight must return a create action");
+        };
+        backend
+            .delete_annotation(AnnotationDeleteRequest {
+                id: AnnotationId {
+                    page_index: 0,
+                    xref: second_xref,
+                },
+                expected_revision: 2,
+            })
+            .unwrap();
+        backend
+            .update_annotation(AnnotationUpdateRequest {
+                id: AnnotationId {
+                    page_index: 0,
+                    xref: first_xref,
+                },
+                expected_revision: 3,
+                contents: Some("LunaPDF 日本語コメント\nexternal viewer check".to_owned()),
+                color: Some(PdfAnnotationColor::Rgb {
+                    red: 0.2,
+                    green: 0.45,
+                    blue: 0.95,
+                }),
+            })
+            .unwrap();
         assert_eq!(backend.save().unwrap(), 1);
         drop(backend);
 

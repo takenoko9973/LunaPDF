@@ -1,6 +1,6 @@
 # LunaPDF タブ・ページ操作・テキスト選択・注釈編集 調査・作業報告
 
-更新日：2026-07-24
+更新日：2026-07-27
 
 この文書は、`lunapdf_codex_tabs_paging_selection_annotations_instructions.md` に基づく調査、実装、検証の結果を作業中から記録する。未完了の項目は成功扱いせず、確認済みの事実と未確認範囲を分けて記載する。
 
@@ -372,3 +372,88 @@ cargo clippy --all-targets
 - Clippy：警告なし
 
 外部ソフト固有の外観ストリームがUndo前後で視覚的に完全一致すること、非常に大きいPDFでのsnapshotメモリ量、外部ビューアーでの表示は最終受入の未確認候補として扱う。
+
+## 7. 全体回帰検証と実機受入
+
+### 最終自動検証
+
+最終差分を含むDev Container上で、指示書指定のコマンドを再実行した。
+
+```text
+docker compose -f .devcontainer/compose.base.yml exec workspace cargo fmt --check
+docker compose -f .devcontainer/compose.base.yml exec workspace cargo check
+docker compose -f .devcontainer/compose.base.yml exec workspace cargo test
+docker compose -f .devcontainer/compose.base.yml exec workspace cargo check --release
+docker compose -f .devcontainer/compose.base.yml exec workspace cargo clippy --all-targets
+```
+
+実結果：
+
+- `cargo fmt --check`：終了コード0
+- `cargo check`：終了コード0
+- `cargo test`：165 passed、0 failed、1 ignored
+- `cargo check --release`：終了コード0
+- `cargo clippy --all-targets`：終了コード0、警告なし
+
+Windows GNU向けは、`AGENTS.md`指定のdebug／releaseコマンドでcross buildし、次の出力を得た。
+
+- `dist/lunapdf-debug.exe`：276,819,594 bytes
+- `dist/lunapdf-release.exe`：24,157,696 bytes
+
+### 保存互換性用fixture
+
+既存のignored受入テストを、同一ページに重なるHighlightを2件作成し、一方を削除し、残る一方へ日本語・改行を含むコメントとRGB色を設定して保存する内容へ拡張した。最終注釈件数が1件であることも保存処理の再オープン検証で確認する。
+
+```text
+docker compose -f .devcontainer/compose.base.yml exec workspace sh -c \
+  "LUNAPDF_ACCEPTANCE_OUTPUT=/workspace/dist/lunapdf-annotation-acceptance.pdf \
+  cargo test exports_highlight_fixture_for_external_viewers -- --ignored --nocapture"
+docker compose -f .devcontainer/compose.base.yml exec workspace sh -c \
+  "qpdf --check /workspace/dist/lunapdf-annotation-acceptance.pdf"
+```
+
+実結果：
+
+- ignored受入テスト：1 passed、0 failed
+- 出力：`dist/lunapdf-annotation-acceptance.pdf`、9,786 bytes
+- qpdf：PDF 1.7、非暗号化、構文・stream encoding errorなし
+
+受入PDFは`dist/`へ別ファイルとして生成した。元PDF fixture、ユーザー変更中の`assets/icons/fit-width.svg`、既存PDFは変更していない。再実行時は、既存出力を上書きしないテスト契約により一度`AlreadyExists`となったため、前回このテストが生成した同じ受入PDFだけを削除して再生成した。
+
+### Windows実機で確認できた範囲
+
+Windowsホスト上で`dist/lunapdf-release.exe`を起動し、LunaPDFのメインウィンドウとネイティブなPDF選択ダイアログが開くことまでは確認した。
+
+ただし、画面取得は次のWindows APIエラーで2回とも失敗した。
+
+```text
+SetIsBorderRequired failed: インターフェイスがサポートされていません (0x80004002)
+```
+
+アクセシビリティ経由ではLunaPDF本体がタイトルバー以外を公開せず、ネイティブファイル選択欄への入力も`element 52 is not available in cached app state`で停止した。このため、受入PDFをLunaPDFまたは起動済みのSumatraPDFへ読み込ませた目視確認は実施できていない。検証用に起動したLunaPDFプロセスは終了済みである。
+
+以上から、次は自動テストまたは構造検査で確認済みである。
+
+- タブ幅、閉じる領域、Xを構成する2線の長さ・太さ
+- 3桁を最低幅とするページ番号欄
+- raw wheelイベント単位のFitWidth端遷移、文書端、Ctrl、水平入力、領域外入力
+- クリック許容距離とドラッグ開始、1 glyph選択、行単位表示geometry、コピー／保存Quadの論理範囲
+- 注釈のstable ID、重複候補、右クリック／ダブルクリック方針
+- オーバーレイ矩形が中央領域内に収まり、配置計算と編集状態が分離されていること
+- コメント／色更新、削除、LIFO Undo、dirty、revision拒否、保存後再読込
+- 受入PDFの構文
+
+次は実機で未確認である。
+
+- 100%／125%／150%／200% DPIでのX、長い日本語タブ、多数タブ、`999 / 999`表示
+- ノッチ式マウス、高精度ホイール、トラックパッドによる操作感
+- 単純クリック、短いドラッグ、複数行選択、コピー／作成対象の画面上の一致
+- コンテキストメニュー、複数注釈サブメニュー、ダブルクリック、IME
+- オーバーレイの右端表示、背後入力遮断、開閉前後の倍率・ページ・スクロール位置、白紙待ちや再描画の有無
+- 外部PDFビューアーでのコメント、色、削除結果の表示
+- 外部ソフト固有の外観ストリームを持つ注釈のUndo前後の視覚的一致
+- 署名・暗号化権限制限PDF、非常に大きいPDFの連続編集時のsnapshotメモリ量
+
+### 完了判定
+
+ソース変更、自動回帰、debug／release build、保存後再読込、PDF構文検査は完了した。指示書の完了条件18「保存後も外部PDFビューアーで利用できる」と、画面・DPI・入力機器に依存する手動受入は、上記GUI検証環境の制約により完了と判定しない。
