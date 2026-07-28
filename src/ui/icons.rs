@@ -1,7 +1,9 @@
 use eframe::egui::{Color32, Rect, Response, Sense, Ui, Vec2};
 
 const ICON_SIZE: f32 = 18.0;
-const BUTTON_SIZE: f32 = 28.0;
+// Sumatra starts from an 18px icon and adds only a small vertical pad; a 24pt
+// control keeps a comparable ratio while preserving a usable click target.
+pub(crate) const TOOLBAR_CONTROL_HEIGHT: f32 = 24.0;
 
 macro_rules! embedded_icon {
     ($name:literal) => {
@@ -69,7 +71,7 @@ pub(crate) fn icon_button(
     } else {
         Sense::hover()
     };
-    let (rect, mut response) = ui.allocate_exact_size(Vec2::splat(BUTTON_SIZE), sense);
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::splat(TOOLBAR_CONTROL_HEIGHT), sense);
     response = response.on_hover_text(tooltip);
 
     if ui.is_rect_visible(rect) {

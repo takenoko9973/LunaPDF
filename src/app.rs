@@ -39,7 +39,7 @@ use crate::ui::annotation_editor::{
     show_annotation_editor,
 };
 use crate::ui::fonts::install_cjk_fallback;
-use crate::ui::icons::{ToolbarIcon, icon_button};
+use crate::ui::icons::{TOOLBAR_CONTROL_HEIGHT, ToolbarIcon, icon_button};
 use crate::ui::sidebar::{HighlightSidebarAction, SidebarTab, show_highlights, show_outline};
 use crate::ui::viewport::{
     PageInteraction, PageInteractionInput, PageViewport, pdf_cursor_icon, screen_rect_for_tile,
@@ -2990,7 +2990,12 @@ impl PrototypeApp {
         let mut open_requested = false;
         let mut print_requested = false;
 
-        egui::Panel::top("toolbar").show(root_ui, |ui| {
+        let toolbar_frame = egui::Frame::side_top_panel(root_ui.style()).stroke(egui::Stroke::new(
+            1.0,
+            root_ui.visuals().widgets.noninteractive.bg_stroke.color,
+        ));
+        let toolbar_panel = egui::Panel::top("toolbar").frame(toolbar_frame);
+        toolbar_panel.show(root_ui, |ui| {
             // Scrolling preserves one stable row when the window is too narrow;
             // wrapping would separate controls inside a functional group.
             egui::ScrollArea::horizontal()
@@ -3050,7 +3055,8 @@ impl PrototypeApp {
                             self.documents[index].page_input = (current_page + 1).to_string();
                         }
                         let page_input_width = page_number_input_width(ui, page_count);
-                        let page_response = ui.add(
+                        let page_response = ui.add_sized(
+                            [page_input_width, TOOLBAR_CONTROL_HEIGHT],
                             egui::TextEdit::singleline(&mut self.documents[index].page_input)
                                 .id(page_id)
                                 .desired_width(page_input_width)
@@ -3154,7 +3160,8 @@ impl PrototypeApp {
                         ui.separator();
 
                         let search = &mut self.documents[index].search;
-                        let response = ui.add(
+                        let response = ui.add_sized(
+                            [180.0, TOOLBAR_CONTROL_HEIGHT],
                             egui::TextEdit::singleline(&mut search.query)
                                 .id(search_query_id(document_id))
                                 .desired_width(180.0)
