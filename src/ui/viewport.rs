@@ -105,25 +105,24 @@ pub(crate) fn pdf_cursor_icon(
     autoscroll_active: bool,
     blank_pan_active: bool,
 ) -> CursorIcon {
-    // Hit-owned cursors precede navigation states so text, links, annotations,
-    // forms, and images cannot inherit a movement cursor from the page behind.
-    match target {
-        Some(PageCursorTarget::Text) => return CursorIcon::Text,
-        Some(PageCursorTarget::Link) => return CursorIcon::PointingHand,
-        Some(PageCursorTarget::Annotation | PageCursorTarget::OtherInteractive) => {
-            return CursorIcon::Default;
-        }
-        Some(PageCursorTarget::Blank | PageCursorTarget::Background) | None => {}
-    }
-
     if autoscroll_active {
         CursorIcon::AllScroll
     } else if blank_pan_active {
+        // The closed hand describes an established pan, not the idle ability
+        // to start one. It therefore remains visible while that drag crosses text.
         CursorIcon::Grabbing
-    } else if target.is_some() {
-        CursorIcon::Grab
     } else {
-        CursorIcon::Default
+        match target {
+            Some(PageCursorTarget::Text) => CursorIcon::Text,
+            Some(PageCursorTarget::Link) => CursorIcon::PointingHand,
+            Some(
+                PageCursorTarget::Annotation
+                | PageCursorTarget::OtherInteractive
+                | PageCursorTarget::Blank
+                | PageCursorTarget::Background,
+            )
+            | None => CursorIcon::Default,
+        }
     }
 }
 
@@ -1143,21 +1142,29 @@ mod tests {
     }
 
     #[test]
-    fn cursor_priority_preserves_hit_owned_affordances() {
+    fn idle_cursor_distinguishes_selectable_text_links_and_other_targets() {
         assert_eq!(
-            pdf_cursor_icon(Some(PageCursorTarget::Text), true, true),
+            pdf_cursor_icon(Some(PageCursorTarget::Text), false, false),
             CursorIcon::Text
         );
         assert_eq!(
-            pdf_cursor_icon(Some(PageCursorTarget::Link), true, true),
+            pdf_cursor_icon(Some(PageCursorTarget::Link), false, false),
             CursorIcon::PointingHand
         );
         assert_eq!(
-            pdf_cursor_icon(Some(PageCursorTarget::Annotation), true, true),
+            pdf_cursor_icon(Some(PageCursorTarget::Annotation), false, false),
             CursorIcon::Default
         );
         assert_eq!(
-            pdf_cursor_icon(Some(PageCursorTarget::OtherInteractive), true, true),
+            pdf_cursor_icon(Some(PageCursorTarget::OtherInteractive), false, false),
+            CursorIcon::Default
+        );
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Blank), false, false),
+            CursorIcon::Default
+        );
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Background), false, false),
             CursorIcon::Default
         );
     }
@@ -1167,7 +1174,7 @@ mod tests {
         for target in [PageCursorTarget::Blank, PageCursorTarget::Background] {
             assert_eq!(
                 pdf_cursor_icon(Some(target), false, false),
-                CursorIcon::Grab
+                CursorIcon::Default
             );
             assert_eq!(
                 pdf_cursor_icon(Some(target), false, true),
@@ -1182,11 +1189,23 @@ mod tests {
                 CursorIcon::AllScroll
             );
         }
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Text), false, false),
+            CursorIcon::Text
+        );
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Text), false, true),
+            CursorIcon::Grabbing
+        );
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Text), true, false),
+            CursorIcon::AllScroll
+        );
         assert_eq!(pdf_cursor_icon(None, false, false), CursorIcon::Default);
     }
 
     #[test]
-    fn selection_target_never_uses_blank_pan_cursor() {
+    fn selection_target_uses_the_i_beam_without_an_active_pan() {
         let selection = selected_glyph();
         let target = classify_page_press(
             0,
@@ -1199,7 +1218,10 @@ mod tests {
         .cursor_target();
 
         assert_eq!(target, PageCursorTarget::Text);
-        assert_eq!(pdf_cursor_icon(Some(target), false, true), CursorIcon::Text);
+        assert_eq!(
+            pdf_cursor_icon(Some(target), false, false),
+            CursorIcon::Text
+        );
     }
 
     #[test]
@@ -1239,7 +1261,7 @@ mod tests {
         );
         assert_eq!(
             pdf_cursor_icon(Some(PageCursorTarget::Blank), false, pan.active),
-            CursorIcon::Grab
+            CursorIcon::Default
         );
         assert_eq!(
             update_blank_pan(&mut pan, Pos2::new(110.0, 108.0), 6.0),
@@ -1281,7 +1303,7 @@ mod tests {
                 false,
                 click_viewport.blank_pan_in_progress()
             ),
-            CursorIcon::Grab
+            CursorIcon::Default
         );
 
         let pan_context = egui::Context::default();
@@ -1342,7 +1364,7 @@ mod tests {
                 false,
                 viewport.blank_pan_in_progress()
             ),
-            CursorIcon::Grab
+            CursorIcon::Default
         );
         let drag = background_frame(
             &context,

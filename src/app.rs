@@ -38,6 +38,7 @@ use crate::ui::annotation_editor::{
     annotation_comment_id, annotation_overlay_rect, show_annotation_candidate_button,
     show_annotation_editor,
 };
+use crate::ui::cursor::set_pdf_cursor;
 use crate::ui::fonts::install_cjk_fallback;
 use crate::ui::icons::{TOOLBAR_CONTROL_HEIGHT, ToolbarIcon, icon_button};
 use crate::ui::sidebar::{HighlightSidebarAction, SidebarTab, show_highlights, show_outline};
@@ -152,6 +153,9 @@ pub(crate) struct PrototypeApp {
     annotation_editor: Option<AnnotationEditorState>,
     annotation_picker: Option<AnnotationPickerState>,
     recent_annotation_colors: Vec<[u8; 3]>,
+    // egui-winit emits Event::Copy without a matching pressed Key event.
+    // The release event clears this latch so OS key-repeat cannot recopy the PDF.
+    copy_shortcut_active: bool,
 }
 
 struct DocumentTab {
@@ -694,6 +698,7 @@ impl PrototypeApp {
             annotation_editor: None,
             annotation_picker: None,
             recent_annotation_colors,
+            copy_shortcut_active: false,
         };
         if paths.is_empty() && restore_enabled {
             if let Some(session) = saved_session {
@@ -1609,8 +1614,15 @@ impl PrototypeApp {
         if highlight_pressed && !close_flow_active {
             self.create_highlight();
         }
-        let copy_pressed = !text_input_has_focus
-            && context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::C));
+        let text_input_owns_copy =
+            active_text_input.is_some_and(|input_id| text_edit_has_selection(context, input_id));
+        let pdf_selection_available = self.can_copy_selection();
+        let copy_pressed = consume_pdf_copy_event(
+            context,
+            &mut self.copy_shortcut_active,
+            text_input_owns_copy,
+            pdf_selection_available,
+        );
         if copy_pressed {
             self.copy_selection(context);
         }
@@ -3001,7 +3013,12 @@ impl PrototypeApp {
             egui::ScrollArea::horizontal()
                 .id_salt("toolbar-scroll")
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    // Constrain the scroll content before centering; otherwise a
+                    // top panel can offer the remaining window height here.
+                    ui.set_height(TOOLBAR_CONTROL_HEIGHT);
+                    // Centering within the fixed row keeps labels, TextEdits,
+                    // separators, and icon targets on one visual axis.
+                    ui.horizontal_centered(|ui| {
                         // Keep the sidebar slot stable while no PDF is open so the remaining
                         // toolbar groups do not shift when the first document is loaded.
                         let sidebar_enabled = self
@@ -3984,11 +4001,10 @@ impl PrototypeApp {
         {
             // The annotation editor is painted after the PDF. Skipping the PDF
             // cursor here also covers editor regions whose widgets use Default.
-            ui.ctx().set_cursor_icon(pdf_cursor_icon(
-                cursor_target,
-                autoscroll_active,
-                blank_pan_active,
-            ));
+            set_pdf_cursor(
+                ui.ctx(),
+                pdf_cursor_icon(cursor_target, autoscroll_active, blank_pan_active),
+            );
         }
         if let Some((page_index, start, end)) = completed_drag {
             tab.request_selection(page_index, start, end);
@@ -4178,8 +4194,10 @@ impl PrototypeApp {
         let blank_pan_active = viewport.blank_pan_in_progress();
         let dedicated_cursor_owner = pointer_over_any_rect(ui.ctx(), &excluded_rects);
         if !dedicated_cursor_owner && (cursor_target.is_some() || blank_pan_active) {
-            ui.ctx()
-                .set_cursor_icon(pdf_cursor_icon(cursor_target, false, blank_pan_active));
+            set_pdf_cursor(
+                ui.ctx(),
+                pdf_cursor_icon(cursor_target, false, blank_pan_active),
+            );
         }
 
         if let Some((page_index, start, end)) = interaction.completed_drag {
@@ -5840,6 +5858,7 @@ impl eframe::App for PrototypeApp {
             // Native focus loss may omit a matching button-release event.
             self.stop_active_autoscroll();
             self.viewport.cancel_primary_interaction();
+            self.copy_shortcut_active = false;
         }
         let modal_open = self.close_confirmation.is_some() || self.session_close_failure.is_some();
         if modal_open {
@@ -6200,6 +6219,53 @@ fn consume_highlight_shortcut(context: &egui::Context, active_text_input: Option
     context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::H))
 }
 
+fn text_edit_has_selection(context: &egui::Context, id: Id) -> bool {
+    egui::TextEdit::load_state(context, id)
+        .and_then(|state| state.cursor.char_range())
+        .is_some_and(|range| !range.is_empty())
+}
+
+/// Consumes a platform copy event only when PDF selection owns the command.
+fn consume_pdf_copy_event(
+    context: &egui::Context,
+    shortcut_active: &mut bool,
+    text_input_owns_copy: bool,
+    pdf_selection_available: bool,
+) -> bool {
+    context.input_mut(|input| {
+        let mut copy_pdf_selection = false;
+        let mut retained_events = Vec::with_capacity(input.events.len());
+        for event in input.events.drain(..) {
+            match event {
+                Event::Copy => {
+                    let first_copy_event = !*shortcut_active;
+                    *shortcut_active = true;
+                    if text_input_owns_copy {
+                        // TextEdit must retain Event::Copy so its own selected range reaches
+                        // the platform clipboard before PDF selection is considered.
+                        retained_events.push(Event::Copy);
+                    } else if first_copy_event && pdf_selection_available {
+                        copy_pdf_selection = true;
+                    }
+                }
+                Event::Key {
+                    key: Key::C | Key::Insert | Key::Copy,
+                    pressed: false,
+                    ..
+                } => {
+                    // egui-winit also maps Ctrl+Insert and the dedicated Copy key
+                    // to Event::Copy, so their releases must rearm the same latch.
+                    *shortcut_active = false;
+                    retained_events.push(event);
+                }
+                _ => retained_events.push(event),
+            }
+        }
+        input.events = retained_events;
+        copy_pdf_selection
+    })
+}
+
 fn is_pdf_path(path: &Path) -> bool {
     path.is_file()
         && path
@@ -6468,6 +6534,207 @@ mod tests {
     }
 
     #[test]
+    fn platform_copy_event_reaches_the_existing_pdf_copy_path_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf_path = directory.path().join("document.pdf");
+        write_blank_pdf(&pdf_path);
+        let session_path = directory.path().join("session.json");
+        let mut app = PrototypeApp::from_startup(vec![pdf_path], SessionStore::new(session_path));
+        app.documents[0].selection = Some(SelectionSnapshot {
+            page_index: 0,
+            generation: 1,
+            text: "日本語\nPDF text".to_owned(),
+            display_quads: Vec::new(),
+            quads: Vec::new(),
+            extraction_time: Duration::ZERO,
+        });
+        let context = egui::Context::default();
+
+        let output = context.run_ui(copy_event_input(), |ui| app.handle_shortcuts(ui.ctx()));
+
+        let copied_texts = output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                egui::OutputCommand::CopyImage(_) | egui::OutputCommand::OpenUrl(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(copied_texts, vec!["日本語\nPDF text"]);
+        assert_eq!(app.status, "Selected text copied");
+
+        let repeated = context.run_ui(copy_event_input(), |ui| app.handle_shortcuts(ui.ctx()));
+        assert!(
+            repeated
+                .platform_output
+                .commands
+                .iter()
+                .all(|command| !matches!(command, egui::OutputCommand::CopyText(_)))
+        );
+    }
+
+    #[test]
+    fn selected_text_inputs_keep_the_copy_event_ahead_of_pdf_selection() {
+        let input_ids = [
+            search_query_id(7),
+            page_number_id(7),
+            annotation_comment_id(
+                7,
+                AnnotationId {
+                    page_index: 0,
+                    xref: 11,
+                },
+            ),
+        ];
+
+        for input_id in input_ids {
+            let context = egui::Context::default();
+            let mut text = "search text".to_owned();
+            let _initial = context.run_ui(egui::RawInput::default(), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(input_id));
+            });
+            let mut state = egui::TextEdit::load_state(&context, input_id).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(6),
+                )));
+            egui::TextEdit::store_state(&context, input_id, state);
+            context.memory_mut(|memory| memory.request_focus(input_id));
+
+            let mut copied_pdf = true;
+            let mut copy_event_remained = false;
+            let mut shortcut_active = false;
+            let output = context.run_ui(copy_event_input(), |ui| {
+                let text_input_owns_copy = text_edit_has_selection(ui.ctx(), input_id);
+                copied_pdf = consume_pdf_copy_event(
+                    ui.ctx(),
+                    &mut shortcut_active,
+                    text_input_owns_copy,
+                    true,
+                );
+                copy_event_remained = ui.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::Copy))
+                });
+                ui.add(egui::TextEdit::singleline(&mut text).id(input_id));
+            });
+
+            assert!(!copied_pdf);
+            assert!(copy_event_remained);
+            assert!(output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == "search")
+            }));
+        }
+    }
+
+    #[test]
+    fn copy_event_without_any_selection_is_consumed_without_action() {
+        let context = egui::Context::default();
+        let mut shortcut_active = false;
+        let mut copied_pdf = true;
+        let mut copy_event_remained = true;
+
+        let _output = context.run_ui(copy_event_input(), |ui| {
+            copied_pdf = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, false);
+            copy_event_remained = ui.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Copy))
+            });
+        });
+
+        assert!(!copied_pdf);
+        assert!(!copy_event_remained);
+    }
+
+    #[test]
+    fn copy_key_release_rearms_pdf_copy_after_repeat_is_ignored() {
+        let context = egui::Context::default();
+        let mut shortcut_active = false;
+        let mut copied = false;
+        let _first = context.run_ui(copy_event_input(), |ui| {
+            copied = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, true);
+        });
+        assert!(copied);
+
+        let _repeat = context.run_ui(copy_event_input(), |ui| {
+            copied = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, true);
+        });
+        assert!(!copied);
+
+        let release_input = egui::RawInput {
+            events: vec![copy_key_release_event(Key::C)],
+            ..Default::default()
+        };
+        let _release = context.run_ui(release_input, |ui| {
+            copied = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, true);
+        });
+        assert!(!copied);
+        assert!(!shortcut_active);
+
+        let _second_press = context.run_ui(copy_event_input(), |ui| {
+            copied = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, true);
+        });
+        assert!(copied);
+    }
+
+    #[test]
+    fn copy_release_in_the_same_frame_rearms_the_next_pdf_copy() {
+        let context = egui::Context::default();
+        let mut shortcut_active = false;
+        let mut copied = false;
+        let copy_then_release = egui::RawInput {
+            events: vec![Event::Copy, copy_key_release_event(Key::C)],
+            ..Default::default()
+        };
+
+        let _first = context.run_ui(copy_then_release, |ui| {
+            copied = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, true);
+        });
+        assert!(copied);
+        assert!(!shortcut_active);
+
+        let _second = context.run_ui(copy_event_input(), |ui| {
+            copied = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, true);
+        });
+        assert!(copied);
+    }
+
+    #[test]
+    fn alternative_copy_key_releases_rearm_the_pdf_copy_latch() {
+        for release_key in [Key::Insert, Key::Copy] {
+            let context = egui::Context::default();
+            let mut shortcut_active = false;
+            let mut copied = false;
+            let _first = context.run_ui(copy_event_input(), |ui| {
+                copied = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, true);
+            });
+            assert!(copied);
+
+            let release_input = egui::RawInput {
+                events: vec![copy_key_release_event(release_key)],
+                ..Default::default()
+            };
+            let _release = context.run_ui(release_input, |ui| {
+                copied = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, true);
+            });
+            assert!(!copied);
+            assert!(!shortcut_active);
+
+            let _second = context.run_ui(copy_event_input(), |ui| {
+                copied = consume_pdf_copy_event(ui.ctx(), &mut shortcut_active, false, true);
+            });
+            assert!(copied);
+        }
+    }
+
+    #[test]
     fn consumed_escape_still_stops_active_autoscroll() {
         let directory = tempfile::tempdir().unwrap();
         let pdf_path = directory.path().join("document.pdf");
@@ -6553,6 +6820,23 @@ mod tests {
                 modifiers: Modifiers::NONE,
             }],
             ..Default::default()
+        }
+    }
+
+    fn copy_event_input() -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        }
+    }
+
+    fn copy_key_release_event(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
         }
     }
 

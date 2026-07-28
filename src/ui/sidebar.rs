@@ -1,16 +1,17 @@
 use std::collections::BTreeMap;
 
-use eframe::egui::{self, CursorIcon, Id, Sense, Ui, Vec2};
+use eframe::egui::{self, CursorIcon, Id, Rect, Sense, Ui, Vec2, WidgetInfo, WidgetType};
 
 use crate::domain::annotation::AnnotationSummary;
 use crate::domain::document::OutlineItem;
-use crate::ui::annotation_editor::color_swatch;
+use crate::ui::annotation_editor::paint_color_swatch;
 
 const COMMENT_HEAD_CHARACTERS: usize = 48;
 // 18pt swatch plus 5pt vertical breathing room keeps the row readable and clickable.
 const HIGHLIGHT_ROW_HEIGHT: f32 = 28.0;
 // Four points preserve a visible hover gutter without shrinking the gesture row.
 const HIGHLIGHT_ROW_HORIZONTAL_PADDING: f32 = 4.0;
+const HIGHLIGHT_ROW_SWATCH_SIZE: f32 = 18.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SidebarTab {
@@ -106,18 +107,12 @@ pub(crate) fn show_highlights(
                             ui.visuals().widgets.hovered.bg_fill,
                         );
                     }
-                    ui.scope_builder(
-                        egui::UiBuilder::new().max_rect(
-                            row_rect.shrink2(Vec2::new(HIGHLIGHT_ROW_HORIZONTAL_PADDING, 0.0)),
-                        ),
-                        |ui| {
-                            ui.horizontal(|ui| {
-                                color_swatch(ui, summary.color, 18.0);
-                                ui.label(format!("{}ページ", page_index + 1));
-                                ui.label(comment_head(&summary.contents));
-                            });
-                        },
-                    );
+                    let row_label = paint_highlight_row(ui, row_rect, *page_index, summary);
+                    // Painter content has no child Response, so attach its meaning
+                    // to the one row Response used by every pointer gesture.
+                    row.widget_info(|| {
+                        WidgetInfo::labeled(WidgetType::Button, true, row_label.clone())
+                    });
                     let row = if summary.contents.trim().is_empty() {
                         row
                     } else {
@@ -160,6 +155,59 @@ pub(crate) fn show_highlights(
         }
     });
     action
+}
+
+fn paint_highlight_row(
+    ui: &mut Ui,
+    row_rect: Rect,
+    page_index: usize,
+    summary: &AnnotationSummary,
+) -> String {
+    let item_spacing = ui.spacing().item_spacing.x;
+    let (swatch_rect, text_rect) = highlight_row_content_rects(row_rect, item_spacing);
+    paint_color_swatch(ui, swatch_rect, summary.color);
+
+    let text = format!(
+        "{}ページ  {}",
+        page_index + 1,
+        comment_head(&summary.contents)
+    );
+    let mut layout_job = egui::text::LayoutJob::single_section(
+        text.clone(),
+        egui::TextFormat {
+            font_id: egui::TextStyle::Body.resolve(ui.style()),
+            color: ui.visuals().text_color(),
+            ..Default::default()
+        },
+    );
+    layout_job.wrap = egui::epaint::text::TextWrapping::truncate_at_width(text_rect.width());
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(layout_job));
+    // Painter-owned text keeps the row Response authoritative while the
+    // galley box, rather than a fixed baseline offset, determines vertical centering.
+    let text_position = egui::Pos2::new(
+        text_rect.left(),
+        text_rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter()
+        .with_clip_rect(text_rect)
+        .galley(text_position, galley, ui.visuals().text_color());
+    text
+}
+
+fn highlight_row_content_rects(row_rect: Rect, item_spacing: f32) -> (Rect, Rect) {
+    let content_rect = row_rect.shrink2(Vec2::new(HIGHLIGHT_ROW_HORIZONTAL_PADDING, 0.0));
+    let swatch_rect = Rect::from_center_size(
+        egui::Pos2::new(
+            content_rect.left() + HIGHLIGHT_ROW_SWATCH_SIZE / 2.0,
+            content_rect.center().y,
+        ),
+        Vec2::splat(HIGHLIGHT_ROW_SWATCH_SIZE),
+    );
+    let text_rect = Rect::from_min_max(
+        egui::Pos2::new(swatch_rect.right() + item_spacing, content_rect.top()),
+        content_rect.right_bottom(),
+    );
+    (swatch_rect, text_rect)
 }
 
 /// Maps one row gesture without letting read-only rows open a mutation path.
@@ -234,6 +282,24 @@ mod tests {
         assert_eq!(
             comment_head(&"a".repeat(COMMENT_HEAD_CHARACTERS + 1)),
             format!("{}…", "a".repeat(COMMENT_HEAD_CHARACTERS))
+        );
+    }
+
+    #[test]
+    fn row_content_uses_the_allocated_rows_vertical_center() {
+        let row_rect = Rect::from_min_size(
+            egui::Pos2::new(10.0, 20.0),
+            Vec2::new(240.0, HIGHLIGHT_ROW_HEIGHT),
+        );
+
+        let (swatch_rect, text_rect) = highlight_row_content_rects(row_rect, 8.0);
+
+        assert_eq!(swatch_rect.center().y, row_rect.center().y);
+        assert_eq!(text_rect.center().y, row_rect.center().y);
+        assert!(text_rect.left() > swatch_rect.right());
+        assert_eq!(
+            text_rect.right(),
+            row_rect.right() - HIGHLIGHT_ROW_HORIZONTAL_PADDING
         );
     }
 

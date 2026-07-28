@@ -19,6 +19,8 @@
 - [Codex向け LunaPDF タブ・ページ操作・テキスト選択・注釈編集 改善指示書](ui-improvement/lunapdf_codex_tabs_paging_selection_annotations_instructions.md)
 - [Codex向け LunaPDF 注釈UI・入力操作・サイドバー追補修正指示書](ui-improvement/260728_lunapdf_codex_annotation_interaction_sidebar_followup_instructions.md)
 - [Codex向け LunaPDF 空白パン・自動スクロール カーソル修正指示書](ui-improvement/260728_lunapdf_codex_cursor_state_followup_fix_instructions.md)
+- [Codex向け LunaPDF 注釈UI・カーソル・コピー操作 差分修正指示書](ui-improvement/260728_lunapdf_ui_cursor_copy_followup_instructions.md)
+- [LunaPDF 注釈UI・カーソル・コピー操作 差分修正 作業報告](ui-improvement/260728_lunapdf_ui_cursor_copy_followup_report.md)
 - [LunaPDF 注釈UI・ハイライト描画 修正指示書](ui-improvement/260728_lunapdf_annotation_ui_highlight_revision_instructions_ja.md)
 - [LunaPDF 注釈UI・ハイライト描画 修正 作業報告](ui-improvement/260728_lunapdf_annotation_ui_highlight_revision_report_ja.md)
 - [LunaPDF 注釈UI・入力操作・サイドバー追補修正 作業報告](ui-improvement/260728_lunapdf_annotation_interaction_sidebar_followup_report.md)
