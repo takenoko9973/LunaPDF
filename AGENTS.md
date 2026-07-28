@@ -2,7 +2,7 @@
 
 - コミットメッセージは `<type>: 日本語の要約` の形式に統一する（例: `fix: 印刷処理の終了状態を修正`）。
 - Goalを設定して進める作業では、各フェーズなど区切りのよい時点で変更をコミットする。
-- リポジトリ内の作業指示書に従う前に、`docs/tasks/README.md`の分類に沿うフォルダへ配置し、同READMEの索引を更新する。
+- リポジトリ内の作業指示書に従う前に、`docs/tasks/README.md`の分類に沿うフォルダへ配置し、同READMEの索引を更新する。また、`yymmdd_xxxxx.md` に変更し、実行時期がわかるようにすること。
 - GUIまたは性能の受入検証を行う前に、`.codex/validation-lessons.md`を読む。
 - Source files are stored on the Windows filesystem.
 - Use the Dev Container for Linux builds and tests.
