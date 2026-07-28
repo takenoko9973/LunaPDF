@@ -163,7 +163,7 @@ pub(crate) fn selected_text(glyphs: &[GlyphSnapshot], start: PagePoint, end: Pag
     text
 }
 
-/// Returns display and annotation Quads for the same inclusive glyph range as copy text.
+/// Returns merged display and annotation Quads for the same inclusive glyph range as copy text.
 pub(crate) fn selected_quads(
     glyphs: &[GlyphSnapshot],
     start: PagePoint,
@@ -172,7 +172,7 @@ pub(crate) fn selected_quads(
     let Some(selected_glyphs) = selected_glyphs(glyphs, start, end) else {
         return Vec::new();
     };
-    selected_glyphs.iter().map(|glyph| glyph.quad).collect()
+    merge_line_bands(selected_glyphs)
 }
 
 /// Returns the geometry used only to paint the selected glyph range.
@@ -181,20 +181,84 @@ pub(crate) fn selected_display_quads(
     start: PagePoint,
     end: PagePoint,
 ) -> Vec<PageQuad> {
-    let Some(selected_glyphs) = selected_glyphs(glyphs, start, end) else {
+    selected_quads(glyphs, start, end)
+}
+
+fn merge_line_bands(glyphs: &[GlyphSnapshot]) -> Vec<PageQuad> {
+    if glyphs.is_empty() {
         return Vec::new();
-    };
+    }
+
     let mut bands = Vec::new();
-    let mut line_start = 0;
-    for index in 1..=selected_glyphs.len() {
-        let line_ended = index == selected_glyphs.len()
-            || selected_glyphs[index].line_index != selected_glyphs[line_start].line_index;
-        if line_ended {
-            bands.push(merge_line_band(&selected_glyphs[line_start..index]));
-            line_start = index;
+    let mut run_start = 0;
+    let mut run_direction = None;
+    for index in 1..=glyphs.len() {
+        let direction =
+            (index < glyphs.len()).then(|| glyph_direction(&glyphs[index - 1], &glyphs[index]));
+        // A run ends before the current glyph when a line, continuity gap,
+        // or writing direction changes; this keeps one annotation from
+        // spanning unrelated columns or differently oriented text.
+        let run_ended = index == glyphs.len()
+            || glyphs[index].line_index != glyphs[run_start].line_index
+            || !glyphs_are_continuous(&glyphs[index - 1], &glyphs[index])
+            || run_direction.is_some_and(|previous| direction != Some(previous));
+        if run_ended {
+            bands.push(merge_line_band(&glyphs[run_start..index]));
+            run_start = index;
+            run_direction = None;
+        } else if let Some(direction) = direction {
+            run_direction = Some(direction);
         }
     }
     bands
+}
+
+fn glyph_direction(previous: &GlyphSnapshot, next: &GlyphSnapshot) -> (bool, bool) {
+    let previous_center = glyph_center(previous);
+    let next_center = glyph_center(next);
+    let delta_x = next_center.x - previous_center.x;
+    let delta_y = next_center.y - previous_center.y;
+    let advances_horizontally = delta_x.abs() >= delta_y.abs();
+    let forward = if advances_horizontally {
+        delta_x >= 0.0
+    } else {
+        delta_y >= 0.0
+    };
+    (advances_horizontally, forward)
+}
+
+fn glyphs_are_continuous(previous: &GlyphSnapshot, next: &GlyphSnapshot) -> bool {
+    let previous_center = glyph_center(previous);
+    let next_center = glyph_center(next);
+    let delta_x = next_center.x - previous_center.x;
+    let delta_y = next_center.y - previous_center.y;
+    let (advances_horizontally, _) = glyph_direction(previous, next);
+    let (gap, previous_extent, next_extent) = if advances_horizontally {
+        let (previous_x0, _, previous_x1, _) = previous.quad.bounds();
+        let (next_x0, _, next_x1, _) = next.quad.bounds();
+        let gap = if delta_x >= 0.0 {
+            next_x0 - previous_x1
+        } else {
+            previous_x0 - next_x1
+        };
+        (gap, previous_x1 - previous_x0, next_x1 - next_x0)
+    } else {
+        let (_, previous_y0, _, previous_y1) = previous.quad.bounds();
+        let (_, next_y0, _, next_y1) = next.quad.bounds();
+        let gap = if delta_y >= 0.0 {
+            next_y0 - previous_y1
+        } else {
+            previous_y0 - next_y1
+        };
+        (gap, previous_y1 - previous_y0, next_y1 - next_y0)
+    };
+
+    // A run may include normal inter-glyph spacing (including a word space),
+    // but a gap larger than either adjacent glyph's own extent indicates a
+    // column or unrelated region.  This scales with page/text size instead
+    // of imposing a fixed PDF-point threshold.
+    let continuity_bound = previous_extent.max(next_extent);
+    gap <= continuity_bound
 }
 
 fn merge_line_band(glyphs: &[GlyphSnapshot]) -> PageQuad {
@@ -397,10 +461,9 @@ mod tests {
         let forward = selected_quads(&glyphs, start, end);
         let reverse = selected_quads(&glyphs, end, start);
 
-        assert_eq!(
-            forward,
-            glyphs.iter().map(|glyph| glyph.quad).collect::<Vec<_>>()
-        );
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0].upper_left, glyphs[0].quad.upper_left);
+        assert_eq!(forward[0].lower_right, glyphs[2].quad.lower_right);
         assert_eq!(reverse, forward);
     }
 
@@ -444,8 +507,20 @@ mod tests {
         assert_eq!(bands[0].lower_right, glyphs[2].quad.lower_right);
         assert_eq!(
             selected_quads(&glyphs, PagePoint::new(1.0, 5.0), PagePoint::new(27.0, 5.0),).len(),
-            3
+            1
         );
+    }
+
+    #[test]
+    fn selection_quads_split_a_large_same_line_gap() {
+        let glyphs = vec![glyph('A', 0.0, 0), glyph('B', 40.0, 0), glyph('C', 50.0, 0)];
+
+        let quads = selected_quads(&glyphs, PagePoint::new(1.0, 5.0), PagePoint::new(57.0, 5.0));
+
+        assert_eq!(quads.len(), 2);
+        assert_eq!(quads[0], glyphs[0].quad);
+        assert_eq!(quads[1].upper_left, glyphs[1].quad.upper_left);
+        assert_eq!(quads[1].lower_right, glyphs[2].quad.lower_right);
     }
 
     #[test]
@@ -520,5 +595,51 @@ mod tests {
         assert_eq!(band.upper_right, top.quad.upper_right);
         assert_eq!(band.lower_left, bottom.quad.lower_left);
         assert_eq!(band.lower_right, bottom.quad.lower_right);
+    }
+
+    #[test]
+    fn vertical_selection_quads_merge_adjacent_glyphs() {
+        let glyphs = vec![
+            GlyphSnapshot {
+                character: '縦',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(10.0, 20.0),
+                    upper_right: PagePoint::new(20.0, 20.0),
+                    lower_left: PagePoint::new(10.0, 30.0),
+                    lower_right: PagePoint::new(20.0, 30.0),
+                },
+                line_index: 0,
+            },
+            GlyphSnapshot {
+                character: '書',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(10.0, 32.0),
+                    upper_right: PagePoint::new(20.0, 32.0),
+                    lower_left: PagePoint::new(10.0, 42.0),
+                    lower_right: PagePoint::new(20.0, 42.0),
+                },
+                line_index: 0,
+            },
+        ];
+
+        let quads = selected_quads(
+            &glyphs,
+            PagePoint::new(15.0, 21.0),
+            PagePoint::new(15.0, 41.0),
+        );
+
+        assert_eq!(quads, vec![merge_line_band(&glyphs)]);
+    }
+
+    #[test]
+    fn saved_and_preview_selection_geometry_are_identical() {
+        let glyphs = vec![glyph('A', 0.0, 0), glyph('B', 10.0, 0)];
+        let start = PagePoint::new(1.0, 5.0);
+        let end = PagePoint::new(17.0, 5.0);
+
+        assert_eq!(
+            selected_quads(&glyphs, start, end),
+            selected_display_quads(&glyphs, start, end)
+        );
     }
 }

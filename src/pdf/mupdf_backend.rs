@@ -3131,7 +3131,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_selection_quads_match_the_preview_glyph_range() {
+    fn confirmed_selection_quads_match_preview_geometry() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("selection-range.pdf");
         let path_text = path.to_str().unwrap();
@@ -3159,16 +3159,9 @@ mod tests {
         let last = snapshot.glyphs.last().unwrap().quad.bounds();
         let start = PagePoint::new((first.0 + first.2) / 2.0, (first.1 + first.3) / 2.0);
         let end = PagePoint::new((last.0 + last.2) / 2.0, (last.1 + last.3) / 2.0);
-        let expected_quads = snapshot
-            .glyphs
-            .iter()
-            .map(|glyph| glyph.quad)
-            .collect::<Vec<_>>();
-
         let selection = backend.select(0, 1, start, end).unwrap();
 
         assert_eq!(selection.text, "ABCDE");
-        assert_eq!(selection.quads, expected_quads);
         assert_eq!(selection.display_quads.len(), 1);
         assert_eq!(
             selection.display_quads[0].upper_left,
@@ -3178,6 +3171,7 @@ mod tests {
             selection.display_quads[0].lower_right,
             snapshot.glyphs[4].quad.lower_right
         );
+        assert_eq!(selection.quads, selection.display_quads);
     }
 
     #[test]
