@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
 
-use eframe::egui::{self, Id, Sense, Ui};
+use eframe::egui::{self, CursorIcon, Id, Sense, Ui, Vec2};
 
 use crate::domain::annotation::AnnotationSummary;
 use crate::domain::document::OutlineItem;
 use crate::ui::annotation_editor::color_swatch;
 
 const COMMENT_HEAD_CHARACTERS: usize = 48;
+// 18pt swatch plus 5pt vertical breathing room keeps the row readable and clickable.
+const HIGHLIGHT_ROW_HEIGHT: f32 = 28.0;
+// Four points preserve a visible hover gutter without shrinking the gesture row.
+const HIGHLIGHT_ROW_HORIZONTAL_PADDING: f32 = 4.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SidebarTab {
@@ -90,14 +94,30 @@ pub(crate) fn show_highlights(
         for (page_index, highlights) in pages {
             for summary in highlights {
                 ui.push_id((summary.id.page_index, summary.id.xref), |ui| {
-                    let row = ui
-                        .horizontal(|ui| {
-                            color_swatch(ui, summary.color, 18.0);
-                            ui.label(format!("{}ページ", page_index + 1));
-                            ui.label(comment_head(&summary.contents));
-                        })
-                        .response
-                        .interact(Sense::click());
+                    let (row_rect, row_response) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), HIGHLIGHT_ROW_HEIGHT),
+                        Sense::click(),
+                    );
+                    let row = row_response.on_hover_cursor(CursorIcon::PointingHand);
+                    if row.hovered() {
+                        ui.painter().rect_filled(
+                            row_rect,
+                            2.0,
+                            ui.visuals().widgets.hovered.bg_fill,
+                        );
+                    }
+                    ui.scope_builder(
+                        egui::UiBuilder::new().max_rect(
+                            row_rect.shrink2(Vec2::new(HIGHLIGHT_ROW_HORIZONTAL_PADDING, 0.0)),
+                        ),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                color_swatch(ui, summary.color, 18.0);
+                                ui.label(format!("{}ページ", page_index + 1));
+                                ui.label(comment_head(&summary.contents));
+                            });
+                        },
+                    );
                     let row = if summary.contents.trim().is_empty() {
                         row
                     } else {

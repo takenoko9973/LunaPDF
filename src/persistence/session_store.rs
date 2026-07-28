@@ -149,6 +149,7 @@ mod tests {
                     zoom: 1.75,
                 },
             }],
+            recent_annotation_colors: Vec::new(),
         }
     }
 

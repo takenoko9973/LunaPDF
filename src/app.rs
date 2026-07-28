@@ -151,6 +151,7 @@ pub(crate) struct PrototypeApp {
     thumbnail_lru: WeightedLruCache<ThumbnailCacheKey, ()>,
     annotation_editor: Option<AnnotationEditorState>,
     annotation_picker: Option<AnnotationPickerState>,
+    recent_annotation_colors: Vec<[u8; 3]>,
 }
 
 struct DocumentTab {
@@ -661,6 +662,12 @@ impl PrototypeApp {
         let restore_enabled = saved_session
             .as_ref()
             .is_none_or(|session| session.restore_enabled);
+        // Color preferences restore independently of tabs so explicit command-line
+        // PDFs do not discard the user's editor history.
+        let recent_annotation_colors = saved_session
+            .as_ref()
+            .map(|session| session.recent_annotation_colors.clone())
+            .unwrap_or_default();
         let mut app = Self {
             tabs: TabState::new(),
             documents: Vec::new(),
@@ -686,6 +693,7 @@ impl PrototypeApp {
             thumbnail_lru: WeightedLruCache::new(THUMBNAIL_BUDGET_BYTES),
             annotation_editor: None,
             annotation_picker: None,
+            recent_annotation_colors,
         };
         if paths.is_empty() && restore_enabled {
             if let Some(session) = saved_session {
@@ -2141,6 +2149,7 @@ impl PrototypeApp {
                 SidebarTab::Thumbnails => SessionSidebarTab::Thumbnails,
                 SidebarTab::Highlights => SessionSidebarTab::Highlights,
             },
+            recent_annotation_colors: self.recent_annotation_colors.clone(),
             ..SessionState::default()
         };
         session.tabs = self
@@ -3698,7 +3707,8 @@ impl PrototypeApp {
                     .to_owned(),
             );
         }
-        let action = show_annotation_editor(context, bounds, editor);
+        let action =
+            show_annotation_editor(context, bounds, editor, &mut self.recent_annotation_colors);
         match action {
             Some(AnnotationEditorAction::Close | AnnotationEditorAction::Discard) => {
                 self.annotation_editor = None;
@@ -8039,6 +8049,30 @@ mod tests {
         assert_eq!(app.documents.len(), 1);
         assert_eq!(app.tabs.tabs()[0].path(), explicit);
         assert!(app.session_restore_progress.is_none());
+    }
+
+    #[test]
+    fn explicit_cli_pdf_restores_and_captures_recent_annotation_colors() {
+        let directory = tempfile::tempdir().unwrap();
+        let explicit = directory.path().join("explicit.pdf");
+        write_blank_pdf(&explicit);
+        let explicit = std::fs::canonicalize(explicit).unwrap();
+        let state = SessionState {
+            recent_annotation_colors: vec![[12, 34, 56], [90, 80, 70]],
+            ..SessionState::default()
+        };
+        let session_path = directory.path().join("session.json");
+        SessionStore::new(session_path.clone())
+            .save(&state)
+            .unwrap();
+
+        let app = PrototypeApp::from_startup(vec![explicit], SessionStore::new(session_path));
+
+        assert_eq!(app.recent_annotation_colors, state.recent_annotation_colors);
+        assert_eq!(
+            app.current_session().recent_annotation_colors,
+            state.recent_annotation_colors
+        );
     }
 
     #[test]

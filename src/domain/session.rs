@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 const SCHEMA_VERSION: u32 = 1;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 4.0;
+// Five entries fit the compact editor history while bounding schema-1 storage.
+pub(crate) const MAX_RECENT_ANNOTATION_COLORS: usize = 5;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +19,9 @@ pub(crate) struct SessionState {
     pub(crate) sidebar_open: bool,
     pub(crate) sidebar_tab: SidebarTab,
     pub(crate) tabs: Vec<SessionTab>,
+    #[serde(default)]
+    // Additive default keeps existing schema-1 session JSON readable.
+    pub(crate) recent_annotation_colors: Vec<[u8; 3]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -66,6 +71,7 @@ impl Default for SessionState {
             sidebar_open: false,
             sidebar_tab: SidebarTab::Outline,
             tabs: Vec::new(),
+            recent_annotation_colors: Vec::new(),
         }
     }
 }
@@ -109,6 +115,19 @@ impl SessionState {
                     tab.path.display()
                 );
             }
+        }
+        // Keep the preference bounded and deterministic so malformed session files
+        // cannot grow memory or present the same color repeatedly.
+        if self.recent_annotation_colors.len() > MAX_RECENT_ANNOTATION_COLORS {
+            bail!("session contains more than {MAX_RECENT_ANNOTATION_COLORS} recent colors");
+        }
+        let mut colors = HashSet::with_capacity(self.recent_annotation_colors.len());
+        if self
+            .recent_annotation_colors
+            .iter()
+            .any(|color| !colors.insert(*color))
+        {
+            bail!("session contains duplicate recent colors");
         }
         Ok(())
     }
@@ -236,5 +255,37 @@ mod tests {
 
         assert_eq!(restored.sidebar_tab, SidebarTab::Highlights);
         assert_eq!(restored.schema_version, 1);
+    }
+
+    #[test]
+    fn old_schema_one_json_defaults_recent_colors_to_empty() {
+        let json = r#"{
+            "schema_version": 1,
+            "restore_enabled": true,
+            "selected_tab": null,
+            "sidebar_open": false,
+            "sidebar_tab": "Outline",
+            "tabs": []
+        }"#;
+
+        let restored: SessionState = serde_json::from_str(json).unwrap();
+
+        assert!(restored.recent_annotation_colors.is_empty());
+        assert!(restored.validate().is_ok());
+    }
+
+    #[test]
+    fn recent_color_validation_rejects_duplicates_and_overflow() {
+        let duplicate = SessionState {
+            recent_annotation_colors: vec![[1, 2, 3], [1, 2, 3]],
+            ..SessionState::default()
+        };
+        assert!(duplicate.validate().is_err());
+
+        let overflow = SessionState {
+            recent_annotation_colors: (0..6).map(|value| [value, 0, 0]).collect(),
+            ..SessionState::default()
+        };
+        assert!(overflow.validate().is_err());
     }
 }

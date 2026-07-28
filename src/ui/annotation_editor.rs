@@ -1,12 +1,14 @@
+use eframe::egui::containers::scroll_area::ScrollBarVisibility;
 use eframe::egui::{
-    self, Button, Color32, Id, Order, Popup, Pos2, Rect, Response, ScrollArea, Sense,
-    SetOpenCommand, Stroke, StrokeKind, Vec2,
+    self, Button, Color32, CursorIcon, Id, Order, Popup, PopupCloseBehavior, Pos2, Rect, Response,
+    ScrollArea, Sense, SetOpenCommand, Stroke, StrokeKind, Vec2,
 };
 
 use crate::domain::annotation::{
     AnnotationId, AnnotationSnapshot, AnnotationSummary, AnnotationUpdateRequest,
     PdfAnnotationColor,
 };
+use crate::domain::session::MAX_RECENT_ANNOTATION_COLORS;
 
 // The panel is deliberately bounded in logical points. It remains usable on
 // narrow windows by shrinking inside the view and scrolling its own contents.
@@ -18,15 +20,35 @@ const OVERLAY_MARGIN: f32 = 12.0;
 // without allowing a long external Contents value to dominate the menu width.
 const ANNOTATION_LABEL_COMMENT_CHARS: usize = 24;
 const COLOR_SWATCH_SIZE: f32 = 18.0;
+// The larger target keeps compact swatches easy to click while the inner 18pt
+// color area stays consistent with annotation lists.
+const COLOR_CHOICE_SIZE: f32 = 28.0;
+// A 12pt check remains legible inside an 18pt swatch. Painting a 3pt dark
+// outline below a 1.5pt light stroke keeps it visible on every preset color.
+const COLOR_CHECK_SIZE: f32 = 12.0;
+const COLOR_CHECK_OUTLINE_WIDTH: f32 = 3.0;
+const COLOR_CHECK_FOREGROUND_WIDTH: f32 = 1.5;
+// These logical dimensions follow the instructed 28–32pt target and 14–16pt icon.
+const EDITOR_CLOSE_BUTTON_SIZE: f32 = 30.0;
+const EDITOR_CLOSE_ICON_SIZE: f32 = 15.0;
+const EDITOR_CLOSE_ICON_STROKE: f32 = 1.5;
+// Header reserves the 30-point close target plus separator spacing, leaving the
+// body enough room to avoid a bar for ordinary 320x480 editor content.
+const EDITOR_HEADER_RESERVED_HEIGHT: f32 = 42.0;
 
 // These explicit RGB values form the editable UI palette; they are never used
 // as inferred replacements when an existing PDF color cannot be read.
-const COLOR_PRESETS: [(&str, [u8; 3]); 5] = [
+const COLOR_PRESETS: [(&str, [u8; 3]); 10] = [
     ("黄色", [255, 255, 0]),
     ("緑色", [76, 175, 80]),
+    ("シアン", [0, 188, 212]),
     ("青色", [66, 133, 244]),
-    ("赤色", [239, 83, 80]),
     ("紫色", [171, 71, 188]),
+    ("ピンク", [233, 30, 99]),
+    ("赤色", [239, 83, 80]),
+    ("オレンジ", [255, 152, 0]),
+    ("グレー", [128, 128, 128]),
+    ("白色", [255, 255, 255]),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +100,7 @@ pub(crate) struct AnnotationEditorState {
     pub(crate) mutation_in_flight: bool,
     pub(crate) placement: AnnotationOverlayPlacement,
     pub(crate) notice: Option<String>,
+    pub(crate) custom_color_draft: Option<[u8; 3]>,
 }
 
 impl AnnotationEditorState {
@@ -114,6 +137,7 @@ impl AnnotationEditorState {
             mutation_in_flight: false,
             placement: AnnotationOverlayPlacement::RightEdge,
             notice: None,
+            custom_color_draft: None,
         }
     }
 
@@ -323,6 +347,7 @@ pub(crate) fn show_annotation_editor(
     context: &egui::Context,
     bounds: Rect,
     state: &mut AnnotationEditorState,
+    recent_annotation_colors: &mut Vec<[u8; 3]>,
 ) -> Option<AnnotationEditorAction> {
     let rect = match state.placement {
         AnnotationOverlayPlacement::RightEdge => annotation_overlay_rect(bounds),
@@ -333,33 +358,67 @@ pub(crate) fn show_annotation_editor(
         .fixed_pos(rect.min)
         .show(context, |ui| {
             ui.set_width(rect.width());
+            ui.set_max_height(rect.height());
+            let frame_margin_height = ui.style().spacing.window_margin.sum().y;
             egui::Frame::window(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("注釈の編集");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (close_rect, close_response) = ui.allocate_exact_size(
+                            Vec2::splat(EDITOR_CLOSE_BUTTON_SIZE),
+                            Sense::click(),
+                        );
+                        let close_response = close_response
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("閉じる");
+                        if close_response.hovered() {
+                            ui.painter().rect_filled(
+                                close_rect,
+                                2.0,
+                                ui.visuals().widgets.hovered.bg_fill,
+                            );
+                        }
+                        let stroke = Stroke::new(
+                            EDITOR_CLOSE_ICON_STROKE,
+                            ui.visuals().widgets.inactive.fg_stroke.color,
+                        );
+                        let center = close_rect.center();
+                        let offset = EDITOR_CLOSE_ICON_SIZE / 2.0;
+                        ui.painter().line_segment(
+                            [center + Vec2::splat(-offset), center + Vec2::splat(offset)],
+                            stroke,
+                        );
+                        ui.painter().line_segment(
+                            [
+                                center + Vec2::new(-offset, offset),
+                                center + Vec2::new(offset, -offset),
+                            ],
+                            stroke,
+                        );
+                        if close_response.clicked() {
+                            if state.mutation_in_flight {
+                                state.notice = Some("注釈処理の完了を待っています。".to_owned());
+                            } else if state.is_dirty() {
+                                state.notice = Some(
+                                    "未保存の変更があります。保存または変更を破棄してください。"
+                                        .to_owned(),
+                                );
+                            } else {
+                                action = Some(AnnotationEditorAction::Close);
+                            }
+                        }
+                    });
+                });
+                ui.separator();
                 ScrollArea::vertical()
                     .id_salt(("annotation-editor-scroll", state.document_id))
-                    .max_height(rect.height())
+                    .scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
+                    // Only the body scrolls; the title and close target stay visible.
+                    .max_height(
+                        (rect.height() - frame_margin_height - EDITOR_HEADER_RESERVED_HEIGHT)
+                            .max(1.0),
+                    )
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.heading("注釈の編集");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("×").on_hover_text("閉じる").clicked() {
-                                        if state.mutation_in_flight {
-                                            state.notice =
-                                                Some("注釈処理の完了を待っています。".to_owned());
-                                        } else if state.is_dirty() {
-                                            state.notice = Some(
-                                                "未保存の変更があります。保存または変更を破棄してください。"
-                                                    .to_owned(),
-                                            );
-                                        } else {
-                                            action = Some(AnnotationEditorAction::Close);
-                                        }
-                                    }
-                                },
-                            );
-                        });
-                        ui.separator();
                         ui.label("コメント／メモ");
                         ui.add_enabled(
                             state.can_edit_contents && !state.stale && !state.mutation_in_flight,
@@ -373,7 +432,7 @@ pub(crate) fn show_annotation_editor(
                         );
                         ui.add_space(8.0);
                         ui.label("色");
-                        color_menu(ui, state);
+                        color_menu(ui, state, recent_annotation_colors);
                         if let Some(notice) = &state.notice {
                             ui.colored_label(Color32::LIGHT_RED, notice);
                         }
@@ -386,10 +445,7 @@ pub(crate) fn show_annotation_editor(
                                 action = Some(AnnotationEditorAction::Save);
                             }
                             if ui
-                                .add_enabled(
-                                    !state.mutation_in_flight,
-                                    Button::new("変更を破棄"),
-                                )
+                                .add_enabled(!state.mutation_in_flight, Button::new("変更を破棄"))
                                 .clicked()
                             {
                                 action = Some(AnnotationEditorAction::Discard);
@@ -420,51 +476,180 @@ pub(crate) fn annotation_comment_id(document_id: u64, annotation_id: AnnotationI
     ))
 }
 
-fn color_menu(ui: &mut egui::Ui, state: &mut AnnotationEditorState) {
-    let label = color_label(state.buffer.color);
-    ui.add_enabled_ui(
-        state.can_edit_color && !state.stale && !state.mutation_in_flight,
-        |ui| {
-            ui.horizontal(|ui| {
-                color_swatch(ui, state.buffer.color, COLOR_SWATCH_SIZE);
-                ui.menu_button(label, |ui| {
-                    for (name, rgb) in COLOR_PRESETS {
-                        let color = rgb_color(rgb);
-                        let selected = state.buffer.color == Some(color);
-                        let row_label = if selected {
-                            format!("✓ {name}")
-                        } else {
-                            name.to_owned()
-                        };
-                        let clicked = ui
-                            .horizontal(|ui| {
-                                color_swatch(ui, Some(color), COLOR_SWATCH_SIZE);
-                                ui.selectable_label(selected, row_label)
-                            })
-                            .inner
-                            .clicked();
-                        if clicked {
-                            state.buffer.color = Some(rgb_color(rgb));
-                            ui.close();
-                        }
+fn color_menu(
+    ui: &mut egui::Ui,
+    state: &mut AnnotationEditorState,
+    recent_annotation_colors: &mut Vec<[u8; 3]>,
+) {
+    let enabled = state.can_edit_color && !state.stale && !state.mutation_in_flight;
+    // A draft cannot be applied after permissions or revision state changes,
+    // so discard it instead of allowing a stale mutation through the picker.
+    if !enabled {
+        state.custom_color_draft = None;
+    }
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            let trigger = color_trigger(ui, state.buffer.color);
+            ui.label(color_label(state.buffer.color));
+            Popup::menu(&trigger)
+                .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    ui.label("プリセット");
+                    for row in 0..2 {
+                        ui.horizontal(|ui| {
+                            for col in 0..5 {
+                                let (name, rgb) = COLOR_PRESETS[row * 5 + col];
+                                show_color_choice(ui, name, rgb, state, recent_annotation_colors);
+                            }
+                        });
+                    }
+                    if !recent_annotation_colors.is_empty() {
+                        ui.separator();
+                        ui.label("最近使った色");
+                        ui.horizontal_wrapped(|ui| {
+                            for rgb in recent_annotation_colors.clone() {
+                                show_color_choice(ui, "", rgb, state, recent_annotation_colors);
+                            }
+                        });
+                    }
+                    ui.separator();
+                    if ui.button("その他の色…").clicked() {
+                        // Drafting starts from the display value but does not rewrite an
+                        // unreadable/CMYK source until the user confirms Apply.
+                        state.custom_color_draft = Some(
+                            color_preview(state.buffer.color)
+                                .map(|color| [color.r(), color.g(), color.b()])
+                                .unwrap_or(COLOR_PRESETS[0].1),
+                        );
+                        ui.close();
+                    }
+                });
+        });
+    });
+
+    let mut open = true;
+    if let Some(mut draft) = state.custom_color_draft {
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("その他の色")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label("RGB色");
+                ui.color_edit_button_srgb(&mut draft);
+                ui.horizontal(|ui| {
+                    if ui.button("適用").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
                     }
                 });
             });
-            ui.horizontal(|ui| {
-                ui.label("任意の色を選択…");
-                let mut rgb = color_preview(state.buffer.color)
-                    .map(|color| [color.r(), color.g(), color.b()])
-                    .unwrap_or(COLOR_PRESETS[0].1);
-                // The picker stays in the persistent editor Area. Nesting its
-                // popup inside the preset menu closes the parent menu on the
-                // activation click, so later drag events never reach the picker.
-                // The fallback seeds only the control and is stored after change.
-                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                    state.buffer.color = Some(rgb_color(rgb));
-                }
-            });
-        },
-    );
+        if apply {
+            apply_custom_color(state, recent_annotation_colors, draft);
+            state.custom_color_draft = None;
+        } else if cancel || !open {
+            cancel_custom_color(state);
+        } else {
+            state.custom_color_draft = Some(draft);
+        }
+    }
+}
+
+fn show_color_choice(
+    ui: &mut egui::Ui,
+    name: &str,
+    rgb: [u8; 3],
+    state: &mut AnnotationEditorState,
+    recent_annotation_colors: &mut Vec<[u8; 3]>,
+) {
+    let color = rgb_color(rgb);
+    let selected = state.buffer.color == Some(color);
+    let label = if name.is_empty() {
+        format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+    } else {
+        name.to_owned()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(COLOR_CHOICE_SIZE), Sense::click());
+    let response = response.on_hover_text(format!(
+        "{label} #{:02X}{:02X}{:02X}",
+        rgb[0], rgb[1], rgb[2]
+    ));
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 2.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    let swatch_rect = Rect::from_center_size(rect.center(), Vec2::splat(COLOR_SWATCH_SIZE));
+    paint_color_swatch(ui, swatch_rect, Some(color));
+    if selected {
+        paint_color_check(ui, rect.center());
+    }
+    if response.clicked() {
+        select_color(state, recent_annotation_colors, rgb);
+        ui.close();
+    }
+}
+
+fn color_trigger(ui: &mut egui::Ui, color: Option<PdfAnnotationColor>) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(COLOR_CHOICE_SIZE), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 2.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    let swatch_rect = Rect::from_center_size(rect.center(), Vec2::splat(COLOR_SWATCH_SIZE));
+    paint_color_swatch(ui, swatch_rect, color);
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn paint_color_check(ui: &egui::Ui, center: Pos2) {
+    let half = COLOR_CHECK_SIZE / 2.0;
+    let start = center + Vec2::new(-half, 0.0);
+    let middle = center + Vec2::new(-half / 3.0, half / 2.0);
+    let end = center + Vec2::new(half, -half / 2.0);
+    for stroke in [
+        Stroke::new(COLOR_CHECK_OUTLINE_WIDTH, Color32::BLACK),
+        Stroke::new(COLOR_CHECK_FOREGROUND_WIDTH, Color32::WHITE),
+    ] {
+        ui.painter().line_segment([start, middle], stroke);
+        ui.painter().line_segment([middle, end], stroke);
+    }
+}
+
+fn paint_color_swatch(ui: &egui::Ui, rect: Rect, color: Option<PdfAnnotationColor>) {
+    let border = Stroke::new(1.0, ui.visuals().widgets.noninteractive.fg_stroke.color);
+    let fill = color_preview(color).unwrap_or(ui.visuals().extreme_bg_color);
+    ui.painter()
+        .rect(rect, 2.0, fill, border, StrokeKind::Inside);
+    if color.is_none() {
+        // The diagonal distinguishes an unreadable color from a valid gray value.
+        ui.painter()
+            .line_segment([rect.left_bottom(), rect.right_top()], border);
+    }
+}
+
+fn select_color(
+    state: &mut AnnotationEditorState,
+    recent_annotation_colors: &mut Vec<[u8; 3]>,
+    rgb: [u8; 3],
+) {
+    state.buffer.color = Some(rgb_color(rgb));
+    recent_annotation_colors.retain(|entry| *entry != rgb);
+    recent_annotation_colors.insert(0, rgb);
+    recent_annotation_colors.truncate(MAX_RECENT_ANNOTATION_COLORS);
+}
+
+fn apply_custom_color(
+    state: &mut AnnotationEditorState,
+    recent_annotation_colors: &mut Vec<[u8; 3]>,
+    rgb: [u8; 3],
+) {
+    select_color(state, recent_annotation_colors, rgb);
+}
+
+fn cancel_custom_color(state: &mut AnnotationEditorState) {
+    state.custom_color_draft = None;
 }
 
 fn annotation_candidate_label(annotation: &AnnotationSnapshot) -> String {
@@ -493,15 +678,15 @@ fn color_label(color: Option<PdfAnnotationColor>) -> String {
     };
     if let Some((name, _)) = COLOR_PRESETS
         .iter()
-        .find(|(_, rgb)| Some(rgb_color(*rgb)) == Some(color))
+        .find(|(_, rgb)| rgb_color(*rgb) == color)
     {
         return (*name).to_owned();
     }
     match color {
-        PdfAnnotationColor::Gray(gray) => format!("Gray {:.0}%", gray * 100.0),
+        PdfAnnotationColor::Gray(value) => format!("Gray {:.0}%", value * 100.0),
         PdfAnnotationColor::Rgb { red, green, blue } => {
-            let preview = normalized_rgb_to_color32(red, green, blue);
-            format!("#{:02X}{:02X}{:02X}", preview.r(), preview.g(), preview.b())
+            let rgb = normalized_rgb_to_color32(red, green, blue);
+            format!("#{:02X}{:02X}{:02X}", rgb.r(), rgb.g(), rgb.b())
         }
         PdfAnnotationColor::Cmyk {
             cyan,
@@ -529,16 +714,7 @@ pub(crate) fn color_swatch(
         return response;
     }
 
-    let border = Stroke::new(1.0, ui.visuals().widgets.noninteractive.fg_stroke.color);
-    let fill = color_preview(color).unwrap_or(ui.visuals().extreme_bg_color);
-    ui.painter()
-        .rect(rect, 2.0, fill, border, StrokeKind::Inside);
-    if color.is_none() {
-        // A diagonal mark distinguishes an unreadable PDF color from a valid
-        // gray swatch without inventing a replacement color.
-        ui.painter()
-            .line_segment([rect.left_bottom(), rect.right_top()], border);
-    }
+    paint_color_swatch(ui, rect, color);
     response
 }
 
@@ -720,5 +896,44 @@ mod tests {
         let comments = annotation_hover_comments(&[&first, &empty, &third]);
 
         assert_eq!(comments, vec!["最初\n続き", "三番目"]);
+    }
+
+    #[test]
+    fn color_palette_contains_ten_labeled_presets() {
+        assert_eq!(COLOR_PRESETS.len(), 10);
+        assert!(COLOR_PRESETS.iter().all(|(label, _)| !label.is_empty()));
+    }
+
+    #[test]
+    fn recent_colors_dedupe_and_keep_newest_five() {
+        let annotation = annotation("", None);
+        let mut editor = AnnotationEditorState::from_snapshot(7, 3, &annotation);
+        let mut recent = Vec::new();
+        for value in 0..6 {
+            select_color(&mut editor, &mut recent, [value, 1, 2]);
+        }
+        select_color(&mut editor, &mut recent, [2, 1, 2]);
+
+        assert_eq!(
+            recent,
+            vec![[2, 1, 2], [5, 1, 2], [4, 1, 2], [3, 1, 2], [1, 1, 2]]
+        );
+    }
+
+    #[test]
+    fn custom_color_apply_updates_buffer_and_cancel_leaves_it_unchanged() {
+        let annotation = annotation("", None);
+        let mut editor = AnnotationEditorState::from_snapshot(7, 3, &annotation);
+        let mut recent = Vec::new();
+        let original = editor.buffer.clone();
+
+        editor.custom_color_draft = Some([10, 20, 30]);
+        cancel_custom_color(&mut editor);
+        assert_eq!(editor.buffer, original);
+        assert!(recent.is_empty());
+
+        apply_custom_color(&mut editor, &mut recent, [10, 20, 30]);
+        assert_eq!(editor.buffer.color, Some(rgb_color([10, 20, 30])));
+        assert_eq!(recent, vec![[10, 20, 30]]);
     }
 }
