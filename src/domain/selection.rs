@@ -192,25 +192,71 @@ fn merge_line_bands(glyphs: &[GlyphSnapshot]) -> Vec<PageQuad> {
     let mut bands = Vec::new();
     let mut run_start = 0;
     let mut run_direction = None;
-    for index in 1..=glyphs.len() {
-        let direction =
-            (index < glyphs.len()).then(|| glyph_direction(&glyphs[index - 1], &glyphs[index]));
+    let mut index = 1;
+    while index <= glyphs.len() {
+        if index == glyphs.len() {
+            bands.push(merge_line_band(&glyphs[run_start..index]));
+            break;
+        }
+        let direction = Some(glyph_direction(&glyphs[index - 1], &glyphs[index]));
         // A run ends before the current glyph when a line, continuity gap,
         // or writing direction changes; this keeps one annotation from
         // spanning unrelated columns or differently oriented text.
-        let run_ended = index == glyphs.len()
-            || glyphs[index].line_index != glyphs[run_start].line_index
-            || !glyphs_are_continuous(&glyphs[index - 1], &glyphs[index])
+        let continuity_break = !glyphs_are_continuous(glyphs, index - 1, index);
+        let run_ended = glyphs[index].line_index != glyphs[run_start].line_index
+            || continuity_break
             || run_direction.is_some_and(|previous| direction != Some(previous));
         if run_ended {
+            if let Some((space_start, space_end)) = wide_whitespace_bridge(glyphs, index - 1, index)
+            {
+                if space_end <= run_start {
+                    // The wide whitespace was already removed from this run;
+                    // skip its trailing pair without creating an empty band.
+                    index += 1;
+                    continue;
+                }
+                if run_start < space_start {
+                    bands.push(merge_line_band(&glyphs[run_start..space_start]));
+                }
+                run_start = space_end;
+                run_direction = None;
+                index = space_end;
+                continue;
+            }
             bands.push(merge_line_band(&glyphs[run_start..index]));
             run_start = index;
             run_direction = None;
         } else if let Some(direction) = direction {
             run_direction = Some(direction);
         }
+        index += 1;
     }
     bands
+}
+
+/// Returns a whitespace range that must be omitted when its non-space anchors
+/// are farther apart than either neighboring glyph can account for.
+fn wide_whitespace_bridge(
+    glyphs: &[GlyphSnapshot],
+    previous_index: usize,
+    next_index: usize,
+) -> Option<(usize, usize)> {
+    if !glyphs[previous_index].character.is_whitespace()
+        && !glyphs[next_index].character.is_whitespace()
+    {
+        return None;
+    }
+    let left_index = (0..=previous_index)
+        .rev()
+        .find(|&index| !glyphs[index].character.is_whitespace())?;
+    let right_index =
+        (next_index..glyphs.len()).find(|&index| !glyphs[index].character.is_whitespace())?;
+    if glyphs[left_index].line_index != glyphs[right_index].line_index
+        || glyphs_are_continuous_without_spaces(glyphs, left_index, right_index)
+    {
+        return None;
+    }
+    Some((left_index + 1, right_index))
 }
 
 fn glyph_direction(previous: &GlyphSnapshot, next: &GlyphSnapshot) -> (bool, bool) {
@@ -227,7 +273,42 @@ fn glyph_direction(previous: &GlyphSnapshot, next: &GlyphSnapshot) -> (bool, boo
     (advances_horizontally, forward)
 }
 
-fn glyphs_are_continuous(previous: &GlyphSnapshot, next: &GlyphSnapshot) -> bool {
+fn glyphs_are_continuous(
+    glyphs: &[GlyphSnapshot],
+    previous_index: usize,
+    next_index: usize,
+) -> bool {
+    let previous = &glyphs[previous_index];
+    let next = &glyphs[next_index];
+    if previous.character.is_whitespace() || next.character.is_whitespace() {
+        let Some(left_index) = (0..=previous_index)
+            .rev()
+            .find(|&index| !glyphs[index].character.is_whitespace())
+        else {
+            return true;
+        };
+        let Some(right_index) =
+            (next_index..glyphs.len()).find(|&index| !glyphs[index].character.is_whitespace())
+        else {
+            return true;
+        };
+        if left_index != previous_index || right_index != next_index {
+            // A wide space glyph can have zero inter-glyph gap on both sides.
+            // Compare the surrounding non-space edges so a column-sized blank
+            // does not silently become one continuous highlight band.
+            return glyphs_are_continuous_without_spaces(glyphs, left_index, right_index);
+        }
+    }
+    glyphs_are_continuous_without_spaces(glyphs, previous_index, next_index)
+}
+
+fn glyphs_are_continuous_without_spaces(
+    glyphs: &[GlyphSnapshot],
+    previous_index: usize,
+    next_index: usize,
+) -> bool {
+    let previous = &glyphs[previous_index];
+    let next = &glyphs[next_index];
     let previous_center = glyph_center(previous);
     let next_center = glyph_center(next);
     let delta_x = next_center.x - previous_center.x;
@@ -262,59 +343,49 @@ fn glyphs_are_continuous(previous: &GlyphSnapshot, next: &GlyphSnapshot) -> bool
 }
 
 fn merge_line_band(glyphs: &[GlyphSnapshot]) -> PageQuad {
-    let first = &glyphs[0];
-    if glyphs.len() == 1 {
-        return first.quad;
-    }
-
-    let center = |glyph: &GlyphSnapshot| {
-        let (x0, y0, x1, y1) = glyph.quad.bounds();
-        PagePoint::new((x0 + x1) / 2.0, (y0 + y1) / 2.0)
-    };
-    let horizontal_span = glyphs.iter().map(|glyph| center(glyph).x).fold(
-        (f32::INFINITY, f32::NEG_INFINITY),
-        |(minimum, maximum), x| (minimum.min(x), maximum.max(x)),
-    );
-    let vertical_span = glyphs.iter().map(|glyph| center(glyph).y).fold(
-        (f32::INFINITY, f32::NEG_INFINITY),
-        |(minimum, maximum), y| (minimum.min(y), maximum.max(y)),
-    );
-    let advances_horizontally =
-        horizontal_span.1 - horizontal_span.0 >= vertical_span.1 - vertical_span.0;
-
-    if advances_horizontally {
-        let left = glyphs
-            .iter()
-            .min_by(|left, right| center(left).x.total_cmp(&center(right).x))
-            .expect("a line band always has at least one glyph");
-        let right = glyphs
-            .iter()
-            .max_by(|left, right| center(left).x.total_cmp(&center(right).x))
-            .expect("a line band always has at least one glyph");
-        // Reusing the outer glyph edges keeps tilted and rotated text geometry;
-        // an axis-aligned bounds union would overpaint Typst text lines.
-        PageQuad {
-            upper_left: left.quad.upper_left,
-            upper_right: right.quad.upper_right,
-            lower_left: left.quad.lower_left,
-            lower_right: right.quad.lower_right,
-        }
-    } else {
-        let top = glyphs
-            .iter()
-            .min_by(|top, bottom| center(top).y.total_cmp(&center(bottom).y))
-            .expect("a line band always has at least one glyph");
-        let bottom = glyphs
-            .iter()
-            .max_by(|top, bottom| center(top).y.total_cmp(&center(bottom).y))
-            .expect("a line band always has at least one glyph");
-        PageQuad {
-            upper_left: top.quad.upper_left,
-            upper_right: top.quad.upper_right,
-            lower_left: bottom.quad.lower_left,
-            lower_right: bottom.quad.lower_right,
+    let mut band = glyphs[0].quad;
+    for glyph in &glyphs[1..] {
+        let quad = glyph.quad;
+        let forward_gap = edge_distance_squared(
+            band.upper_right,
+            band.lower_right,
+            quad.upper_left,
+            quad.lower_left,
+        );
+        let reverse_gap = edge_distance_squared(
+            band.upper_left,
+            band.lower_left,
+            quad.upper_right,
+            quad.lower_right,
+        );
+        // MuPDF always stores text-progression edges as [ul,ll] and [ur,lr],
+        // including rotated and bidi text. Extending the nearer edge follows
+        // that contract without reinterpreting the corner names in page axes.
+        if forward_gap <= reverse_gap {
+            band.upper_right = quad.upper_right;
+            band.lower_right = quad.lower_right;
+        } else {
+            band.upper_left = quad.upper_left;
+            band.lower_left = quad.lower_left;
         }
     }
+    band
+}
+
+fn edge_distance_squared(
+    first_upper: PagePoint,
+    first_lower: PagePoint,
+    second_upper: PagePoint,
+    second_lower: PagePoint,
+) -> f32 {
+    point_distance_squared(first_upper, second_upper)
+        + point_distance_squared(first_lower, second_lower)
+}
+
+fn point_distance_squared(first: PagePoint, second: PagePoint) -> f32 {
+    let delta_x = first.x - second.x;
+    let delta_y = first.y - second.y;
+    delta_x * delta_x + delta_y * delta_y
 }
 
 /// Borrows the canonical inclusive glyph range without allocating during drag preview.
@@ -571,20 +642,20 @@ mod tests {
         let top = GlyphSnapshot {
             character: '縦',
             quad: PageQuad {
-                upper_left: PagePoint::new(10.0, 20.0),
-                upper_right: PagePoint::new(20.0, 20.0),
-                lower_left: PagePoint::new(10.0, 30.0),
-                lower_right: PagePoint::new(20.0, 30.0),
+                upper_left: PagePoint::new(20.0, 20.0),
+                upper_right: PagePoint::new(20.0, 30.0),
+                lower_left: PagePoint::new(10.0, 20.0),
+                lower_right: PagePoint::new(10.0, 30.0),
             },
             line_index: 0,
         };
         let bottom = GlyphSnapshot {
             character: '書',
             quad: PageQuad {
-                upper_left: PagePoint::new(10.0, 32.0),
-                upper_right: PagePoint::new(20.0, 32.0),
-                lower_left: PagePoint::new(10.0, 42.0),
-                lower_right: PagePoint::new(20.0, 42.0),
+                upper_left: PagePoint::new(20.0, 32.0),
+                upper_right: PagePoint::new(20.0, 42.0),
+                lower_left: PagePoint::new(10.0, 32.0),
+                lower_right: PagePoint::new(10.0, 42.0),
             },
             line_index: 0,
         };
@@ -592,8 +663,8 @@ mod tests {
         let band = merge_line_band(&[top.clone(), bottom.clone()]);
 
         assert_eq!(band.upper_left, top.quad.upper_left);
-        assert_eq!(band.upper_right, top.quad.upper_right);
-        assert_eq!(band.lower_left, bottom.quad.lower_left);
+        assert_eq!(band.lower_left, top.quad.lower_left);
+        assert_eq!(band.upper_right, bottom.quad.upper_right);
         assert_eq!(band.lower_right, bottom.quad.lower_right);
     }
 
@@ -603,20 +674,20 @@ mod tests {
             GlyphSnapshot {
                 character: '縦',
                 quad: PageQuad {
-                    upper_left: PagePoint::new(10.0, 20.0),
-                    upper_right: PagePoint::new(20.0, 20.0),
-                    lower_left: PagePoint::new(10.0, 30.0),
-                    lower_right: PagePoint::new(20.0, 30.0),
+                    upper_left: PagePoint::new(20.0, 20.0),
+                    upper_right: PagePoint::new(20.0, 30.0),
+                    lower_left: PagePoint::new(10.0, 20.0),
+                    lower_right: PagePoint::new(10.0, 30.0),
                 },
                 line_index: 0,
             },
             GlyphSnapshot {
                 character: '書',
                 quad: PageQuad {
-                    upper_left: PagePoint::new(10.0, 32.0),
-                    upper_right: PagePoint::new(20.0, 32.0),
-                    lower_left: PagePoint::new(10.0, 42.0),
-                    lower_right: PagePoint::new(20.0, 42.0),
+                    upper_left: PagePoint::new(20.0, 32.0),
+                    upper_right: PagePoint::new(20.0, 42.0),
+                    lower_left: PagePoint::new(10.0, 32.0),
+                    lower_right: PagePoint::new(10.0, 42.0),
                 },
                 line_index: 0,
             },
@@ -629,6 +700,140 @@ mod tests {
         );
 
         assert_eq!(quads, vec![merge_line_band(&glyphs)]);
+    }
+
+    #[test]
+    fn reversed_quad_corner_orientation_does_not_collapse_horizontal_band() {
+        let glyphs = vec![
+            GlyphSnapshot {
+                character: 'B',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(28.0, 0.0),
+                    upper_right: PagePoint::new(20.0, 0.0),
+                    lower_left: PagePoint::new(28.0, 10.0),
+                    lower_right: PagePoint::new(20.0, 10.0),
+                },
+                line_index: 0,
+            },
+            GlyphSnapshot {
+                character: 'A',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(18.0, 0.0),
+                    upper_right: PagePoint::new(10.0, 0.0),
+                    lower_left: PagePoint::new(18.0, 10.0),
+                    lower_right: PagePoint::new(10.0, 10.0),
+                },
+                line_index: 0,
+            },
+        ];
+
+        let band = merge_line_band(&glyphs);
+
+        assert_eq!(band.bounds(), (10.0, 0.0, 28.0, 10.0));
+        assert!(band.contains(PagePoint::new(19.0, 5.0)));
+    }
+
+    #[test]
+    fn reversed_quad_corner_orientation_does_not_collapse_vertical_band() {
+        let glyphs = vec![
+            GlyphSnapshot {
+                character: '書',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(20.0, 42.0),
+                    upper_right: PagePoint::new(20.0, 32.0),
+                    lower_left: PagePoint::new(10.0, 42.0),
+                    lower_right: PagePoint::new(10.0, 32.0),
+                },
+                line_index: 0,
+            },
+            GlyphSnapshot {
+                character: '縦',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(20.0, 30.0),
+                    upper_right: PagePoint::new(20.0, 20.0),
+                    lower_left: PagePoint::new(10.0, 30.0),
+                    lower_right: PagePoint::new(10.0, 20.0),
+                },
+                line_index: 0,
+            },
+        ];
+
+        let band = merge_line_band(&glyphs);
+
+        assert_eq!(band.bounds(), (10.0, 20.0, 20.0, 42.0));
+        assert!(band.contains(PagePoint::new(15.0, 31.0)));
+    }
+
+    #[test]
+    fn wide_space_does_not_bridge_non_space_glyphs() {
+        let glyphs = vec![
+            glyph('A', 0.0, 0),
+            GlyphSnapshot {
+                character: ' ',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(8.0, 0.0),
+                    upper_right: PagePoint::new(108.0, 0.0),
+                    lower_left: PagePoint::new(8.0, 10.0),
+                    lower_right: PagePoint::new(108.0, 10.0),
+                },
+                line_index: 0,
+            },
+            glyph('B', 108.0, 0),
+        ];
+
+        let bands = merge_line_bands(&glyphs);
+
+        assert_eq!(bands.len(), 2);
+        assert_eq!(bands[0].bounds(), (0.0, 0.0, 8.0, 10.0));
+        assert_eq!(bands[1].bounds(), (108.0, 0.0, 116.0, 10.0));
+    }
+
+    #[test]
+    fn normal_word_space_stays_in_one_band() {
+        let glyphs = vec![
+            glyph('A', 0.0, 0),
+            GlyphSnapshot {
+                character: ' ',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(8.0, 0.0),
+                    upper_right: PagePoint::new(14.0, 0.0),
+                    lower_left: PagePoint::new(8.0, 10.0),
+                    lower_right: PagePoint::new(14.0, 10.0),
+                },
+                line_index: 0,
+            },
+            glyph('B', 16.0, 0),
+        ];
+
+        assert_eq!(merge_line_bands(&glyphs).len(), 1);
+    }
+
+    #[test]
+    fn whitespace_only_selection_remains_a_valid_band() {
+        let glyphs = vec![
+            GlyphSnapshot {
+                character: ' ',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(0.0, 0.0),
+                    upper_right: PagePoint::new(8.0, 0.0),
+                    lower_left: PagePoint::new(0.0, 10.0),
+                    lower_right: PagePoint::new(8.0, 10.0),
+                },
+                line_index: 0,
+            },
+            GlyphSnapshot {
+                character: '\u{3000}',
+                quad: PageQuad {
+                    upper_left: PagePoint::new(8.0, 0.0),
+                    upper_right: PagePoint::new(16.0, 0.0),
+                    lower_left: PagePoint::new(8.0, 10.0),
+                    lower_right: PagePoint::new(16.0, 10.0),
+                },
+                line_index: 0,
+            },
+        ];
+
+        assert_eq!(merge_line_bands(&glyphs).len(), 1);
     }
 
     #[test]
