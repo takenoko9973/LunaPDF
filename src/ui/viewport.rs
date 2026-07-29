@@ -102,16 +102,16 @@ impl PagePressKind {
 /// Returns the cursor for one PDF frame without mutating the interaction state.
 pub(crate) fn pdf_cursor_icon(
     target: Option<PageCursorTarget>,
-    autoscroll_active: bool,
+    _autoscroll_active: bool,
     blank_pan_active: bool,
 ) -> CursorIcon {
-    if autoscroll_active {
+    if blank_pan_active {
+        // An established pan keeps the four-direction arrow while crossing
+        // text, using egui's standard cursor instead of custom artwork.
         CursorIcon::AllScroll
-    } else if blank_pan_active {
-        // The closed hand describes an established pan, not the idle ability
-        // to start one. It therefore remains visible while that drag crosses text.
-        CursorIcon::Grabbing
     } else {
+        // Middle-button autoscroll intentionally does not override the target
+        // cursor, so pressing the wheel causes no cursor-only visual change.
         match target {
             Some(PageCursorTarget::Text) => CursorIcon::Text,
             Some(PageCursorTarget::Link) => CursorIcon::PointingHand,
@@ -1170,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_transitions_cover_blank_pan_and_autoscroll() {
+    fn cursor_transitions_cover_all_scroll_pan_and_unchanged_autoscroll() {
         for target in [PageCursorTarget::Blank, PageCursorTarget::Background] {
             assert_eq!(
                 pdf_cursor_icon(Some(target), false, false),
@@ -1178,15 +1178,11 @@ mod tests {
             );
             assert_eq!(
                 pdf_cursor_icon(Some(target), false, true),
-                CursorIcon::Grabbing
+                CursorIcon::AllScroll
             );
             assert_eq!(
                 pdf_cursor_icon(Some(target), true, false),
-                CursorIcon::AllScroll
-            );
-            assert_ne!(
-                pdf_cursor_icon(Some(target), false, false),
-                CursorIcon::AllScroll
+                CursorIcon::Default
             );
         }
         assert_eq!(
@@ -1195,11 +1191,15 @@ mod tests {
         );
         assert_eq!(
             pdf_cursor_icon(Some(PageCursorTarget::Text), false, true),
-            CursorIcon::Grabbing
+            CursorIcon::AllScroll
         );
         assert_eq!(
             pdf_cursor_icon(Some(PageCursorTarget::Text), true, false),
-            CursorIcon::AllScroll
+            CursorIcon::Text
+        );
+        assert_eq!(
+            pdf_cursor_icon(Some(PageCursorTarget::Link), true, false),
+            CursorIcon::PointingHand
         );
         assert_eq!(pdf_cursor_icon(None, false, false), CursorIcon::Default);
     }
@@ -1269,7 +1269,7 @@ mod tests {
         );
         assert_eq!(
             pdf_cursor_icon(Some(PageCursorTarget::Blank), false, pan.active),
-            CursorIcon::Grabbing
+            CursorIcon::AllScroll
         );
         assert_eq!(
             update_blank_pan(&mut pan, Pos2::new(106.0, 115.0), 6.0),
@@ -1375,7 +1375,7 @@ mod tests {
         assert_eq!(drag.pan_delta, Some(Vec2::new(-20.0, -30.0)));
         assert_eq!(
             pdf_cursor_icon(drag.cursor_target, false, viewport.blank_pan_in_progress()),
-            CursorIcon::Grabbing
+            CursorIcon::AllScroll
         );
     }
 
