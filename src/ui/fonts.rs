@@ -1,248 +1,235 @@
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use std::fs;
-use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "windows")]
+use dwrote::{FontCollection, FontStretch, FontStyle, FontWeight};
 use eframe::egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
-use eframe::egui::{self, FontData, FontFamily, FontTweak};
+use eframe::egui::{self, FontData, FontFamily};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use font_kit::family_name::FamilyName;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use font_kit::handle::Handle;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use font_kit::properties::Properties;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use font_kit::source::SystemSource;
 
-const CJK_FONT_NAME: &str = "lunapdf-cjk-fallback";
-const CJK_MONOSPACE_FONT_NAME: &str = "lunapdf-cjk-fallback-monospace";
+const UI_FONT_NAME: &str = "lunapdf-ui-font";
 
-// Meiryo's tight glyph mesh stayed near the galley center across tested DPIs without a tweak.
-// Its line metrics also make the menu and toolbar slightly shorter, which the user accepted.
 #[cfg(target_os = "windows")]
-const YU_GOTHIC_UI_Y_OFFSET: f32 = 1.5;
-
-#[cfg(target_os = "windows")]
-const CJK_FONT_FILES: &[(&str, f32)] = &[
-    ("meiryo.ttc", 0.0),
-    ("meiryob.ttc", 0.0),
-    ("YuGothR.ttc", YU_GOTHIC_UI_Y_OFFSET),
-    ("YuGothM.ttc", YU_GOTHIC_UI_Y_OFFSET),
-];
-
+const UI_FONT_FAMILY: &str = "Yu Gothic UI";
 #[cfg(target_os = "linux")]
-const CJK_FONT_PATHS: &[&str] = &[
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJKJP-Regular.otf",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
-    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
-];
-
+const UI_FONT_FAMILY: &str = "Noto Sans CJK JP";
 #[cfg(target_os = "macos")]
-const CJK_FONT_PATHS: &[&str] = &[
-    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-    "/System/Library/Fonts/Hiragino Sans GB.ttc",
-];
+const UI_FONT_FAMILY: &str = "Hiragino Sans";
+
+struct LoadedUiFont {
+    data: Vec<u8>,
+    face_index: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_exact_ui_font(
+    family: &str,
+    properties: Properties,
+    requested_properties: Properties,
+) -> bool {
+    // Platform matchers may substitute a nearby family or face. Accepting either would make
+    // the configured family name advisory instead of the exact cross-platform contract.
+    family == UI_FONT_FAMILY && properties == requested_properties
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn load_family_font() -> Option<LoadedUiFont> {
+    let properties = Properties::new();
+    let source = SystemSource::new();
+    let family_name = FamilyName::Title(UI_FONT_FAMILY.to_owned());
+    let handle = match source.select_best_match(&[family_name], &properties) {
+        Ok(handle) => handle,
+        Err(error) => {
+            debug_font_warning(&format!(
+                "UI font family lookup failed ({UI_FONT_FAMILY}): {error}"
+            ));
+            return None;
+        }
+    };
+
+    let font = match handle.load() {
+        Ok(font) => font,
+        Err(error) => {
+            debug_font_warning(&format!(
+                "UI font could not be loaded ({UI_FONT_FAMILY}): {error}"
+            ));
+            return None;
+        }
+    };
+    if !is_exact_ui_font(&font.family_name(), font.properties(), properties) {
+        debug_font_warning(&format!(
+            "UI font did not provide an exact regular face: {UI_FONT_FAMILY}"
+        ));
+        return None;
+    }
+
+    // Convert both font-kit handle variants to the owned bytes egui requires while preserving
+    // the collection face index selected by the platform source.
+    let (data, face_index) = match handle {
+        Handle::Path { path, font_index } => {
+            let data = match fs::read(&path) {
+                Ok(data) if !data.is_empty() => data,
+                Ok(_) => {
+                    debug_font_warning(&format!("UI font file is empty: {}", path.display()));
+                    return None;
+                }
+                Err(error) => {
+                    debug_font_warning(&format!(
+                        "UI font could not be read ({}): {error}",
+                        path.display()
+                    ));
+                    return None;
+                }
+            };
+            (data, font_index)
+        }
+        Handle::Memory { bytes, font_index } => {
+            if bytes.is_empty() {
+                debug_font_warning("UI font memory data is empty");
+                return None;
+            }
+            (bytes.as_ref().clone(), font_index)
+        }
+    };
+
+    debug_font_family_selection(UI_FONT_FAMILY, face_index);
+    Some(LoadedUiFont { data, face_index })
+}
+
+#[cfg(target_os = "windows")]
+fn load_family_font() -> Option<LoadedUiFont> {
+    let font_collection = FontCollection::system();
+    let family = match font_collection.font_family_by_name(UI_FONT_FAMILY) {
+        Ok(Some(family)) => family,
+        Ok(None) => {
+            debug_font_warning(&format!("UI font family was not found: {UI_FONT_FAMILY}"));
+            return None;
+        }
+        Err(error) => {
+            debug_font_warning(&format!(
+                "UI font family lookup failed ({UI_FONT_FAMILY}): HRESULT {error:#010x}"
+            ));
+            return None;
+        }
+    };
+    let font = match family.first_matching_font(
+        FontWeight::Regular,
+        FontStretch::Normal,
+        FontStyle::Normal,
+    ) {
+        Ok(font) => font,
+        Err(error) => {
+            debug_font_warning(&format!(
+                "UI font regular face lookup failed ({UI_FONT_FAMILY}): HRESULT {error:#010x}"
+            ));
+            return None;
+        }
+    };
+    // DirectWrite may return a nearest match; silently registering it would change UI weight.
+    if font.weight() != FontWeight::Regular
+        || font.stretch() != FontStretch::Normal
+        || font.style() != FontStyle::Normal
+    {
+        debug_font_warning(&format!(
+            "UI font did not provide an exact regular face: {UI_FONT_FAMILY}"
+        ));
+        return None;
+    }
+
+    let font_face = font.create_font_face();
+    let font_files = match font_face.files() {
+        Ok(font_files) => font_files,
+        Err(error) => {
+            debug_font_warning(&format!(
+                "UI font regular face files could not be queried ({UI_FONT_FAMILY}): HRESULT {error:#010x}"
+            ));
+            return None;
+        }
+    };
+    // egui accepts one font blob and face index, so a face backed by multiple files is unusable.
+    let [font_file] = font_files.as_slice() else {
+        debug_font_warning(&format!(
+            "UI font regular face did not use exactly one file: {UI_FONT_FAMILY}"
+        ));
+        return None;
+    };
+    let path = match font_file.font_file_path() {
+        Ok(path) => path,
+        Err(error) => {
+            debug_font_warning(&format!(
+                "UI font regular face path could not be queried ({UI_FONT_FAMILY}): HRESULT {error:#010x}"
+            ));
+            return None;
+        }
+    };
+    let data = match fs::read(&path) {
+        Ok(data) if !data.is_empty() => data,
+        Ok(_) => {
+            debug_font_warning(&format!("UI font file is empty: {}", path.display()));
+            return None;
+        }
+        Err(error) => {
+            debug_font_warning(&format!(
+                "UI font could not be read ({}): {error}",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    let face_index = font_face.get_index();
+    debug_font_family_selection(UI_FONT_FAMILY, face_index);
+    Some(LoadedUiFont { data, face_index })
+}
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-const CJK_FONT_PATHS: &[&str] = &[];
-
-#[derive(Clone, Debug, PartialEq)]
-struct CjkFontCandidate {
-    path: PathBuf,
-    y_offset: f32,
-}
-
-#[derive(Debug, PartialEq)]
-struct LoadedCjkFont {
-    candidate: CjkFontCandidate,
-    data: Vec<u8>,
-}
-
-/// Adds one Windows font directory using the platform's case-insensitive path semantics.
-#[cfg(target_os = "windows")]
-fn push_unique_windows_font_directory(font_directories: &mut Vec<PathBuf>, directory: PathBuf) {
-    let already_present = font_directories.iter().any(|existing| {
-        existing
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&directory.to_string_lossy())
-    });
-    if !already_present {
-        font_directories.push(directory);
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn cjk_font_candidates() -> Vec<CjkFontCandidate> {
-    let mut font_directories = Vec::new();
-    if let Some(windows_directory) = std::env::var_os("WINDIR").map(PathBuf::from)
-        && windows_directory.is_absolute()
-    {
-        push_unique_windows_font_directory(&mut font_directories, windows_directory.join("Fonts"));
-    }
-
-    // Windows is normally installed here, but WINDIR remains authoritative on
-    // hosts that use another drive or directory.
-    let default_directory = PathBuf::from(r"C:\Windows\Fonts");
-    push_unique_windows_font_directory(&mut font_directories, default_directory);
-    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-        && local_app_data.is_absolute()
-    {
-        push_unique_windows_font_directory(
-            &mut font_directories,
-            local_app_data
-                .join("Microsoft")
-                .join("Windows")
-                .join("Fonts"),
-        );
-    }
-
-    font_directories
-        .into_iter()
-        .flat_map(|directory| {
-            CJK_FONT_FILES
-                .iter()
-                .map(move |(file_name, y_offset)| CjkFontCandidate {
-                    path: directory.join(file_name),
-                    y_offset: *y_offset,
-                })
-        })
-        .collect()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn cjk_font_candidates() -> Vec<CjkFontCandidate> {
-    // Unverified platforms retain their existing glyph position.
-    CJK_FONT_PATHS
-        .iter()
-        .map(|path| CjkFontCandidate {
-            path: PathBuf::from(path),
-            y_offset: 0.0,
-        })
-        .collect()
-}
-
-/// Reads the first usable candidate without making a missing system font fatal.
-///
-/// Candidates are tried in order. Missing paths are skipped silently, while
-/// empty or unreadable files emit debug diagnostics and do not stop selection.
-fn load_first_readable_cjk_font(candidates: &[CjkFontCandidate]) -> Option<LoadedCjkFont> {
-    for candidate in candidates {
-        if !candidate.path.exists() {
-            continue;
-        }
-
-        let data = match fs::read(&candidate.path) {
-            Ok(data) if !data.is_empty() => data,
-            Ok(_) => {
-                debug_font_warning(&format!(
-                    "CJK font file is empty: {}",
-                    candidate.path.display()
-                ));
-                continue;
-            }
-            Err(error) => {
-                debug_font_warning(&format!(
-                    "CJK font could not be read ({}): {error}",
-                    candidate.path.display()
-                ));
-                continue;
-            }
-        };
-        return Some(LoadedCjkFont {
-            candidate: candidate.clone(),
-            data,
-        });
-    }
+fn load_family_font() -> Option<LoadedUiFont> {
     None
 }
 
-fn cjk_font_insert(
-    name: &str,
-    data: Vec<u8>,
-    family: FontFamily,
-    priority: FontPriority,
-    y_offset: f32,
-) -> FontInsert {
+fn font_insert(data: Vec<u8>, face_index: u32) -> FontInsert {
+    let mut font_data = FontData::from_owned(data);
+    font_data.index = face_index;
     FontInsert::new(
-        name,
-        FontData::from_owned(data).tweak(FontTweak {
-            y_offset,
-            ..Default::default()
-        }),
-        vec![InsertFontFamily { family, priority }],
+        UI_FONT_NAME,
+        font_data,
+        vec![
+            InsertFontFamily {
+                family: FontFamily::Proportional,
+                priority: FontPriority::Highest,
+            },
+            InsertFontFamily {
+                family: FontFamily::Monospace,
+                priority: FontPriority::Lowest,
+            },
+        ],
     )
 }
 
-/// Builds the smallest registration set for the candidate's correction.
+/// Installs the exact regular system UI font for proportional and monospace text.
 ///
-/// With no correction, one `FontData` can serve both families. A non-zero correction must be
-/// split because `FontTweak` applies to all families associated with one `FontData`; cloning the
-/// bytes is limited to that case so the zero-offset path does not duplicate a large font file.
-fn cjk_font_inserts(data: Vec<u8>, y_offset: f32) -> Vec<FontInsert> {
-    if y_offset == 0.0 {
-        let data = FontData::from_owned(data).tweak(FontTweak {
-            y_offset: 0.0,
-            ..Default::default()
-        });
-        return vec![FontInsert::new(
-            CJK_FONT_NAME,
-            data,
-            vec![
-                InsertFontFamily {
-                    family: FontFamily::Proportional,
-                    priority: FontPriority::Highest,
-                },
-                InsertFontFamily {
-                    family: FontFamily::Monospace,
-                    priority: FontPriority::Lowest,
-                },
-            ],
-        )];
-    }
-
-    vec![
-        cjk_font_insert(
-            CJK_FONT_NAME,
-            data.clone(),
-            FontFamily::Proportional,
-            FontPriority::Highest,
-            y_offset,
-        ),
-        cjk_font_insert(
-            CJK_MONOSPACE_FONT_NAME,
-            data,
-            FontFamily::Monospace,
-            FontPriority::Lowest,
-            0.0,
-        ),
-    ]
-}
-
-/// Installs the first readable system CJK font for the proportional UI family.
-///
-/// The selected CJK font is preferred for proportional text so Japanese and ASCII in one
-/// label share the same metrics. A zero-offset candidate uses one FontInsert for both families;
-/// a corrected candidate uses distinct names so its proportional and monospace tweaks differ.
-/// A missing or unreadable system font is deliberately non-fatal: PDF viewing must still
-/// start when the host has no Japanese font installed.
-pub(crate) fn install_cjk_fallback(ctx: &egui::Context) {
-    let candidates = cjk_font_candidates();
-    let Some(loaded) = load_first_readable_cjk_font(&candidates) else {
-        // Keep the warning out of the normal UI: this is diagnostic information for
-        // developers, while release builds must continue with egui's built-in fonts.
-        debug_font_warning("no readable CJK system font was found");
+/// Family resolution is platform-specific and never falls back to another family or face.
+pub(crate) fn install_ui_font(ctx: &egui::Context) {
+    let Some(loaded) = load_family_font() else {
+        debug_font_warning("no exact system UI font was found");
         return;
     };
-    let selected_path = loaded.candidate.path.clone();
-    let y_offset = loaded.candidate.y_offset;
-    for insert in cjk_font_inserts(loaded.data, y_offset) {
-        ctx.add_font(insert);
-    }
-    debug_font_selection(&selected_path, y_offset);
+    ctx.add_font(font_insert(loaded.data, loaded.face_index));
 }
 
 #[cfg(debug_assertions)]
-fn debug_font_selection(path: &Path, y_offset: f32) {
-    eprintln!(
-        "[lunapdf] CJK UI font: {}; y-offset: {y_offset:.1} logical pt",
-        path.display()
-    );
+fn debug_font_family_selection(family: &str, face_index: u32) {
+    eprintln!("[lunapdf] UI font family: {family}; face-index: {face_index}");
 }
 
 #[cfg(not(debug_assertions))]
-fn debug_font_selection(_path: &Path, _y_offset: f32) {}
+fn debug_font_family_selection(_family: &str, _face_index: u32) {}
 
 #[cfg(debug_assertions)]
 fn debug_font_warning(message: &str) {
@@ -255,183 +242,28 @@ fn debug_font_warning(_message: &str) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
-    fn candidate_paths_are_unique_and_cover_expected_platform_fonts() {
-        let candidates = cjk_font_candidates();
-        let mut unique = candidates
-            .iter()
-            .map(|candidate| candidate.path.clone())
-            .collect::<Vec<_>>();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), candidates.len());
-
-        #[cfg(target_os = "windows")]
-        {
-            let file_names = candidates
-                .iter()
-                .filter_map(|candidate| candidate.path.file_name())
-                .map(|name| name.to_string_lossy().to_ascii_lowercase())
-                .collect::<Vec<_>>();
-            assert!(file_names.iter().any(|name| name.contains("yugoth")));
-            assert!(file_names.iter().any(|name| name.contains("meiryo")));
-        }
-        #[cfg(target_os = "linux")]
-        {
-            assert!(
-                candidates
-                    .iter()
-                    .any(|candidate| candidate.path.to_string_lossy().contains("NotoSansCJK"))
-            );
-            assert!(
-                candidates
-                    .iter()
-                    .any(|candidate| candidate.path.to_string_lossy().contains("ipa"))
-            );
-        }
-        #[cfg(target_os = "macos")]
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.path.to_string_lossy().contains("Hiragino"))
-        );
+    fn font_insert_sets_face_index_and_both_ui_families() {
+        let insert = font_insert(vec![1, 2, 3], 2);
+        assert_eq!(insert.name, UI_FONT_NAME);
+        assert_eq!(insert.data.index, 2);
+        assert_eq!(insert.families.len(), 2);
+        assert_eq!(insert.families[0].family, FontFamily::Proportional);
+        assert_eq!(insert.families[1].family, FontFamily::Monospace);
+        assert!(matches!(insert.families[0].priority, FontPriority::Highest));
+        assert!(matches!(insert.families[1].priority, FontPriority::Lowest));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn candidate_offsets_are_limited_to_verified_windows_fonts() {
-        let candidates = cjk_font_candidates();
+    fn exact_ui_font_match_rejects_another_family_or_face() {
+        let requested = Properties::new();
+        assert!(is_exact_ui_font(UI_FONT_FAMILY, requested, requested));
+        assert!(!is_exact_ui_font("another-family", requested, requested));
 
-        #[cfg(target_os = "windows")]
-        assert_eq!(YU_GOTHIC_UI_Y_OFFSET, 1.5);
-
-        #[cfg(target_os = "windows")]
-        for candidate in candidates {
-            let file_name = candidate
-                .path
-                .file_name()
-                .expect("Windows candidate has a file name")
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            if file_name.starts_with("yugoth") {
-                assert_eq!(candidate.y_offset, YU_GOTHIC_UI_Y_OFFSET);
-            } else {
-                assert!(file_name.starts_with("meiryo"));
-                assert_eq!(candidate.y_offset, 0.0);
-            }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        assert!(candidates.iter().all(|candidate| candidate.y_offset == 0.0));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_font_directories_deduplicate_case_only_path_variants() {
-        let mut directories = Vec::new();
-
-        push_unique_windows_font_directory(&mut directories, PathBuf::from(r"C:\WINDOWS\Fonts"));
-        push_unique_windows_font_directory(&mut directories, PathBuf::from(r"C:\Windows\Fonts"));
-        push_unique_windows_font_directory(
-            &mut directories,
-            PathBuf::from(r"C:\Users\example\AppData\Local\Microsoft\Windows\Fonts"),
-        );
-
-        assert_eq!(directories.len(), 2);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_prefers_the_measured_centered_meiryo_candidate() {
-        assert_eq!(CJK_FONT_FILES[0], ("meiryo.ttc", 0.0));
-    }
-
-    #[test]
-    fn selection_skips_missing_and_empty_candidates() {
-        let directory = tempdir().unwrap();
-        let missing_path = directory.path().join("missing.ttf");
-        let empty_path = directory.path().join("empty.ttf");
-        let readable_path = directory.path().join("readable.ttf");
-        fs::write(&empty_path, []).unwrap();
-        fs::write(&readable_path, [1, 2, 3]).unwrap();
-        let candidates = vec![
-            CjkFontCandidate {
-                path: missing_path,
-                y_offset: 0.0,
-            },
-            CjkFontCandidate {
-                path: empty_path,
-                y_offset: 0.5,
-            },
-            CjkFontCandidate {
-                path: readable_path.clone(),
-                y_offset: 1.0,
-            },
-        ];
-
-        let loaded = load_first_readable_cjk_font(&candidates).unwrap();
-
-        assert_eq!(loaded.candidate.path, readable_path);
-        assert_eq!(loaded.candidate.y_offset, 1.0);
-        assert_eq!(loaded.data, [1, 2, 3]);
-    }
-
-    #[test]
-    fn selection_is_non_fatal_when_no_candidate_is_readable() {
-        let directory = tempdir().unwrap();
-        let empty_path = directory.path().join("empty.ttf");
-        fs::write(&empty_path, []).unwrap();
-        let candidates = vec![
-            CjkFontCandidate {
-                path: directory.path().join("missing.ttf"),
-                y_offset: 0.0,
-            },
-            CjkFontCandidate {
-                path: empty_path,
-                y_offset: 1.0,
-            },
-        ];
-
-        assert!(load_first_readable_cjk_font(&candidates).is_none());
-    }
-
-    #[test]
-    fn font_inserts_reuse_zero_offset_data_and_split_corrected_data() {
-        let zero_offset = cjk_font_inserts(vec![1, 2, 3], 0.0);
-        assert_eq!(zero_offset.len(), 1);
-        assert_eq!(zero_offset[0].name, CJK_FONT_NAME);
-        assert_eq!(zero_offset[0].data.tweak.y_offset, 0.0);
-        assert_eq!(zero_offset[0].families.len(), 2);
-        assert_eq!(zero_offset[0].families[0].family, FontFamily::Proportional);
-        assert!(matches!(
-            zero_offset[0].families[0].priority,
-            FontPriority::Highest
-        ));
-        assert_eq!(zero_offset[0].families[1].family, FontFamily::Monospace);
-        assert!(matches!(
-            zero_offset[0].families[1].priority,
-            FontPriority::Lowest
-        ));
-
-        let corrected = cjk_font_inserts(vec![1, 2, 3], 1.0);
-        assert_eq!(corrected.len(), 2);
-        assert_eq!(corrected[0].name, CJK_FONT_NAME);
-        assert_eq!(corrected[1].name, CJK_MONOSPACE_FONT_NAME);
-        assert_ne!(corrected[0].name, corrected[1].name);
-        assert_eq!(corrected[0].data.tweak.y_offset, 1.0);
-        assert_eq!(corrected[1].data.tweak.y_offset, 0.0);
-        assert_eq!(corrected[0].families.len(), 1);
-        assert_eq!(corrected[1].families.len(), 1);
-        assert_eq!(corrected[0].families[0].family, FontFamily::Proportional);
-        assert_eq!(corrected[1].families[0].family, FontFamily::Monospace);
-        assert!(matches!(
-            corrected[0].families[0].priority,
-            FontPriority::Highest
-        ));
-        assert!(matches!(
-            corrected[1].families[0].priority,
-            FontPriority::Lowest
-        ));
+        let mut bold = requested;
+        bold.weight = font_kit::properties::Weight::BOLD;
+        assert!(!is_exact_ui_font(UI_FONT_FAMILY, bold, requested));
     }
 }

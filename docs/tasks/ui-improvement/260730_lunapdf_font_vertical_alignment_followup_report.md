@@ -1,5 +1,41 @@
 # LunaPDF UI文字縦位置・フォントメトリクス追補修正 作業報告
 
+## 0．システムフォントfamily方式への移行
+
+本報告の第1節以降は、ファイルパス候補と`FontTweak::y_offset`を比較した時点の
+検証記録として残す。現在のUIフォント登録は、その比較結果を直接使う方式ではなく、
+各OSのシステムフォントコレクションをfamily名で検索する方式へ移行した。
+
+| OS | family | 解決API |
+| --- | --- | --- |
+| Windows | `Yu Gothic UI` | DirectWrite |
+| Linux | `Noto Sans CJK JP` | Fontconfig（`font-kit`） |
+| macOS | `Hiragino Sans` | CoreText（`font-kit`） |
+
+各OSともRegular、Normal style、Normal stretchの完全一致だけを採用する。OSが返した
+フォントデータとcollection内のface indexを一つの`FontData`へ設定し、Proportionalの
+`Highest`とMonospaceの`Lowest`へ一つの`FontInsert`で登録する。別family、別weight、
+ファイルパス候補へのfallbackは行わない。
+
+旧方式の次の処理は削除した。
+
+- WindowsのMeiryo、Yu Gothicファイル名候補と`WINDIR`、`LOCALAPPDATA`探索。
+- LinuxとmacOSのフォントファイルパス候補。
+- `FontTweak::y_offset`と、補正値に応じて`FontData`を複製する処理。
+- `install_cjk_fallback`および内部登録名に残っていたfallback前提の命名。
+
+現行方式はY補正を行わない。Windows 10実機では`Yu Gothic UI`のface index 1が選択され、
+提供画像でメニュー、タブ、ツールバー、サイドバーに明白な欠けや上下ずれがないことを
+確認した。LinuxのDev Containerには対象familyがなく、macOS実機もないため、この2環境の
+実フォント選択と表示は未確認である。
+
+現行方式の直接依存は、Windows限定の`dwrote 0.11.5`と、Linux/macOS限定の
+`font-kit 0.14.3`である。Dev Containerでは、全テスト221件成功、既存ignored 2件、
+Clippy警告なし、Linux release check、Windows GNU debug/release buildに成功した。
+
+以下の第1節から第8節は、移行前のファイルパス候補方式を評価した履歴であり、現行の
+フォント選択仕様を示すものではない。
+
 ## 1．作業範囲
 
 作業開始時と終了時のGit状態は次のとおり。
@@ -221,7 +257,7 @@ Windows全テストも実行し、225成功、2失敗、既存ignored 2だった
 - 未保存マーカー付きタブと実際の長い日本語ファイル名タブの目視。
 - 入力済み検索文字列、検索結果が存在する場合の件数表示、クリック領域、カーソル挙動の手動確認。
 
-## 7．未確認範囲と残課題
+## 7．旧方式時点の未確認範囲と残課題
 
 - LinuxとmacOSの実機表示は未確認であり、補正していない。
 - Windowsの最終構成で選択されるのは`meiryo.ttc`。`YuGothR.ttc`は途中ビルドの実機目視まで、`YuGothM.ttc`と`meiryob.ttc`は実フォントのメトリクス計測までである。
@@ -229,7 +265,7 @@ Windows全テストも実行し、225成功、2失敗、既存ignored 2だった
 - メイリオ選択によりメニューバーの表示高が1px、ツールバーの表示高が2px小さくなる。ユーザーが許容した既知の変更であり、高さを戻す処理は追加していない。
 - 上記の非表示項目とDPI条件は追加の人間による画面確認が必要である。
 
-## 8．差分監査
+## 8．旧方式時点の差分監査
 
 - UI要素ごとの固定Y座標補正は追加していない。
 - タブ、ハイライト一覧、ツールバーラベルの既存中央配置は変更していない。

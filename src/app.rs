@@ -39,7 +39,7 @@ use crate::ui::annotation_editor::{
     show_annotation_editor,
 };
 use crate::ui::cursor::set_pdf_cursor;
-use crate::ui::fonts::install_cjk_fallback;
+use crate::ui::fonts::install_ui_font;
 use crate::ui::icons::{TOOLBAR_CONTROL_HEIGHT, ToolbarIcon, icon_button};
 use crate::ui::sidebar::{HighlightSidebarAction, SidebarTab, show_highlights, show_outline};
 use crate::ui::viewport::{
@@ -648,7 +648,7 @@ impl PrototypeApp {
         paths: Vec<PathBuf>,
         session_store: SessionStore,
     ) -> Self {
-        install_cjk_fallback(&creation_context.egui_ctx);
+        install_ui_font(&creation_context.egui_ctx);
         egui_extras::install_image_loaders(&creation_context.egui_ctx);
         Self::from_startup(paths, session_store)
     }
