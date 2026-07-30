@@ -1806,6 +1806,76 @@ mod tests {
         assert!(error.to_string().contains("got 1 components"));
     }
 
+    #[test]
+    fn annotation_colors_match_gray_and_cmyk_within_component_tolerance() {
+        let gray = PdfAnnotationColor::Gray(0.4);
+        let gray_nearby = PdfAnnotationColor::Gray(0.4 + PDF_PROPERTY_TOLERANCE * 0.5);
+        let gray_far = PdfAnnotationColor::Gray(0.4 + PDF_PROPERTY_TOLERANCE * 2.0);
+        assert!(annotation_colors_match(Some(gray), Some(gray_nearby)));
+        assert!(!annotation_colors_match(Some(gray), Some(gray_far)));
+        assert!(!annotation_colors_match(
+            Some(gray),
+            Some(PdfAnnotationColor::Rgb {
+                red: 0.4,
+                green: 0.4,
+                blue: 0.4,
+            })
+        ));
+
+        let cmyk = PdfAnnotationColor::Cmyk {
+            cyan: 0.1,
+            magenta: 0.2,
+            yellow: 0.3,
+            key: 0.4,
+        };
+        let cmyk_nearby = PdfAnnotationColor::Cmyk {
+            cyan: 0.1 + PDF_PROPERTY_TOLERANCE * 0.5,
+            magenta: 0.2 - PDF_PROPERTY_TOLERANCE * 0.5,
+            yellow: 0.3,
+            key: 0.4 + PDF_PROPERTY_TOLERANCE * 0.5,
+        };
+        let cmyk_far = PdfAnnotationColor::Cmyk {
+            cyan: 0.1 + PDF_PROPERTY_TOLERANCE * 2.0,
+            magenta: 0.2,
+            yellow: 0.3,
+            key: 0.4,
+        };
+        assert!(annotation_colors_match(Some(cmyk), Some(cmyk_nearby)));
+        assert!(!annotation_colors_match(Some(cmyk), Some(cmyk_far)));
+        assert!(!annotation_colors_match(Some(cmyk), Some(gray)));
+    }
+
+    #[test]
+    fn property_matches_accepts_nearby_values_and_rejects_distant_values() {
+        let expected = 0.5;
+        assert!(property_matches(
+            expected + PDF_PROPERTY_TOLERANCE * 0.5,
+            expected
+        ));
+        assert!(!property_matches(
+            expected + PDF_PROPERTY_TOLERANCE * 2.0,
+            expected
+        ));
+    }
+
+    #[test]
+    fn quad_matches_respects_coordinate_tolerance_for_each_corner() {
+        let expected = PageQuad {
+            upper_left: PagePoint::new(10.0, 20.0),
+            upper_right: PagePoint::new(30.0, 20.0),
+            lower_left: PagePoint::new(10.0, 40.0),
+            lower_right: PagePoint::new(30.0, 40.0),
+        };
+
+        let mut nearby = mupdf_quad_from_page(&expected);
+        nearby.ul.x += PDF_COORDINATE_TOLERANCE * 0.5;
+        assert!(quad_matches(&nearby, &expected));
+
+        let mut distant = mupdf_quad_from_page(&expected);
+        distant.ul.x += PDF_COORDINATE_TOLERANCE * 2.0;
+        assert!(!quad_matches(&distant, &expected));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_file_identity_is_stable_across_file_handles() {
