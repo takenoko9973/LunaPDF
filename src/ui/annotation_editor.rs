@@ -10,38 +10,38 @@ use crate::domain::annotation::{
 };
 use crate::domain::session::MAX_RECENT_ANNOTATION_COLORS;
 
-// The panel is deliberately bounded in logical points. It remains usable on
-// narrow windows by shrinking inside the view and scrolling its own contents.
+// パネルは意図的に論理ポイント内に収める。狭いウィンドウでもビュー内で縮小し、
+// 内容自体をスクロールすることで利用できる。
 const OVERLAY_PREFERRED_WIDTH: f32 = 320.0;
 const OVERLAY_PREFERRED_HEIGHT: f32 = 480.0;
 const OVERLAY_MARGIN: f32 = 12.0;
 
-// Candidate labels show enough of a comment to distinguish ordinary notes
-// without allowing a long external Contents value to dominate the menu width.
+// 候補ラベルには通常のメモを区別できるだけのコメントを表示し、外部の長い Contents 値が
+// メニュー幅を支配しないようにする。
 const ANNOTATION_LABEL_COMMENT_CHARS: usize = 24;
 const COLOR_SWATCH_SIZE: f32 = 18.0;
-// The larger target keeps compact swatches easy to click while the inner 18pt
-// color area stays consistent with annotation lists.
+// 大きめの対象で小さなスウォッチをクリックしやすくしつつ、内側の18ptの色領域は
+// 注釈一覧と一貫させる。
 const COLOR_CHOICE_SIZE: f32 = 28.0;
 const COLOR_TRIGGER_HEIGHT: f32 = 32.0;
 const COLOR_TRIGGER_HORIZONTAL_PADDING: f32 = 8.0;
 const COLOR_TRIGGER_ARROW_HALF_SIZE: f32 = 3.0;
 const COLOR_PICKER_SLIDER_WIDTH: f32 = 220.0;
-// A 12pt check remains legible inside an 18pt swatch. Painting a 3pt dark
-// outline below a 1.5pt light stroke keeps it visible on every preset color.
+// 12pt のチェックは18ptのスウォッチ内でも判読できる。3ptの暗い輪郭を1.5ptの明るい
+// ストロークの下に描くことで、すべてのプリセット色で見えるようにする。
 const COLOR_CHECK_SIZE: f32 = 12.0;
 const COLOR_CHECK_OUTLINE_WIDTH: f32 = 3.0;
 const COLOR_CHECK_FOREGROUND_WIDTH: f32 = 1.5;
-// These logical dimensions follow the instructed 28–32pt target and 14–16pt icon.
+// これらの論理寸法は指定された28–32ptの対象と14–16ptのアイコンに従う。
 const EDITOR_CLOSE_BUTTON_SIZE: f32 = 30.0;
 const EDITOR_CLOSE_ICON_SIZE: f32 = 15.0;
 const EDITOR_CLOSE_ICON_STROKE: f32 = 1.5;
-// Header reserves the 30-point close target plus separator spacing, leaving the
-// body enough room to avoid a bar for ordinary 320x480 editor content.
+// ヘッダーは30ポイントの閉じる対象と区切りの間隔を確保し、通常の320x480エディター内容で
+// 本体にスクロールバーを出さずに済むだけの空間を残す。
 const EDITOR_HEADER_RESERVED_HEIGHT: f32 = 42.0;
 
-// These explicit RGB values form the editable UI palette; they are never used
-// as inferred replacements when an existing PDF color cannot be read.
+// これらの明示的な RGB 値は編集可能な UI パレットを構成する。既存の PDF 色を読み取れない
+// 場合でも、推測した置換値として使うことはない。
 const COLOR_PRESETS: [(&str, [u8; 3]); 10] = [
     ("黄色", [255, 255, 0]),
     ("緑色", [76, 175, 80]),
@@ -108,7 +108,7 @@ pub(crate) struct AnnotationEditorState {
 }
 
 impl AnnotationEditorState {
-    /// Creates an edit buffer without exposing the selected text as annotation content.
+    /// 選択テキストを注釈内容として露出させずに編集バッファを作成する。
     #[cfg(test)]
     pub(crate) fn from_snapshot(
         document_id: u64,
@@ -118,7 +118,7 @@ impl AnnotationEditorState {
         Self::from_summary(document_id, revision, &annotation.summary())
     }
 
-    /// Creates an editor from sidebar metadata without waiting for page geometry.
+    /// ページジオメトリを待たず、サイドバーのメタデータからエディターを作成する。
     pub(crate) fn from_summary(
         document_id: u64,
         revision: u64,
@@ -154,8 +154,8 @@ impl AnnotationEditorState {
             self.buffer.contents == self.original.contents || self.can_edit_contents;
         let color_allowed = self.buffer.color == self.original.color
             || (self.can_edit_color && self.buffer.color.is_some());
-        // A mixed editable/read-only annotation is saved only when every
-        // changed field is allowed; silently dropping one change is forbidden.
+        // 編集可能と読み取り専用が混在する注釈は、変更したすべてのフィールドが許可される
+        // 場合にだけ保存する。変更を1つ黙って破棄することは禁止する。
         !self.stale
             && !self.mutation_in_flight
             && self.is_dirty()
@@ -163,7 +163,7 @@ impl AnnotationEditorState {
             && color_allowed
     }
 
-    /// Builds a minimal revision-bound patch from fields the user actually changed.
+    /// ユーザーが実際に変更したフィールドから、リビジョンに紐付く最小パッチを構築する。
     pub(crate) fn update_request(&self) -> Option<AnnotationUpdateRequest> {
         if !self.can_save() {
             return None;
@@ -192,7 +192,7 @@ pub(crate) enum AnnotationEditorAction {
     Delete,
 }
 
-/// Converts backend snapshots into stable, UI-owned candidate rows.
+/// バックエンドのスナップショットを安定した UI 所有の候補行へ変換する。
 pub(crate) fn annotation_menu_candidates(
     annotations: &[&AnnotationSnapshot],
 ) -> Vec<AnnotationMenuCandidate> {
@@ -208,7 +208,7 @@ pub(crate) fn annotation_menu_candidates(
         .collect()
 }
 
-/// Returns non-empty stored comments without substituting selected page text.
+/// 選択されたページテキストで置き換えず、保存済みで空でないコメントを返す。
 pub(crate) fn annotation_hover_comments<'a>(
     annotations: &[&'a AnnotationSnapshot],
 ) -> Vec<&'a str> {
@@ -219,7 +219,7 @@ pub(crate) fn annotation_hover_comments<'a>(
         .collect()
 }
 
-/// Shows the page context menu and returns only a stable-ID operation request.
+/// ページのコンテキストメニューを表示し、安定した ID による操作要求だけを返す。
 pub(crate) fn show_annotation_context_menu(
     response: &Response,
     target: &AnnotationContextTarget,
@@ -313,7 +313,7 @@ fn candidate_action_menu(
     }
 }
 
-/// Draws one annotation candidate using a swatch plus ordinary foreground text.
+/// スウォッチと通常の前景テキストを使って1つの注釈候補を描画する。
 pub(crate) fn show_annotation_candidate_button(
     ui: &mut egui::Ui,
     candidate: &AnnotationMenuCandidate,
@@ -329,7 +329,7 @@ pub(crate) fn show_annotation_candidate_button(
     .inner
 }
 
-/// Computes the right-edge overlay rectangle without participating in panel layout.
+/// パネルのレイアウトに参加せず、右端のオーバーレイ矩形を計算する。
 pub(crate) fn annotation_overlay_rect(bounds: Rect) -> Rect {
     let available_width = (bounds.width() - OVERLAY_MARGIN * 2.0).max(1.0);
     let available_height = (bounds.height() - OVERLAY_MARGIN * 2.0).max(1.0);
@@ -346,7 +346,7 @@ pub(crate) fn annotation_overlay_rect(bounds: Rect) -> Rect {
     )
 }
 
-/// Draws the editor as a foreground Area so fit and scroll layout stay unchanged.
+/// フィットとスクロールのレイアウトを変えないよう、エディターを前景 Area として描画する。
 pub(crate) fn show_annotation_editor(
     context: &egui::Context,
     bounds: Rect,
@@ -417,7 +417,7 @@ pub(crate) fn show_annotation_editor(
                 ScrollArea::vertical()
                     .id_salt(("annotation-editor-scroll", state.document_id))
                     .scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
-                    // Only the body scrolls; the title and close target stay visible.
+                    // スクロールするのは本体だけで、タイトルと閉じる対象は表示したままにする。
                     .max_height(
                         (rect.height() - frame_margin_height - EDITOR_HEADER_RESERVED_HEIGHT)
                             .max(1.0),
@@ -486,8 +486,8 @@ fn color_menu(
     recent_annotation_colors: &mut Vec<[u8; 3]>,
 ) {
     let enabled = state.can_edit_color && !state.stale && !state.mutation_in_flight;
-    // A draft cannot be applied after permissions or revision state changes,
-    // so discard it instead of allowing a stale mutation through the picker.
+    // 権限またはリビジョン状態が変わった後は下書きを適用できないため、
+    // 古い変更をピッカーから通さずに破棄する。
     if !enabled {
         state.custom_color_draft = None;
     }
@@ -536,8 +536,8 @@ fn color_menu(
                     if picker_open {
                         cancel_custom_color(state);
                     } else {
-                        // Drafting starts from the display value but does not rewrite an
-                        // unreadable/CMYK source until the user confirms Apply.
+                        // 下書きは表示値から始めるが、ユーザーが適用を確認するまで
+                        // 読み取れない/CMYK ソースを書き換えない。
                         state.custom_color_draft = Some(
                             color_preview(state.buffer.color)
                                 .map(|color| [color.r(), color.g(), color.b()])
@@ -585,8 +585,8 @@ fn discard_custom_color_draft_after_popup_close(
     popup_was_open: bool,
     popup_is_open: bool,
 ) {
-    // A draft belongs only to the popup session that created it. Closing via
-    // outside click, Escape, or the trigger must not leak it into the next open.
+    // 下書きは作成したポップアップセッションだけに属する。外側のクリック、Escape、
+    // またはトリガーで閉じたときに次のオープンへ漏らしてはならない。
     if popup_was_open && !popup_is_open {
         cancel_custom_color(state);
     }
@@ -712,7 +712,7 @@ pub(crate) fn paint_color_swatch(ui: &egui::Ui, rect: Rect, color: Option<PdfAnn
     ui.painter()
         .rect(rect, 2.0, fill, border, StrokeKind::Inside);
     if color.is_none() {
-        // The diagonal distinguishes an unreadable color from a valid gray value.
+        // 斜線により、読み取れない色と有効なグレー値を区別する。
         ui.painter()
             .line_segment([rect.left_bottom(), rect.right_top()], border);
     }
@@ -761,7 +761,7 @@ fn annotation_candidate_label(annotation: &AnnotationSnapshot) -> String {
     format!("{comment}・ID {}", annotation.id.xref)
 }
 
-/// Paints an annotation color without using that color for explanatory text.
+/// 注釈の色を描画するが、説明テキストにはその色を使わない。
 pub(crate) fn color_swatch(
     ui: &mut egui::Ui,
     color: Option<PdfAnnotationColor>,
@@ -788,8 +788,8 @@ fn color_preview(color: Option<PdfAnnotationColor>) -> Option<Color32> {
             yellow,
             key,
         } => {
-            // This standard subtractive conversion is display-only. The
-            // original CMYK components remain untouched until the user chooses a color.
+            // この標準的な減法変換は表示専用である。ユーザーが色を選ぶまで、元の CMYK
+            // 成分には触れない。
             let red = (1.0 - cyan) * (1.0 - key);
             let green = (1.0 - magenta) * (1.0 - key);
             let blue = (1.0 - yellow) * (1.0 - key);
@@ -800,8 +800,8 @@ fn color_preview(color: Option<PdfAnnotationColor>) -> Option<Color32> {
 
 fn normalized_rgb_to_color32(red: f32, green: f32, blue: f32) -> Color32 {
     fn channel(value: f32) -> u8 {
-        // PDF color channels are normalized floats; clipping malformed
-        // external values protects the preview without changing stored data.
+        // PDF の色チャンネルは正規化された浮動小数である。異常な外部値をクリップして
+        // プレビューを保護しつつ、保存データは変更しない。
         (value.clamp(0.0, 1.0) * 255.0).round() as u8
     }
     Color32::from_rgb(channel(red), channel(green), channel(blue))

@@ -46,19 +46,18 @@ use crate::ui::viewport::{
     PageInteraction, PageInteractionInput, PageViewport, pdf_cursor_icon, screen_rect_for_tile,
 };
 
-// These bounds cover detailed inspection and overview use without allowing an
-// accidental wheel gesture to request an unbounded raster allocation.
+// 詳細確認と全体表示の両方を覆いつつ、誤ったホイール操作で
+// ラスター割り当てが無制限に要求されない範囲に制限する。
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 4.0;
 
-// Fit modes can change by sub-pixel rounding as panel sizes settle. Ignoring a
-// difference below one tenth of a percent avoids invalidating every page on
-// visually identical consecutive frames.
+// パネルサイズが確定する過程ではサブピクセル丸めで Fit モードが変化しうる。
+// 0.1% 未満の差を無視し、見た目が同じ連続フレームで全ページを無効化しない。
 const ZOOM_CHANGE_EPSILON: f32 = 0.001;
 
-// These values preserve egui's 18-point minimum interaction height, keep a
-// 24-point close target and a readable title region at minimum width, and cap
-// the former unbounded filename label at a conventional desktop tab width.
+// egui の操作領域の最小高さ 18 ポイントを保ち、24 ポイントの閉じる操作領域と
+// 最小幅でも読めるタイトル領域を確保し、従来無制限だったファイル名を
+// 一般的なデスクトップのタブ幅に収める。
 const TAB_MIN_WIDTH: f32 = 96.0;
 const TAB_MAX_WIDTH: f32 = 240.0;
 const TAB_HEIGHT: f32 = 24.0;
@@ -67,62 +66,62 @@ const TAB_CLOSE_WIDTH: f32 = 24.0;
 const TAB_CONTENT_GAP: f32 = 4.0;
 const TAB_ITEM_SPACING: f32 = 1.0;
 
-// An 8-point vector X remains legible inside the 24-point close target while
-// leaving enough hover fill around it at the minimum tab height.
+// 8 ポイントのベクター X は 24 ポイントの閉じる操作領域内で判読でき、
+// 最小タブ高さでも周囲に十分なホバー時の塗りを残せる。
 const TAB_CLOSE_ICON_HALF_SIZE: f32 = 4.0;
 const TAB_CLOSE_ICON_STROKE_WIDTH: f32 = 1.5;
 
-// The first three page digits keep a stable toolbar column. Longer documents
-// measure all required digits instead of truncating or rejecting page input.
+// 最初の 3 桁分を確保してツールバーの列幅を安定させる。長い文書では必要な
+// 桁数をすべて測定し、ページ入力を切り詰めたり拒否したりしない。
 const PAGE_INPUT_MINIMUM_COLUMNS: usize = 3;
 
-// The design budget is shared across all tabs so the active document can use
-// available GPU memory instead of dividing a fixed allocation per tab.
+// 設計上の予算は全タブで共有し、タブごとに固定量を分割せず、アクティブ文書が
+// 利用可能な GPU メモリを使えるようにする。
 const GPU_TILE_BUDGET_BYTES: usize = 192 * 1_024 * 1_024;
 
-// Thumbnails have their own budget so a long sidebar cannot evict the active
-// page's display tiles from the 192 MiB rendering cache.
+// サムネイルには専用予算を設け、長いサイドバーが 192 MiB のレンダーキャッシュ
+// からアクティブページの表示タイルを追い出さないようにする。
 const THUMBNAIL_BUDGET_BYTES: usize = 32 * 1_024 * 1_024;
 const THUMBNAIL_MAX_WIDTH: u32 = 160;
 const THUMBNAIL_MAX_HEIGHT: u32 = 220;
 const THUMBNAIL_ROW_HEIGHT: f32 = 248.0;
 
-// The release performance matrix showed eight pages had the shortest first
-// result and cancellation boundary without increasing total scan time.
+// リリース性能マトリクスでは、8 ページが最初の結果とキャンセル境界を最短にし、
+// 全体のスキャン時間も増やさなかった。
 const HIGHLIGHT_INDEX_BATCH_PAGES: usize = 8;
 
-// High-precision devices emit point deltas rather than discrete wheel steps.
-// Twenty-four logical points filters incidental edge motion without delaying a
-// deliberate short trackpad gesture by more than a typical line of content.
+// 高精度デバイスは離散的なホイール段階ではなくポイント差分を送る。
+// 24 論理ポイントなら端での偶発的な動きを除外しつつ、意図した短いトラックパッド
+// 操作を一般的な 1 行分以上遅延させない。
 const TRACKPAD_PAGE_THRESHOLD_POINTS: f32 = 24.0;
 
-// A short idle interval separates trackpad inertia from the next deliberate
-// gesture even when the backend never emits an exact zero-delta frame.
+// バックエンドが差分 0 のフレームを正確に送らない場合でも、短いアイドル区間で
+// トラックパッドの慣性と次の意図的な操作を分離する。
 const WHEEL_GESTURE_IDLE_SECONDS: f64 = 0.150;
 
-// One logical point absorbs PAGE_GAP and fractional ScrollArea rounding while
-// remaining too small to skip visible page content.
+// 1 論理ポイントで PAGE_GAP と ScrollArea の小数丸めを吸収するが、可視ページの
+// 内容を飛ばすには小さすぎる。
 const SINGLE_PAGE_EDGE_TOLERANCE_POINTS: f32 = 1.0;
 
-// Browser-style autoscroll should remain still near its anchor. Twelve logical
-// points is large enough to tolerate click jitter at ordinary desktop DPI.
+// ブラウザ風 autoscroll はアンカー付近で停止したままにする。12 論理ポイントなら
+// 一般的なデスクトップ DPI でのクリックの揺れを許容できる。
 const AUTOSCROLL_DEAD_ZONE_POINTS: f32 = 12.0;
 const AUTOSCROLL_SPEED_PER_POINT: f32 = 12.0;
 
-// Bound both long pointer excursions and a stalled frame: the former prevents
-// uncontrollable jumps, while 100 ms keeps one frame below 480 logical points.
+// 長いポインター移動と停止したフレームの双方を制限する。前者は制御不能なジャンプを
+// 防ぎ、100 ms なら 1 フレームを 480 論理ポイント未満に保てる。
 const AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND: f32 = 4_800.0;
 const AUTOSCROLL_MAX_FRAME_SECONDS: f32 = 0.100;
 
 const AUTOSCROLL_MARKER_RADIUS_POINTS: f32 = 8.0;
 
-// Inputs no more than 250 ms apart are one continuous zoom gesture for debug
-// accounting. This is short enough not to delay rendering the latest scale.
+// 250 ms 以内の入力をデバッグ計測上は 1 つの連続ズーム操作とみなす。最新倍率の
+// 描画を遅らせない十分短い間隔である。
 #[cfg(debug_assertions)]
 const ZOOM_INPUT_GROUP_IDLE_SECONDS: f64 = 0.250;
 
-// N-05 sets 512 MiB as the stable process target. Suspension is only allowed
-// after crossing that limit; ordinary tab switches retain documents.
+// N-05 はプロセスの安定目標を 512 MiB と定める。サスペンドはこの上限を超えた後だけ
+// 許可し、通常のタブ切り替えでは文書を保持する。
 const RESIDENT_MEMORY_SUSPEND_THRESHOLD_BYTES: usize = 512 * 1_024 * 1_024;
 
 pub(crate) struct PrototypeApp {
@@ -143,8 +142,8 @@ pub(crate) struct PrototypeApp {
     session_restore_progress: Option<SessionRestoreProgress>,
     next_document_id: u64,
     activity_sequence: u64,
-    // A reveal request is consumed by the next tab-bar frame. Keeping it
-    // one-shot lets users scroll away afterward to inspect inactive tabs.
+    // 表示要求は次のタブバーのフレームで消費する。一度だけにすることで、その後に
+    // ユーザーがスクロールして非アクティブなタブを確認できる。
     tab_to_reveal: Option<usize>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
@@ -153,8 +152,8 @@ pub(crate) struct PrototypeApp {
     annotation_editor: Option<AnnotationEditorState>,
     annotation_picker: Option<AnnotationPickerState>,
     recent_annotation_colors: Vec<[u8; 3]>,
-    // egui-winit emits Event::Copy without a matching pressed Key event.
-    // The release event clears this latch so OS key-repeat cannot recopy the PDF.
+    // egui-winit は対応する押下状態の Key イベントなしに Event::Copy を送る。
+    // 解放イベントでラッチを解除し、OS のキーリピートで PDF を再コピーしない。
     copy_shortcut_active: bool,
 }
 
@@ -252,7 +251,7 @@ fn next_highlight_index_request(index: &HighlightIndexState) -> Option<Highlight
     })
 }
 
-/// Replaces page rows only when one response matches the exact outstanding request.
+/// 保留中の要求と完全に一致する応答の場合だけページ行を置き換える。
 fn apply_highlight_index_batch(
     index: &mut HighlightIndexState,
     batch: HighlightIndexBatch,
@@ -510,7 +509,7 @@ fn tab_pointer_action(primary_clicked: bool, middle_clicked: bool) -> Option<Tab
     }
 }
 
-/// Returns one equal tab width, including the transition to horizontal scroll.
+/// 水平スクロールへ移行する場合も含め、均等なタブ幅を返す。
 fn tab_width_for_count(
     available_width: f32,
     tab_count: usize,
@@ -540,7 +539,7 @@ fn tab_reveal_after_close(
     selected_document_changed.then_some(current).flatten()
 }
 
-/// Reserves the close target before assigning the remaining tab width to text.
+/// 残りのタブ幅をテキストへ割り当てる前に閉じる操作領域を確保する。
 fn tab_content_rects(
     tab_rect: Rect,
     horizontal_padding: f32,
@@ -609,8 +608,8 @@ fn paint_document_tab(
         .with_clip_rect(content.title)
         .galley(title_position, title_galley, text_color);
 
-    // The close region shares the tab background; a local fill appears only on
-    // hover so it remains discoverable without recreating the old boxed button.
+    // 閉じる領域はタブ背景を共有し、ホバー時だけ局所的に塗る。旧来の枠付きボタンを
+    // 再現せずに、操作箇所を見つけられるようにする。
     if state.can_close && state.close_response.hovered() {
         ui.painter().rect_filled(
             content.close.shrink(2.0),
@@ -642,7 +641,7 @@ fn close_icon_segments(close_rect: Rect) -> [[Pos2; 2]; 2] {
 }
 
 impl PrototypeApp {
-    /// Creates the application and opens each command-line PDF.
+    /// アプリケーションを生成し、コマンドラインで指定された各 PDF を開く。
     pub(crate) fn new(
         creation_context: &eframe::CreationContext<'_>,
         paths: Vec<PathBuf>,
@@ -666,8 +665,8 @@ impl PrototypeApp {
         let restore_enabled = saved_session
             .as_ref()
             .is_none_or(|session| session.restore_enabled);
-        // Color preferences restore independently of tabs so explicit command-line
-        // PDFs do not discard the user's editor history.
+        // 色設定はタブとは独立して復元し、コマンドライン指定の PDF を開いても
+        // ユーザーの編集履歴を破棄しない。
         let recent_annotation_colors = saved_session
             .as_ref()
             .map(|session| session.recent_annotation_colors.clone())
@@ -705,7 +704,7 @@ impl PrototypeApp {
                 app.restore_session(session);
             }
         } else {
-            // Explicit command-line files take precedence over session restore.
+            // 明示されたコマンドラインファイルをセッション復元より優先する。
             for path in paths {
                 app.open_document(path);
             }
@@ -717,10 +716,10 @@ impl PrototypeApp {
         let _opened_index = self.open_document_with_intent(path, OpenIntent::User);
     }
 
-    /// Opens the native picker and forwards only an explicitly chosen PDF.
+    /// ネイティブピッカーを開き、明示的に選択された PDF だけを渡す。
     fn pick_pdf_and_open(&mut self) {
-        // The native picker temporarily replaces the PDF interaction surface,
-        // so an anchor must not resume when the dialog returns.
+        // ネイティブピッカーの間は PDF の操作面が一時的に置き換わるため、
+        // ダイアログから戻ったときにアンカーを再開してはならない。
         self.stop_active_autoscroll();
         let selected = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
@@ -921,8 +920,8 @@ impl PrototypeApp {
                                 .as_ref()
                                 .is_some_and(|editor| editor.document_id == document_id)
                         {
-                            // Save reopens the PDF and begins a new xref/revision
-                            // validity interval; even a clean old editor must not survive it.
+                            // Save は PDF を再オープンして xref/revision の有効区間を
+                            // 新しく始めるため、変更のない古いエディターも残してはならない。
                             self.annotation_editor = None;
                         }
                         let restart_search = self.active_index() == Some(index)
@@ -947,13 +946,13 @@ impl PrototypeApp {
                             if let Some(page_index) = changed_highlight_page {
                                 tab.refresh_highlight_index_page(page_index, revision, page_count);
                             } else {
-                                // A revision change without an application edit
-                                // has no page identity whose xrefs can be retained.
+                                // アプリケーション編集を伴わない revision 変更では、
+                                // xref を保持できるページの同一性が存在しない。
                                 tab.reset_highlight_index(revision, page_count);
                             }
                         } else {
-                            // Save reopens MuPDF and may assign new xrefs even
-                            // when every visible annotation looks unchanged.
+                            // Save は MuPDF を再オープンし、表示上の注釈がすべて同じでも
+                            // 新しい xref を割り当てることがある。
                             tab.reset_highlight_index(revision, page_count);
                         }
                         let thumbnail_keys = tab.invalidate_thumbnails();
@@ -990,8 +989,8 @@ impl PrototypeApp {
                         if !result_is_current {
                             continue;
                         }
-                        // Texture upload trusts both byte count and page-relative
-                        // dimensions, so validate the worker snapshot first.
+                        // テクスチャ転送はバイト数とページ相対の寸法を信頼するため、
+                        // 先にワーカーのスナップショットを検証する。
                         let bounds_match = tab
                             .info
                             .as_ref()
@@ -1093,9 +1092,8 @@ impl PrototypeApp {
                             tab.pending_highlight_refresh_page = Some(changed_page);
                             self.status = "編集を元に戻しました".to_owned();
                         } else {
-                            // A worker response must correspond to the action at the
-                            // top of this tab's history; silently reordering would let
-                            // a later undo target the wrong annotation identity.
+                            // ワーカー応答はこのタブの履歴先頭の操作に対応しなければならない。
+                            // 並べ替えを黙って行うと、後続の取り消しが誤った注釈の同一性を対象にする。
                             tab.error = Some(
                                 "編集を元に戻せませんでした。タブを開き直してください。詳細: 編集履歴の応答順序が一致しません。"
                                     .to_owned(),
@@ -1312,9 +1310,8 @@ impl PrototypeApp {
                             self.viewport.cancel_primary_interaction();
                         }
                         if operation == "open" && self.documents[index].restoring_from_session {
-                            // The tab vector cannot be shifted while its event
-                            // queues are being traversed. Remove failed restore
-                            // tabs only after every current index is inspected.
+                            // イベントキューを走査中はタブ配列をずらせない。現在の全インデックスを
+                            // 調べ終えてから、復元に失敗したタブを削除する。
                             let path = self.tabs.tabs()[index].path().to_path_buf();
                             failed_restored_paths.push(path);
                             break;
@@ -1331,8 +1328,8 @@ impl PrototypeApp {
                         if operation == "highlight-state" {
                             let tab = &mut self.documents[index];
                             tab.pending_edits = tab.pending_edits.saturating_sub(1);
-                            // MuPDF already created the annotation; only the
-                            // follow-up snapshot failed, so remain dirty.
+                            // MuPDF はすでに注釈を作成しており、後続スナップショットだけが
+                            // 失敗したため、`dirty` のままにする。
                             tab.state = DocumentState::ReadyDirty;
                         }
                         if operation == "annotation-update" || operation == "annotation-delete" {
@@ -1355,9 +1352,8 @@ impl PrototypeApp {
                             }
                         }
                         if operation == "search" {
-                            // A page error normally repeats for every queued page.
-                            // Advancing the generation stops the remaining work instead
-                            // of flooding the UI with identical failures.
+                            // ページエラーは通常、キューに入った全ページで繰り返される。
+                            // generation を進めて残りの処理を止め、同じ失敗で UI を埋めない。
                             self.cancel_search(index);
                         }
                         if operation == "undo" {
@@ -1410,8 +1406,8 @@ impl PrototypeApp {
                         if let Some(confirmation) = &mut self.close_confirmation
                             && confirmation.path == failed_path
                         {
-                            // A dead worker cannot finish the queued save, so the
-                            // dialog must become dismissible instead of waiting forever.
+                            // 停止したワーカーはキュー済みの保存を完了できないため、
+                            // 無限に待たずダイアログを閉じられるようにする。
                             confirmation.save_in_flight = false;
                         }
                         break;
@@ -1420,8 +1416,8 @@ impl PrototypeApp {
             }
         }
 
-        // Removing a tab while iterating its event queue would shift the vector
-        // and could skip the next document. Deferred close runs after all queues.
+        // イベントキューの走査中にタブを削除すると配列がずれ、次の文書を飛ばす
+        // おそれがある。すべてのキューの後で遅延クローズを実行する。
         if let Some(path) = self.saved_tab_to_close.take() {
             self.close_tab_by_path(&path);
         }
@@ -1429,8 +1425,8 @@ impl PrototypeApp {
             if let Some(index) = self.tabs.tabs().iter().position(|tab| tab.path() == path) {
                 self.remove_tab_now(index);
             } else {
-                // A concurrent close may have removed the tab after its worker
-                // reported failure; account for that completion exactly once.
+                // ワーカーの失敗報告後に並行クローズがタブを削除した可能性があるため、
+                // その完了を正確に一度だけ計上する。
                 self.finish_session_restore(false);
             }
         }
@@ -1466,8 +1462,8 @@ impl PrototypeApp {
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
         let open_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::O));
-        // Native dialogs must not start underneath an unresolved close flow;
-        // that flow owns the document set until the user makes a decision.
+        // 未解決のクローズ処理の下でネイティブダイアログを開始してはならない。
+        // ユーザーが決定するまで、その処理が文書集合を所有する。
         if open_pressed
             && !self.window_close_pending
             && !self.close_all_pending
@@ -1491,8 +1487,8 @@ impl PrototypeApp {
         let escape_pressed =
             context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
         if escape_pressed && let Some(index) = self.active_index() {
-            // Escape is consumed here before the PDF view reads raw input, so
-            // autoscroll must stop in this branch rather than only in its frame update.
+            // PDF ビューが生入力を読む前に Escape をここで消費するため、
+            // autoscroll はフレーム更新だけでなくこの分岐でも停止する必要がある。
             self.documents[index].view.stop_autoscroll();
             let document_id = self.documents[index].document_id;
             let query_id = search_query_id(document_id);
@@ -1505,8 +1501,8 @@ impl PrototypeApp {
             if annotation_input_id
                 .is_some_and(|input_id| context.memory(|memory| memory.has_focus(input_id)))
             {
-                // The first Escape leaves the multiline editor; it must not
-                // also discard the buffer or act on the PDF behind the overlay.
+                // 最初の Escape は複数行エディターからフォーカスを外すだけにし、
+                // バッファを破棄したり背後の PDF を操作したりしてはならない。
                 context.memory_mut(|memory| {
                     memory.surrender_focus(annotation_input_id.expect("checked above"));
                 });
@@ -1742,11 +1738,11 @@ impl PrototypeApp {
         }
         if let Some(previous) = previous.filter(|previous| *previous != index) {
             self.documents[previous].view.stop_autoscroll();
-            // PageViewport is shared by tabs, so its primary gesture must not
-            // be interpreted against the newly active document.
+            // PageViewport はタブ間で共有されるため、主ジェスチャーを新しく
+            // アクティブになった文書に対して解釈してはならない。
             self.viewport.cancel_primary_interaction();
-            // A tab switch changes request ownership, not tile identity. Cancel
-            // queued work without discarding the generation or reusable textures.
+            // タブ切り替えで変わるのは要求の所有者であり、タイルの同一性ではない。
+            // generation や再利用可能なテクスチャを破棄せず、キュー済み処理だけを取り消す。
             self.documents[previous].cancel_rendering_requests();
             self.documents[previous].invalidate_text_snapshots();
             self.documents[previous].invalidate_annotation_pages();
@@ -1881,8 +1877,8 @@ impl PrototypeApp {
         let Some(document) = self.documents.get(index) else {
             return;
         };
-        // A queued save precedes Shutdown on the worker command
-        // queue, so Discard cannot honestly cancel it. Wait for completion.
+        // キューでは保存が Shutdown より前に置かれるため、Discard で正直に取り消せない。
+        // 完了を待つ。
         if document.is_saving() {
             self.status = "Waiting for the current save before closing…".to_owned();
             return;
@@ -1997,8 +1993,8 @@ impl PrototypeApp {
         }
         self.tab_to_reveal = tab_reveal_after_close(previous_selection, index, self.active_index());
         if was_restoring {
-            // Closing an opening restore tab consumes its pending result; the
-            // worker is dropped with the tab, so no event can complete it later.
+            // 開く途中の復元タブを閉じると保留結果を消費する。ワーカーもタブとともに
+            // 破棄されるため、後からイベントが完了させることはない。
             self.finish_session_restore(false);
         }
         true
@@ -2067,8 +2063,8 @@ impl PrototypeApp {
             return;
         }
 
-        // eframe closes the native window unless cancellation is sent during
-        // the same frame in which the OS close request is observed.
+        // OS のクローズ要求を検知した同じフレーム中にキャンセルを送らない限り、
+        // eframe はネイティブウィンドウを閉じる。
         context.send_viewport_cmd(ViewportCommand::CancelClose);
         if self.focus_blocking_annotation_editor(None) {
             self.window_close_pending = false;
@@ -2093,9 +2089,8 @@ impl PrototypeApp {
             return;
         }
         if self.session_restore_progress.is_some() {
-            // Session state must not be captured until every restored open has
-            // reported success or failure; receive_document_events retries the
-            // close flow when the last pending result is consumed.
+            // 復元した全オープンが成功または失敗を報告するまでセッション状態を取得しては
+            // ならない。最後の保留結果を消費したとき receive_document_events がクローズ処理を再試行する。
             self.status = "Waiting for session restore before closing…".to_owned();
             return;
         }
@@ -2351,8 +2346,8 @@ impl PrototypeApp {
         match decision {
             SessionCloseDecision::Retry => self.prompt_next_window_document(context),
             SessionCloseDecision::ExitWithoutSession => {
-                // This explicit choice is the only path that permits shutdown
-                // without the atomic session update required by normal close.
+                // この明示的な選択だけが、通常のクローズで必要なアトミックなセッション更新なしに
+                // 終了できる経路である。
                 self.allow_window_close = true;
                 self.window_close_pending = false;
                 self.close_confirmation = None;
@@ -2476,8 +2471,8 @@ impl PrototypeApp {
                 return;
             }
             if editor.is_dirty() || editor.mutation_in_flight {
-                // Switching targets must never silently discard a long comment
-                // or implicitly save it into another annotation.
+                // 対象を切り替えるとき、長いコメントを黙って破棄したり別の注釈へ暗黙に
+                // 保存したりしてはならない。
                 editor.notice =
                     Some("別の注釈を開く前に、現在の変更を保存または破棄してください。".to_owned());
                 return;
@@ -2583,8 +2578,8 @@ impl PrototypeApp {
                 && editor.revision == revision
                 && editor.annotation_id == annotation_id;
             if !same_target && (editor.is_dirty() || editor.mutation_in_flight) {
-                // Context-menu deletion of another annotation must not make an
-                // unrelated edit buffer disappear or become attached to a new target.
+                // 別の注釈をコンテキストメニューから削除しても、無関係な編集バッファを
+                // 消したり新しい対象へ付け替えたりしてはならない。
                 editor.notice = Some(
                     "別の注釈を削除する前に、現在の変更を保存または破棄してください。".to_owned(),
                 );
@@ -2637,8 +2632,8 @@ impl PrototypeApp {
             return;
         };
         if let Some(restriction) = highlight_capability.restriction() {
-            // The adapter reports a concrete restriction; the UI does not
-            // invent a save fallback that could leave an unsavable dirty tab.
+            // アダプターが具体的な制限を報告するため、UI が保存不能な `dirty` タブを残す
+            // 独自の保存代替経路を作らない。
             self.error = Some(format!(
                 "Highlightを作成できません。PDFの編集制限を確認してください。詳細: {restriction}"
             ));
@@ -2660,8 +2655,8 @@ impl PrototypeApp {
             quads: selection.quads.clone(),
         };
         if tab.send(DocumentCommand::CreateHighlight(request)) {
-            // This local pending count closes the race before MuPDF reports its
-            // dirty flag back from the document worker.
+            // このローカル保留数で、MuPDF が文書ワーカーから `dirty` フラグを返す前の
+            // 競合を塞ぐ。
             tab.pending_edits += 1;
             tab.state = DocumentState::ReadyDirty;
             self.status = "Creating PDF Highlight annotation…".to_owned();
@@ -2686,8 +2681,8 @@ impl PrototypeApp {
             .expect("can_undo requires a history entry")
             .clone();
         if tab.send(DocumentCommand::Undo(action)) {
-            // Keep the action in history until the backend confirms the exact
-            // stable ID was removed; a failure must remain retryable.
+            // バックエンドが正確な安定 ID の削除を確認するまで履歴の操作を保持し、
+            // 失敗時に再試行できるようにする。
             tab.undo_in_flight = true;
             self.status = "編集を元に戻しています…".to_owned();
         } else {
@@ -3008,19 +3003,19 @@ impl PrototypeApp {
         ));
         let toolbar_panel = egui::Panel::top("toolbar").frame(toolbar_frame);
         toolbar_panel.show(root_ui, |ui| {
-            // Scrolling preserves one stable row when the window is too narrow;
-            // wrapping would separate controls inside a functional group.
+            // ウィンドウが狭くてもスクロールで 1 行を保つ。折り返すと機能上のグループ内の
+            // コントロールが分離される。
             egui::ScrollArea::horizontal()
                 .id_salt("toolbar-scroll")
                 .show(ui, |ui| {
-                    // Constrain the scroll content before centering; otherwise a
-                    // top panel can offer the remaining window height here.
+                    // 中央揃えの前にスクロール内容を制約する。そうしないと上部パネルが
+                    // ここで残りのウィンドウ高さを提供してしまう。
                     ui.set_height(TOOLBAR_CONTROL_HEIGHT);
-                    // Centering within the fixed row keeps labels, TextEdits,
-                    // separators, and icon targets on one visual axis.
+                    // 固定行の中で中央揃えにし、ラベル、TextEdit、区切り、アイコンの対象を
+                    // 1 本の視覚軸にそろえる。
                     ui.horizontal_centered(|ui| {
-                        // Keep the sidebar slot stable while no PDF is open so the remaining
-                        // toolbar groups do not shift when the first document is loaded.
+                        // PDF を開いていない間もサイドバーの枠を安定させ、最初の文書を読み込んだ
+                        // ときに残りのツールバー群が移動しないようにする。
                         let sidebar_enabled = self
                             .active_index()
                             .is_some_and(|index| self.documents[index].info.is_some());
@@ -3315,8 +3310,8 @@ impl PrototypeApp {
     }
 
     fn can_print(&self) -> bool {
-        // The native dialog runs on the document worker, so opening, saving,
-        // printing, shutdown confirmation, and a missing worker are exclusive.
+        // ネイティブダイアログは文書ワーカー上で動くため、オープン、保存、印刷、終了確認、
+        // ワーカー不在は排他的に扱う。
         self.active_index().is_some_and(|index| {
             let tab = &self.documents[index];
             tab.state != DocumentState::Opening
@@ -3367,8 +3362,8 @@ impl PrototypeApp {
                                 ui.separator();
                                 ui.label(format!("open {:.1} ms", milliseconds(info.open_time)));
                                 ui.label(format!("Highlights: {}", info.highlight_count));
-                                // The explicit strategy distinguishes a slower full rewrite
-                                // from a stalled save during development diagnostics.
+                                // 明示した方式により、開発時の診断で遅い全体書き換えと停止した保存を
+                                // 区別できる。
                                 if info.can_save_incrementally {
                                     ui.label("incremental save");
                                 } else {
@@ -3596,8 +3591,8 @@ impl PrototypeApp {
                                 ui.add_space(THUMBNAIL_MAX_HEIGHT as f32 / 2.0);
                                 ui.label("サムネイルを読み込めませんでした");
                                 if ui.button("再試行").clicked() {
-                                    // Persistent PDF errors must not trigger a retry on
-                                    // every frame; only an explicit user action requeues it.
+                                    // 永続的な PDF エラーで毎フレーム再試行してはならない。
+                                    // 明示的なユーザー操作だけが再キューする。
                                     tab.failed_thumbnails.remove(&key);
                                     tab.request_thumbnail(page_index, key);
                                 }
@@ -3724,8 +3719,8 @@ impl PrototypeApp {
         };
         editor.stale = revision != Some(editor.revision);
         if editor.stale {
-            // A revision-bound xref must not be updated after another edit or
-            // save/reopen cycle. The visible buffer can still be explicitly discarded.
+            // revision に束縛された xref は、別の編集や保存/再オープン後に更新してはならない。
+            // 表示中のバッファは明示的に破棄できる。
             editor.notice = Some(
                 "PDFが変更されたため、この編集内容は保存できません。変更を破棄してください。"
                     .to_owned(),
@@ -3769,7 +3764,7 @@ impl PrototypeApp {
         }
     }
 
-    /// Calculates fit zoom from the current viewport so resize invalidation is testable.
+    /// 現在のビューポートから Fit ズームを計算し、リサイズ時の無効化をテスト可能にする。
     fn fit_zoom_for_page(
         bounds: crate::domain::document::PageRect,
         available: Vec2,
@@ -3791,8 +3786,8 @@ impl PrototypeApp {
     fn continuous_view(&mut self, ui: &mut egui::Ui, index: usize) {
         let document_id = self.documents[index].document_id;
         if self.documents[index].view.autoscroll.is_some() {
-            // Autoscroll owns navigation until its stop input is observed, so
-            // a stale primary gesture must not coexist with its anchor.
+            // 停止入力を受けるまで autoscroll がナビゲーションを所有するため、古い主ジェスチャーを
+            // アンカーと同時に残してはならない。
             self.viewport.cancel_primary_interaction();
         }
         let editor_input_rect = self
@@ -3861,8 +3856,8 @@ impl PrototypeApp {
                 layout.visible_pages(visible_viewport.min.y..visible_viewport.max.y, 0.0);
             tab.prepare_text_snapshots(visible_text_pages.clone(), revision);
             tab.prepare_annotation_pages(visible_text_pages, revision);
-            // One viewport of prefetch keeps ordinary wheel scrolling smooth
-            // while the shared byte LRU supplies the hard memory bound.
+            // 1 ビューポート分を先読みして通常のホイールスクロールを滑らかにし、共有バイト LRU で
+            // 厳密なメモリ上限を確保する。
             let wanted_pages = layout.visible_pages(
                 visible_viewport.min.y..visible_viewport.max.y,
                 visible_viewport.height(),
@@ -3999,8 +3994,8 @@ impl PrototypeApp {
         if !dedicated_cursor_owner
             && (cursor_target.is_some() || autoscroll_active || blank_pan_active)
         {
-            // The annotation editor is painted after the PDF. Skipping the PDF
-            // cursor here also covers editor regions whose widgets use Default.
+            // 注釈エディターは PDF の後に描画される。ここで PDF カーソルを省略すると、ウィジェットが
+            // Default を使うエディター領域も対象にできる。
             set_pdf_cursor(
                 ui.ctx(),
                 pdf_cursor_icon(cursor_target, autoscroll_active, blank_pan_active),
@@ -4185,8 +4180,8 @@ impl PrototypeApp {
             && let Some(target) = adjacent_page_index(page_index, page_count, wheel_page_delta)
         {
             let x = tab.view.single_center_anchor.unwrap_or(Vec2::splat(0.5)).x;
-            // Enter the next page at its top and the previous page at its
-            // bottom so the wheel continues in the direction of travel.
+            // 次のページは上端、前のページは下端から入り、ホイールの移動方向を
+            // 継続する。
             let y = if wheel_page_delta > 0 { 0.0 } else { 1.0 };
             tab.jump_to_single_page_edge(target, Vec2::new(x, y));
         }
@@ -4292,7 +4287,7 @@ impl TextSnapshotKey {
     }
 }
 
-/// Enumerates the raster tiles needed for one page and assigns view priority.
+/// 1 ページに必要なラスタータイルを列挙し、表示優先度を割り当てる。
 fn tile_requests_for_page(
     tab: &DocumentTab,
     page_index: usize,
@@ -4321,8 +4316,8 @@ fn tile_requests_for_page(
     Some(requests)
 }
 
-/// Orders the current page and its two transition views without rasterizing an
-/// enlarged adjacent page outside the range that appears after navigation.
+/// 現在ページと 2 つの遷移ビューを並べ、ナビゲーション後に現れる範囲外の
+/// 拡大隣接ページはラスタライズしない。
 fn single_page_tile_requests(
     tab: &DocumentTab,
     page_bounds: &[crate::domain::document::PageRect],
@@ -4346,8 +4341,8 @@ fn single_page_tile_requests(
     .unwrap_or_default();
     for request in &mut requests {
         if request.priority != RenderPriority::Visible {
-            // The current page's one-viewport margin must finish before either
-            // adjacent transition range, regardless of scroll direction.
+            // スクロール方向にかかわらず、現在ページの 1 ビューポート余白を
+            // どちらの隣接遷移範囲より先に完了させる。
             request.priority = RenderPriority::CurrentViewport;
         }
     }
@@ -4386,7 +4381,7 @@ fn single_page_tile_requests(
     requests
 }
 
-/// Requests only the page area visible immediately after an edge transition.
+/// 端の遷移直後に見えるページ領域だけを要求する。
 fn transition_tile_requests_for_page(
     tab: &DocumentTab,
     page_index: usize,
@@ -4425,7 +4420,7 @@ fn transition_tile_requests_for_page(
     )
 }
 
-/// Limits raster work to the visible area and exactly one viewport around it.
+/// ラスター処理を可視領域とその周囲ちょうど 1 ビューポートに制限する。
 fn prioritized_tile_specs(
     grid: TileGrid,
     page_rect: Rect,
@@ -4446,7 +4441,7 @@ fn prioritized_tile_specs(
     )
 }
 
-/// Enumerates only tiles intersecting the requested logical page region.
+/// 要求された論理ページ領域と交差するタイルだけを列挙する。
 fn tile_specs_intersecting_viewport(
     grid: TileGrid,
     page_rect: Rect,
@@ -4493,7 +4488,7 @@ fn tile_specs_intersecting_viewport(
     )
 }
 
-/// Maps a logical page edge to a bounded page-local device pixel edge.
+/// 論理ページの端を、ページ内で上限を設けたデバイスピクセル端へ変換する。
 fn logical_edge_to_pixel(
     value: f32,
     page_start: f32,
@@ -4508,8 +4503,8 @@ fn logical_edge_to_pixel(
     if !scaled.is_finite() {
         return None;
     }
-    // Outward rounding includes every edge pixel touched by the logical
-    // prefetch rectangle, including partial right and bottom tiles.
+    // 外向き丸めで、論理先読み矩形が触れるすべての端ピクセル（右端・下端の
+    // 部分タイルを含む）を含める。
     let rounded = if round_up {
         scaled.ceil()
     } else {
@@ -4534,8 +4529,8 @@ fn tile_priority(tile_rect: Rect, visible_viewport: Rect) -> RenderPriority {
     if tile_rect.intersects(visible_viewport) {
         return RenderPriority::Visible;
     }
-    // Right/below is the usual forward reading direction for both continuous
-    // and zoomed single-page scrolling; left/above is retained as lower rank.
+    // 右/下は連続表示とズーム単一ページのどちらでも通常の読み進め方向であり、
+    // 左/上は低い順位として残す。
     if tile_rect.top() >= visible_viewport.bottom() || tile_rect.left() >= visible_viewport.right()
     {
         RenderPriority::NextViewport
@@ -4544,7 +4539,7 @@ fn tile_priority(tile_rect: Rect, visible_viewport: Rect) -> RenderPriority {
     }
 }
 
-/// Converts the viewport center into a page-relative coordinate for zoom restore.
+/// ビューポート中心をズーム復元用のページ相対座標へ変換する。
 fn normalized_page_point(page_rect: Rect, point: Pos2) -> Vec2 {
     Vec2::new(
         ((point.x - page_rect.left()) / page_rect.width()).clamp(0.0, 1.0),
@@ -4552,11 +4547,10 @@ fn normalized_page_point(page_rect: Rect, point: Pos2) -> Vec2 {
     )
 }
 
-/// Converts raw wheel events into bounded single-page navigation steps.
+/// 生のホイールイベントを、上限付きの単一ページ移動ステップへ変換する。
 ///
-/// The edge flags describe the scroll position before this frame's ScrollArea
-/// processing. This prevents the event that merely reaches an edge from also
-/// changing the page.
+/// 端フラグはこのフレームの ScrollArea 処理前のスクロール位置を表す。
+/// 端に到達しただけのイベントでページも変わることを防ぐ。
 fn single_page_wheel_steps(
     events: &[Event],
     pointer_over_view: bool,
@@ -4580,8 +4574,8 @@ fn single_page_wheel_steps(
             continue;
         };
 
-        // End and cancellation must release the latch even if the pointer left
-        // the PDF area before the backend delivered the final phase.
+        // バックエンドが最終フェーズを届ける前にポインターが PDF 領域を離れても、
+        // End とキャンセルではラッチを解放する必要がある。
         if matches!(phase, TouchPhase::End | TouchPhase::Cancel) {
             reset_wheel_gesture(state);
             continue;
@@ -4597,8 +4591,8 @@ fn single_page_wheel_steps(
         let direction = delta.y.signum();
         let reversed = state.direction != 0.0 && state.direction != direction;
         if reversed {
-            // Reversal is a deliberate new intent and must not inherit either
-            // the accumulated distance or the previous page latch.
+            // 反転は意図的な新しい操作であり、累積距離も前ページのラッチも
+            // 引き継いではならない。
             reset_wheel_gesture(state);
         }
         state.direction = direction;
@@ -4614,8 +4608,8 @@ fn single_page_wheel_steps(
 
         match unit {
             MouseWheelUnit::Line | MouseWheelUnit::Page => {
-                // A raw discrete event represents one physical wheel action;
-                // its platform-specific numeric magnitude must not multiply pages.
+                // 生の離散イベントは 1 回の物理ホイール操作を表すため、プラットフォーム固有の
+                // 数値の大きさでページ数を増やしてはならない。
                 state.accumulated_points = 0.0;
                 state.latched = false;
                 page_steps += page_delta;
@@ -4637,8 +4631,8 @@ fn single_page_wheel_steps(
     if page_fits_vertically {
         page_steps
     } else {
-        // After one edge transition the adjacent enlarged page begins at the
-        // opposite edge, which cannot be evaluated until the following frame.
+        // 1 回の端遷移後、拡大された隣接ページは反対側の端から始まるため、
+        // 次のフレームまで評価できない。
         page_steps.signum()
     }
 }
@@ -4668,7 +4662,7 @@ struct AutoscrollOffsets {
     maximum: Vec2,
 }
 
-/// Starts, advances, or stops browser-style autoscroll for one PDF ScrollArea.
+/// 1 つの PDF ScrollArea のブラウザ風 autoscroll を開始・更新・停止する。
 fn update_autoscroll(
     context: &egui::Context,
     view: &mut ViewState,
@@ -4705,9 +4699,8 @@ fn update_autoscroll(
     } else if middle_clicked
         && !primary_interaction_in_progress
         && pointer.is_some_and(|position| {
-            // Foreground windows and the annotation editor may overlap the
-            // central rect. Only the central layer's unexcluded area owns the
-            // middle-click start.
+            // 前面ウィンドウや注釈エディターが中央矩形に重なることがある。
+            // 中央レイヤーの除外されていない領域だけが中クリック開始を所有する。
             view_rect.contains(position)
                 && excluded_rects.iter().all(|rect| !rect.contains(position))
                 && context.layer_id_at(position) == Some(view_layer)
@@ -4739,8 +4732,8 @@ fn autoscroll_velocity(anchor: Pos2, pointer: Pos2) -> Vec2 {
         return Vec2::ZERO;
     }
 
-    // Radial scaling keeps diagonal movement directionally stable, unlike
-    // independent per-axis clipping which would skew near the speed ceiling.
+    // 放射方向のスケーリングは、速度上限付近で軸ごとに独立してクリップして方向が
+    // ずれる場合と異なり、斜め移動の方向を安定させる。
     let requested_speed = (distance - AUTOSCROLL_DEAD_ZONE_POINTS) * AUTOSCROLL_SPEED_PER_POINT;
     let speed = requested_speed.min(AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND);
     displacement / distance * speed
@@ -4762,11 +4755,10 @@ fn pointer_over_any_rect(context: &egui::Context, rects: &[Rect]) -> bool {
     })
 }
 
-/// Produces the exact persistent ID that `ScrollArea::id_salt` stores.
+/// `ScrollArea::id_salt` が保存する永続 ID を正確に生成する。
 fn scroll_area_state_id(ui: &egui::Ui, id_salt: impl egui::AsIdSalt) -> Id {
-    // ScrollArea hashes its caller salt into IdSalt before combining it with
-    // the parent. Passing the raw tuple directly to make_persistent_id hashes
-    // a different value and reads a permanently empty scroll state.
+    // ScrollArea は呼び出し側のソルトを IdSalt にハッシュしてから親と結合する。
+    // 生のタプルを make_persistent_id に直接渡すと別の値になり、常に空のスクロール状態を読む。
     ui.make_persistent_id(egui::IdSalt::new(id_salt))
 }
 
@@ -4782,7 +4774,7 @@ fn paint_autoscroll_marker(ui: &egui::Ui, view_rect: Rect, anchor: Pos2) {
     painter.circle_filled(anchor, 2.0, stroke.color);
 }
 
-/// Builds the same centered ScrollArea coordinates for current and prefetched pages.
+/// 現在ページと先読みページで同じ中央揃えの ScrollArea 座標を構築する。
 fn single_page_geometry(
     bounds: crate::domain::document::PageRect,
     zoom: f32,
@@ -4819,8 +4811,8 @@ fn single_page_centered_offset(
     )
 }
 
-/// Selects one cached raster identity nearest to the current zoom while keeping
-/// document, page, revision, and rotation exact.
+/// 文書、ページ、revision、回転を正確に保ったまま、現在のズームに最も近い
+/// キャッシュ済みラスターの同一性を 1 つ選ぶ。
 fn closest_provisional_tile_keys(
     keys: impl Iterator<Item = TileCacheKey>,
     document_id: u64,
@@ -4849,8 +4841,8 @@ fn closest_provisional_tile_keys(
             let right_zoom = f32::from_bits(right.0);
             let left_density = f32::from_bits(left.1);
             let right_density = f32::from_bits(right.1);
-            // Log ratios make half/double scales equally distant. Zoom is the
-            // primary match; density breaks ties because logical mapping is safe.
+            // 対数比により半分と 2 倍の倍率を等距離にする。ズームを主に一致させ、
+            // 論理対応が安全なため密度で同率を決める。
             let left_zoom_distance = (left_zoom / current_zoom).ln().abs();
             let right_zoom_distance = (right_zoom / current_zoom).ln().abs();
             let left_density_distance = (left_density / current_pixels_per_point).ln().abs();
@@ -4921,8 +4913,8 @@ fn paint_page_tiles(
     for key in provisional_keys {
         let retained = gpu_lru.get(&key).is_some();
         if retained && let Some(cached) = tab.tiles.get(&key) {
-            // PageViewport maps device pixels through normalized page space, so
-            // an older DPI is safe here and is replaced by exact tiles below.
+            // PageViewport は正規化ページ空間を介してデバイスピクセルを対応付けるため、
+            // ここでは古い DPI でも安全で、下で正確なタイルに置き換えられる。
             PageViewport::paint_tile(ui, screen_rect, &cached.texture, &cached.tile);
             provisional_painted = true;
         }
@@ -4947,8 +4939,8 @@ fn paint_page_tiles(
             #[cfg(debug_assertions)]
             if tab.visible_tiles.contains(&key) {
                 exact_visible_painted_count += 1;
-                // Once a prefetched tile has served its transition, a later
-                // revisit is an ordinary cache hit rather than another prefetch use.
+                // 先読みタイルが遷移に使われた後の再訪は、別の先読み利用ではなく
+                // 通常のキャッシュヒットとして扱う。
                 if let Some(cached) = tab.tiles.get_mut(&key) {
                     cached.was_prefetched = false;
                 }
@@ -5091,8 +5083,8 @@ impl DocumentTab {
     }
 
     fn mark_worker_disconnected(&mut self) {
-        // No completion event can arrive after channel disconnection. Clear
-        // every response-waiting flag so close and recovery actions remain usable.
+        // チャネル切断後に完了イベントは届かない。応答待ちのフラグをすべて解除し、
+        // クローズと復旧操作を利用可能にする。
         self.cancel_highlight_index_work();
         self.pending_edits = 0;
         self.pending_annotation_pages.clear();
@@ -5109,8 +5101,8 @@ impl DocumentTab {
     }
 
     fn is_suspendable(&self) -> bool {
-        // Dropping a printing tab would also drop its completion receiver and
-        // leave the UI permanently believing the print job is still active.
+        // 印刷中のタブを破棄すると完了受信器も失われ、UI が印刷処理中だと永久に
+        // 誤認するためである。
         self.state == DocumentState::ReadyClean
             && !self.has_unsaved_changes()
             && !self.is_printing()
@@ -5142,8 +5134,8 @@ impl DocumentTab {
         self.service = Some(DocumentService::resume(path, expected_version));
         self.state = DocumentState::Opening;
         self.invalidate_rendering();
-        // A resumed worker starts with generation zero; install the retained
-        // tab token before any cached index continuation reaches its queue.
+        // 再開したワーカーは generation 0 で開始する。キャッシュ済みインデックスの継続が
+        // キューに届く前に、保持していたタブのトークンを設定する。
         self.reconnect_highlight_index();
     }
 
@@ -5172,8 +5164,8 @@ impl DocumentTab {
 
     fn set_display_mode(&mut self, mode: DisplayMode) {
         if self.view.switch_display_mode(mode) {
-            // Display modes use different ScrollArea coordinate systems, so an
-            // anchor from the old mode cannot be resumed safely.
+            // 表示モードごとに ScrollArea の座標系が異なるため、古いモードのアンカーを
+            // 安全に再開できない。
             self.view.stop_autoscroll();
             self.invalidate_rendering();
         }
@@ -5210,8 +5202,8 @@ impl DocumentTab {
         }
         match self.view.display_mode {
             DisplayMode::Continuous => {
-                // Page-top scrolling would hide lower-page hits. Reuse the
-                // pending center-anchor path so the complete hit stays visible.
+                // ページ上端へのスクロールではページ下部のヒットが隠れる。保留中の中央
+                // アンカー経路を再利用し、ヒット全体を表示したままにする。
                 self.view.scroll_to_page = None;
                 self.view.restore_anchor = Some(anchor);
             }
@@ -5223,8 +5215,8 @@ impl DocumentTab {
         }
     }
 
-    /// Applies bounds checking and shared page-input state before a caller sets
-    /// the display-mode-specific restore position.
+    /// 範囲を確認し共有ページ入力状態を更新してから、呼び出し側が表示モード固有の
+    /// 復元位置を設定できるようにする。
     fn set_page_index(&mut self, page_index: usize) -> bool {
         let page_count = self.info.as_ref().map_or(0, |info| info.page_bounds.len());
         if page_index >= page_count {
@@ -5311,7 +5303,7 @@ impl DocumentTab {
         self.wanted_annotation_pages.clear();
     }
 
-    /// Starts the tab-local Highlight scan only after its sidebar is first shown.
+    /// サイドバーが初めて表示された後に、そのタブの Highlight スキャンを開始する。
     fn start_highlight_index(&mut self) {
         if !self.highlight_index.started {
             let Some(info) = &self.info else {
@@ -5331,7 +5323,7 @@ impl DocumentTab {
         self.queue_next_highlight_index_batch();
     }
 
-    /// Cancels all old batches and rebuilds the index after xrefs may have changed.
+    /// xref が変化した可能性があるとき、古いバッチをすべて取り消してインデックスを再構築する。
     fn reset_highlight_index(&mut self, revision: u64, total_pages: usize) {
         if !self.highlight_index.started {
             return;
@@ -5349,7 +5341,7 @@ impl DocumentTab {
         self.queue_next_highlight_index_batch();
     }
 
-    /// Refreshes one edited page while preserving completed pages from the same document.
+    /// 同じ文書の完了済みページを保持しつつ、編集された 1 ページを更新する。
     fn refresh_highlight_index_page(
         &mut self,
         page_index: usize,
@@ -5479,9 +5471,8 @@ impl DocumentTab {
             .retain(|request| wanted.contains(request));
         self.wanted_annotation_pages = wanted;
 
-        // A failed visible page stays blocked until it leaves and re-enters the
-        // wanted set. Pending stale pages are harmless because revision checks
-        // reject their eventual worker responses.
+        // 表示中に失敗したページは要求対象集合から離れて再び入るまでブロックする。
+        // 保留中の古いページは revision 確認でワーカー応答を拒否するため無害である。
         let requests = self
             .wanted_annotation_pages
             .iter()
@@ -5546,8 +5537,8 @@ impl DocumentTab {
             if self.tiles.contains_key(&key) {
                 continue;
             }
-            // A lower enum rank is a stronger priority. Requeue only when the
-            // same tile has moved into a more urgent viewport class.
+            // enum の小さい順位ほど優先度が高い。同じタイルがより緊急なビューポート
+            // クラスへ移った場合だけ再キューする。
             if let Some(pending) = self.pending_tiles.get(&key)
                 && request.priority >= pending.priority
             {
@@ -5571,16 +5562,16 @@ impl DocumentTab {
     }
 
     fn clear_selection(&mut self) {
-        // Advancing the generation prevents a worker result from an earlier
-        // drag from restoring a selection after this explicit click-clear.
+        // generation を進め、以前のドラッグに対するワーカー結果が明示的なクリック消去後に
+        // 選択を復元するのを防ぐ。
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.selection = None;
     }
 }
 
 impl ViewState {
-    /// Records the effective display density and reports whether existing
-    /// render requests use device-pixel coordinates from an older density.
+    /// 有効な表示密度を記録し、既存の描画要求が古い密度のデバイスピクセル座標を
+    /// 使っているかを報告する。
     fn update_render_density(&mut self, pixels_per_point: f32) -> bool {
         let current_bits = pixels_per_point.to_bits();
         let changed = self
@@ -5653,8 +5644,8 @@ impl ViewState {
     fn to_session(&self) -> SessionView {
         let (page_index, page_x, page_y) = match self.display_mode {
             DisplayMode::Continuous => {
-                // A queued page jump has not updated the scroll area's center
-                // yet, so it must supersede the previous frame's anchor.
+                // キューされたページ移動はまだスクロール領域の中心を更新していないため、
+                // 前フレームのアンカーより優先する必要がある。
                 let anchor = self
                     .scroll_to_page
                     .map(|page_index| PageAnchor {
@@ -5709,13 +5700,13 @@ impl ViewState {
             .into_iter()
             .flatten()
         {
-            // Session positions are captured before the next open knows the
-            // page count; a shorter replacement PDF must stay in bounds.
+            // セッション位置は次のオープンがページ数を知る前に取得されるため、
+            // より短い置換 PDF でも範囲内に収める。
             anchor.page_index = anchor.page_index.min(last_page);
         }
     }
 
-    /// Transfers the centered PDF coordinate between the two display modes.
+    /// 2 つの表示モード間で PDF の中央座標を引き継ぐ。
     fn switch_display_mode(&mut self, mode: DisplayMode) -> bool {
         if self.display_mode == mode {
             return false;
@@ -5748,9 +5739,9 @@ impl ViewState {
             _ => unreachable!("LunaPDF has exactly two display modes"),
         }
         self.display_mode = mode;
-        // Both pointer-scroll modes store offsets in the current ScrollArea's
-        // coordinate system. A mode switch must discard the anchor and any
-        // pending two-axis movement before the other layout is shown.
+        // どちらのポインタースクロールモードも現在の ScrollArea の座標系でオフセットを
+        // 保存する。モード切り替え時は別レイアウトを表示する前にアンカーと保留中の
+        // 2 軸移動を破棄しなければならない。
         self.autoscroll = None;
         self.pan_requested_offset = None;
         true
@@ -5796,8 +5787,8 @@ impl RenderPerformance {
                 .map_or(0, |measurement| measurement.discarded_intermediate_requests)
                 .saturating_add(canceled_requests)
         } else {
-            // Requests for the stable old zoom are not "intermediate" work;
-            // only a later input in this same gesture makes the prior target stale.
+            // 安定した古いズームへの要求は「中間」処理ではない。同じジェスチャーの後続入力が
+            // あった場合だけ、以前の対象が古くなる。
             0
         };
         self.zoom = Some(ZoomPerformance {
@@ -5855,15 +5846,15 @@ impl RenderPerformance {
 impl eframe::App for PrototypeApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         if !context.input(|input| input.focused) {
-            // Native focus loss may omit a matching button-release event.
+            // ネイティブのフォーカス喪失では対応するボタン解放イベントが省略されることがある。
             self.stop_active_autoscroll();
             self.viewport.cancel_primary_interaction();
             self.copy_shortcut_active = false;
         }
         let modal_open = self.close_confirmation.is_some() || self.session_close_failure.is_some();
         if modal_open {
-            // A modal owns pointer intent until it closes; retaining a background
-            // autoscroll anchor would move the document under the dialog.
+            // モーダルが閉じるまでポインターの意図を所有する。背景の autoscroll アンカーを
+            // 保持するとダイアログの下で文書が動いてしまう。
             self.stop_active_autoscroll();
         }
         self.receive_document_events(context);
@@ -5889,7 +5880,7 @@ impl eframe::App for PrototypeApp {
     }
 }
 
-/// Picks the longest-unused fully suspendable document and skips the active tab.
+/// 最も長く未使用で完全にサスペンド可能な文書を選び、アクティブタブは除外する。
 fn oldest_suspendable_index(
     active_index: Option<usize>,
     candidates: &[(bool, u64)],
@@ -5902,10 +5893,10 @@ fn oldest_suspendable_index(
         .map(|(index, _)| index)
 }
 
-/// Converts internal worker operation tags into actionable release-UI messages.
+/// 内部ワーカー操作タグを、リリース UI で案内できるメッセージへ変換する。
 fn document_failure_message(operation: &str, detail: &str) -> String {
-    // Backend detail is retained for diagnosis, but the leading summary always
-    // explains in Japanese what failed and what the user can do next.
+    // バックエンドの詳細は診断用に保持するが、先頭の要約では失敗内容とユーザーが
+    // 次にできることを常に日本語で説明する。
     let guidance = match operation {
         "open" => "PDFを開けませんでした。ファイルが破損していないか確認してください。",
         "resume" | "document-info" => {
@@ -5938,7 +5929,7 @@ fn document_save_blocks_close(save_in_flight: bool) -> bool {
     save_in_flight
 }
 
-/// A dirty Highlight event can precede the completion of an already queued Save.
+/// `dirty` な Highlight イベントが、すでにキューされた Save の完了に先行することがある。
 fn state_after_document_info(current: DocumentState, dirty: bool) -> DocumentState {
     if dirty && current == DocumentState::Saving {
         DocumentState::Saving
@@ -5991,8 +5982,8 @@ fn next_search_match(
     if let Some(position) =
         selected.and_then(|cursor| matches.iter().position(|candidate| *candidate == cursor))
     {
-        // The selected logical hit is stable while later page results arrive;
-        // wrapping is based on its new ordered position, not a stale flat index.
+        // 後続ページの結果が届いても選択した論理ヒットは安定している。折り返しは
+        // 古い平坦インデックスではなく、新しい並び順の位置に基づく。
         let next = if forward {
             (position + 1) % matches.len()
         } else {
@@ -6071,8 +6062,8 @@ fn search_match_anchor(
                     y1.max(bounds.3),
                 )
             });
-    // Center the union of all line Quads so a multi-line hit is navigated as
-    // one result. Clamping contains minor PDF coordinate rounding at page edges.
+    // 全行の Quad の和集合を中央に置き、複数行のヒットを 1 つの結果として移動する。
+    // クランプでページ端の PDF 座標の小さな丸め誤差を収める。
     let x = (((x0 + x1) / 2.0 - page_bounds.x0) / page_bounds.width()).clamp(0.0, 1.0);
     let y = (((y0 + y1) / 2.0 - page_bounds.y0) / page_bounds.height()).clamp(0.0, 1.0);
     (x.is_finite() && y.is_finite()).then_some(PageAnchor {
@@ -6098,8 +6089,8 @@ fn text_snapshot_result_is_current(
     page_count: usize,
     wanted: &HashSet<TextSnapshotKey>,
 ) -> bool {
-    // An extraction may finish after a scroll, tab switch, or annotation
-    // mutation. Only the exact visible document state may affect UI or errors.
+    // スクロール、タブ切り替え、注釈変更の後に抽出が完了することがある。UI やエラーに
+    // 影響できるのは完全に一致する表示中の文書状態だけである。
     is_active
         && current_revision == Some(key.revision)
         && key.page_index < page_count
@@ -6112,9 +6103,8 @@ fn annotation_page_result_is_current(
     current_revision: Option<u64>,
     wanted: &HashSet<AnnotationPageRequest>,
 ) -> bool {
-    // Annotation xrefs are document-local mutable identities. A result from an
-    // inactive tab, old revision, or no-longer-visible page must not become an
-    // edit target in the current UI.
+    // 注釈 xref は文書内で可変な同一性である。非アクティブタブ、古い revision、表示外の
+    // ページからの結果を現在の UI の編集対象にしてはならない。
     is_active && current_revision == Some(request.expected_revision) && wanted.contains(&request)
 }
 
@@ -6129,8 +6119,7 @@ fn retain_visible_text_failures(
             .as_ref()
             .is_some_and(|message| message.starts_with("text snapshot:"))
     {
-        // A page-local extraction error must not remain attached to the tab
-        // after that page leaves the visible selection scope.
+        // ページが表示選択範囲を離れた後まで、ページ固有の抽出エラーをタブに残してはならない。
         *error = None;
     }
 }
@@ -6140,16 +6129,16 @@ fn mark_thumbnail_failed(
     failed: &mut HashSet<ThumbnailCacheKey>,
     key: ThumbnailCacheKey,
 ) {
-    // A failed key stays blocked until the user explicitly retries it. Other
-    // pending pages remain intact because their worker commands are still valid.
+    // 失敗したキーはユーザーが明示的に再試行するまでブロックする。他の保留ページは
+    // ワーカーコマンドが有効なのでそのまま保持する。
     pending.remove(&key);
     failed.insert(key);
 }
 
-/// Accepts a raster only when it still belongs to the visible document state.
+/// 表示中の文書状態に属しているラスターだけを受け入れる。
 ///
-/// The worker cannot cancel an in-progress MuPDF render, so all four identity
-/// dimensions are checked before the result allocates a GPU texture.
+/// ワーカーは進行中の MuPDF 描画をキャンセルできないため、結果が GPU テクスチャを
+/// 割り当てる前に 4 つの同一性要素をすべて確認する。
 fn tile_result_is_current(
     is_active: bool,
     key: TileCacheKey,
@@ -6164,10 +6153,10 @@ fn tile_result_is_current(
         && wanted_tiles.contains(&key)
 }
 
-/// Copies validated RGBA pixels into egui and releases the worker transfer allocation.
+/// 検証済み RGBA ピクセルを egui にコピーし、ワーカー転送用の割り当てを解放する。
 fn take_rgba_image(pixels_rgba: &mut Vec<u8>, size: [usize; 2]) -> egui::ColorImage {
-    // `Vec::clear` would retain up to the complete GPU/thumbnail cache budget
-    // on the CPU. Moving the allocation out makes it drop after egui copies it.
+    // `Vec::clear` では GPU/サムネイルキャッシュ予算全体まで CPU 上に保持し続ける。
+    // 割り当てを移動して取り出し、egui のコピー後に破棄できるようにする。
     let transferred_pixels = std::mem::take(pixels_rgba);
     egui::ColorImage::from_rgba_unmultiplied(size, &transferred_pixels)
 }
@@ -6176,7 +6165,7 @@ fn search_query_id(document_id: u64) -> Id {
     Id::new(("pdf-search-query", document_id))
 }
 
-/// Converts a one-based user page number to the existing zero-based page index.
+/// 1 始まりのユーザーページ番号を既存の 0 始まりページインデックスへ変換する。
 fn page_index_from_input(input: &str, page_count: usize) -> Option<usize> {
     let page_number = input.trim().parse::<usize>().ok()?;
     if page_number > page_count {
@@ -6193,10 +6182,10 @@ fn page_number_input_columns(page_count: usize) -> usize {
         .max(PAGE_INPUT_MINIMUM_COLUMNS)
 }
 
-/// Builds a toolbar single-line editor whose galley is centered in its fixed-height clip rect.
+/// 固定高さのクリップ矩形内で `Galley` を中央揃えにするツールバー用 1 行エディターを構築する。
 ///
-/// The font tweak shifts glyphs inside the galley; this alignment only positions
-/// that galley inside TextEdit, so it does not add another fixed glyph offset.
+/// フォント調整は `Galley` 内の字形を移動する。この整列は TextEdit 内の `Galley` の位置だけを
+/// 決めるため、固定字形オフセットを別途加えない。
 fn toolbar_singleline_text_edit(text: &mut dyn egui::TextBuffer) -> egui::TextEdit<'_> {
     egui::TextEdit::singleline(text).vertical_align(egui::Align::Center)
 }
@@ -6220,8 +6209,8 @@ fn page_number_id(document_id: u64) -> Id {
 
 fn consume_highlight_shortcut(context: &egui::Context, active_text_input: Option<Id>) -> bool {
     if active_text_input.is_some() {
-        // A bare `h` belongs to the focused editor. Consuming it here
-        // would both drop the character and create an unrelated annotation.
+        // 単独の `h` はフォーカス中のエディターに属する。ここで消費すると文字を落とし、
+        // 無関係な注釈まで作ってしまう。
         return false;
     }
     context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::H))
@@ -6233,7 +6222,7 @@ fn text_edit_has_selection(context: &egui::Context, id: Id) -> bool {
         .is_some_and(|range| !range.is_empty())
 }
 
-/// Consumes a platform copy event only when PDF selection owns the command.
+/// PDF の選択がコマンドを所有するときだけ、プラットフォームのコピーイベントを消費する。
 fn consume_pdf_copy_event(
     context: &egui::Context,
     shortcut_active: &mut bool,
@@ -6249,8 +6238,8 @@ fn consume_pdf_copy_event(
                     let first_copy_event = !*shortcut_active;
                     *shortcut_active = true;
                     if text_input_owns_copy {
-                        // TextEdit must retain Event::Copy so its own selected range reaches
-                        // the platform clipboard before PDF selection is considered.
+                        // PDF 選択を検討する前に TextEdit 自身の選択範囲がプラットフォームの
+                        // クリップボードへ届くよう、TextEdit 用の Event::Copy は保持する。
                         retained_events.push(Event::Copy);
                     } else if first_copy_event && pdf_selection_available {
                         copy_pdf_selection = true;
@@ -6261,8 +6250,8 @@ fn consume_pdf_copy_event(
                     pressed: false,
                     ..
                 } => {
-                    // egui-winit also maps Ctrl+Insert and the dedicated Copy key
-                    // to Event::Copy, so their releases must rearm the same latch.
+                    // egui-winit は Ctrl+Insert と専用 Copy キーも Event::Copy に変換するため、
+                    // それらの解放で同じラッチを再有効化する。
                     *shortcut_active = false;
                     retained_events.push(event);
                 }

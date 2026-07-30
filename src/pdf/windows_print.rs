@@ -19,8 +19,8 @@ use crate::domain::document::{RenderPriority, TileRequest, TileSpec};
 use crate::pdf::mupdf_backend::MuPdfBackend;
 use crate::pdf::print_layout::PrintLayout;
 
-// Both MuPDF's RGBA transfer and GDI's DIB view stay bounded to eight MiB,
-// regardless of page count or printer resolution.
+// MuPDF の RGBA 転送と GDI の DIB ビューはいずれも、ページ数やプリンター解像度に
+// かかわらず 8 MiB 以内に収まる。
 const PRINT_STRIP_BUDGET_BYTES: usize = 8 * 1_024 * 1_024;
 
 pub(super) enum PrintOutcome {
@@ -28,7 +28,7 @@ pub(super) enum PrintOutcome {
     Cancelled,
 }
 
-/// Shows the native dialog and prints the in-memory annotated document to its DC.
+/// ネイティブダイアログを表示し、メモリ上の注釈付きドキュメントをその DC に印刷する。
 pub(super) fn print_document(backend: &mut MuPdfBackend) -> Result<PrintOutcome> {
     let info = backend.info()?;
     let page_count = info.page_bounds.len();
@@ -69,8 +69,8 @@ pub(super) fn print_document(backend: &mut MuPdfBackend) -> Result<PrintOutcome>
         &info.page_bounds,
     );
     if let Err(error) = result {
-        // Once StartDoc succeeds, AbortDoc is the only valid way to discard a
-        // partially submitted job; leaving it open can stall the spooler.
+        // StartDoc が成功した後、部分的に送信されたジョブを破棄する有効な方法は
+        // AbortDoc だけである。開いたままにするとスプーラーが停止するおそれがある。
         unsafe {
             AbortDoc(selection.dc.0);
         }
@@ -151,8 +151,8 @@ fn print_selected_pages(
                     SRCCOPY,
                 )
             };
-            // GDI reports either zero or GDI_ERROR depending on the printer
-            // driver failure path, so both values must reject the strip.
+            // GDI はプリンタードライバーの失敗経路によって 0 または GDI_ERROR を返す
+            // ため、どちらの値でも帯を拒否しなければならない。
             ensure!(
                 copied != 0 && copied != GDI_ERROR as i32,
                 "Windows printer rejected a page bitmap strip"
@@ -173,7 +173,7 @@ fn bitmap_info(pixel_width: u32, pixel_height: u32) -> Result<BITMAPINFO> {
         bmiHeader: BITMAPINFOHEADER {
             biSize: u32::try_from(size_of::<BITMAPINFOHEADER>())?,
             biWidth: i32::try_from(pixel_width)?,
-            // A negative DIB height tells GDI the MuPDF rows are top-down.
+            // DIB の高さを負にすると、MuPDF の行が上から下の順であることを GDI に伝えられる。
             biHeight: -i32::try_from(pixel_height)?,
             biPlanes: 1,
             biBitCount: 32,
@@ -247,8 +247,8 @@ fn selected_page_range(
     }
     let first = usize::from(from_page);
     let last = usize::from(to_page);
-    // Treat the native dialog result as an external boundary: an invalid range
-    // must not be converted into an out-of-bounds MuPDF page request.
+    // ネイティブダイアログの結果は外部境界として扱う。無効な範囲を範囲外の
+    // MuPDF ページ要求へ変換してはならない。
     ensure!(
         first >= 1 && first <= last && last <= page_count,
         "Windows print dialog returned an invalid page range"

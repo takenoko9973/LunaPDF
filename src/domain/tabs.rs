@@ -7,7 +7,7 @@ pub(crate) struct Tab {
 }
 
 impl Tab {
-    /// Returns the canonical path represented by this tab.
+    /// このタブが表す正規パスを返す。
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -26,25 +26,25 @@ pub(crate) enum OpenTabResult {
 }
 
 impl TabState {
-    /// Creates an empty tab state with no selected tab.
+    /// 選択タブのない空のタブ状態を作成する。
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Returns the tabs in display order.
+    /// 表示順のタブを返す。
     pub(crate) fn tabs(&self) -> &[Tab] {
         &self.tabs
     }
 
-    /// Returns the selected tab index, or `None` when no tabs are open.
+    /// 選択中のタブインデックスを返す。タブが開かれていない場合は`None`を返す。
     pub(crate) fn selected_index(&self) -> Option<usize> {
         self.selected
     }
 
-    /// Canonicalizes an existing PDF path and opens or selects its tab.
+    /// 既存PDFのパスを正規化し、そのタブを開くか選択する。
     ///
-    /// The filesystem canonicalization error is returned unchanged, so a path
-    /// that does not exist is not silently converted into another tab identity.
+    /// ファイルシステムの正規化エラーは変更せず返すため、存在しないパスを別のタブ識別子へ
+    /// 暗黙に変換しない。
     pub(crate) fn open(&mut self, path: impl AsRef<Path>) -> io::Result<OpenTabResult> {
         let canonical_path = std::fs::canonicalize(path)?;
 
@@ -61,7 +61,7 @@ impl TabState {
         Ok(OpenTabResult::Opened(index))
     }
 
-    /// Selects an open tab by index and reports whether the index was valid.
+    /// インデックスで開いているタブを選択し、そのインデックスが有効かどうかを報告する。
     pub(crate) fn select(&mut self, index: usize) -> bool {
         if index >= self.tabs.len() {
             return false;
@@ -70,7 +70,7 @@ impl TabState {
         true
     }
 
-    /// Closes a tab by index and returns it, keeping the selected index valid.
+    /// インデックスでタブを閉じ、選択インデックスを有効に保ったまま閉じたタブを返す。
     pub(crate) fn close(&mut self, index: usize) -> Option<Tab> {
         if index >= self.tabs.len() {
             return None;

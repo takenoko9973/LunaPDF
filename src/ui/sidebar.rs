@@ -7,9 +7,9 @@ use crate::domain::document::OutlineItem;
 use crate::ui::annotation_editor::paint_color_swatch;
 
 const COMMENT_HEAD_CHARACTERS: usize = 48;
-// 18pt swatch plus 5pt vertical breathing room keeps the row readable and clickable.
+// 18pt のスウォッチに5ptの垂直余白を加えると、行が読みやすくクリックしやすい。
 const HIGHLIGHT_ROW_HEIGHT: f32 = 28.0;
-// Four points preserve a visible hover gutter without shrinking the gesture row.
+// 4pt の余白なら、ジェスチャー行を狭めずにホバー用の余白を見える形で残せる。
 const HIGHLIGHT_ROW_HORIZONTAL_PADDING: f32 = 4.0;
 const HIGHLIGHT_ROW_SWATCH_SIZE: f32 = 18.0;
 
@@ -35,7 +35,7 @@ enum HighlightRowGesture {
     DeleteMenu,
 }
 
-/// Draws the Rust-owned outline hierarchy and returns a selected page target.
+/// Rust 側が所有するアウトライン階層を描画し、選択されたページの対象を返す。
 pub(crate) fn show_outline(ui: &mut Ui, items: &[OutlineItem]) -> Option<usize> {
     show_outline_level(ui, items, Id::new("pdf-outline-root"))
 }
@@ -71,7 +71,7 @@ fn outline_label(ui: &mut Ui, item: &OutlineItem) -> egui::Response {
     )
 }
 
-/// Draws progressively indexed Highlights without retaining a selected row.
+/// インデックス順のハイライトを描画し、選択された行を保持しない。
 pub(crate) fn show_highlights(
     ui: &mut Ui,
     pages: &BTreeMap<usize, Vec<AnnotationSummary>>,
@@ -108,8 +108,8 @@ pub(crate) fn show_highlights(
                         );
                     }
                     let row_label = paint_highlight_row(ui, row_rect, *page_index, summary);
-                    // Painter content has no child Response, so attach its meaning
-                    // to the one row Response used by every pointer gesture.
+                    // Painter の内容には子 Response がないため、すべてのポインタ操作で使う
+                    // 行の Response 1つに意味を付与する。
                     row.widget_info(|| {
                         WidgetInfo::labeled(WidgetType::Button, true, row_label.clone())
                     });
@@ -182,8 +182,8 @@ fn paint_highlight_row(
     );
     layout_job.wrap = egui::epaint::text::TextWrapping::truncate_at_width(text_rect.width());
     let galley = ui.fonts_mut(|fonts| fonts.layout_job(layout_job));
-    // Painter-owned text keeps the row Response authoritative while the
-    // galley box, rather than a fixed baseline offset, determines vertical centering.
+    // Painter が所有するテキストにより行の Response を正とし、固定ベースラインの
+    // オフセットではなく `Galley` の矩形で垂直方向の中央を決める。
     let text_position = egui::Pos2::new(
         text_rect.left(),
         text_rect.center().y - galley.size().y / 2.0,
@@ -210,7 +210,7 @@ fn highlight_row_content_rects(row_rect: Rect, item_spacing: f32) -> (Rect, Rect
     (swatch_rect, text_rect)
 }
 
-/// Maps one row gesture without letting read-only rows open a mutation path.
+/// 読み取り専用の行から変更経路を開かないように、1行のジェスチャーを対応付ける。
 fn highlight_row_action(
     gesture: HighlightRowGesture,
     summary: &AnnotationSummary,

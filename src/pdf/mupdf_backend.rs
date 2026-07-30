@@ -42,17 +42,17 @@ use crate::domain::selection::{
     TextPageSnapshot, TextSnapshotRequest, selected_display_quads, selected_quads, selected_text,
 };
 
-// PDF numeric objects can round coordinates while serializing an incremental
-// update. One hundredth of a PDF point is below display-pixel precision at the
-// supported zoom range while still detecting a materially different Quad.
+// PDF の数値オブジェクトは増分更新のシリアライズ時に座標を丸めることがある。
+// PDF ポイントの 100 分の 1 は対応するズーム範囲の表示ピクセル精度を下回りつつ、
+// 実質的に異なる Quad は検出できる。
 const PDF_COORDINATE_TOLERANCE: f32 = 0.01;
 
-// PDF writers can round normalized color and opacity numbers. One thousandth
-// is below an 8-bit channel step while still detecting a visible replacement.
+// PDF ライターは正規化した色と不透明度の数値を丸めることがある。1000 分の 1 は
+// 8 ビットチャネルの 1 段階を下回りつつ、目に見える置換は検出できる。
 const PDF_PROPERTY_TOLERANCE: f32 = 0.001;
 
-// 16,384 Quads bound one page snapshot near 512 KiB while covering dense
-// papers. Logical hit boundaries are preserved within that byte-oriented cap.
+// 16,384 個の Quad で 1 ページのスナップショットを約 512 KiB に制限しながら、
+// 高密度な文書を網羅する。このバイト指向の上限内では論理的なヒット境界を保持する。
 const SEARCH_QUAD_CAPACITY: usize = 16_384;
 
 pub(super) struct MuPdfBackend {
@@ -65,9 +65,9 @@ pub(super) struct MuPdfBackend {
     highlight_capability: HighlightCapability,
     pending_edits: Vec<PendingEdit>,
     display_list: Option<CachedDisplayList>,
-    // A recovery document opened from bytes has no safe association with the
-    // original path, so retries must use the full-rewrite path until a fresh
-    // path-backed document is installed after successful verification.
+    // バイト列から開いた復旧用ドキュメントは元のパスと安全に関連付けられないため、
+    // 検証に成功して新しいパス関連ドキュメントを設定するまでは、再試行にも全書き換えの
+    // 経路を使う。
     incremental_association_lost: bool,
 }
 
@@ -106,7 +106,7 @@ struct ExpectedAnnotationState {
 }
 
 impl MuPdfBackend {
-    /// Opens the PDF and reads lightweight page geometry on the owner worker.
+    /// PDF を開き、所有ワーカー上で軽量なページ形状を読み取る。
     pub(super) fn open(path: PathBuf) -> Result<Self> {
         let version_before_open = read_document_version(&path)?;
         let mupdf_path = path
@@ -147,9 +147,9 @@ impl MuPdfBackend {
             highlight_count: highlight_count(&self.document)?,
             can_save_incrementally: self.should_save_incrementally(),
             highlight_capability: self.highlight_capability,
-            // MuPDF keeps xref dirty bits after undo operations. Application
-            // dirty state follows the still-live edit log so a complete LIFO
-            // undo returns to a clean tab without trusting those stale bits.
+            // MuPDF は Undo 操作後も xref の `dirty` ビットを保持する。アプリケーションの
+            // `dirty` 状態は有効な編集ログに従わせ、LIFO で全て Undo したときに古いビットを
+            // 信頼せずクリーンなタブへ戻せるようにする。
             dirty: !self.pending_edits.is_empty(),
             revision: self.revision,
             open_time: self.open_time,
@@ -158,7 +158,7 @@ impl MuPdfBackend {
         })
     }
 
-    /// Returns a Rust-owned hierarchy with only validated internal page targets.
+    /// 検証済みの内部ページ対象だけを含む Rust 所有の階層を返す。
     pub(super) fn load_outline(&self) -> Result<Vec<OutlineItem>> {
         let outlines = self.document.outlines()?;
         Ok(outlines
@@ -167,7 +167,7 @@ impl MuPdfBackend {
             .collect())
     }
 
-    /// Searches one page so foreground rendering can run between page commands.
+    /// ページ単位で検索し、ページ処理の間にフォアグラウンド描画を実行できるようにする。
     pub(super) fn search_page(
         &mut self,
         page_index: usize,
@@ -196,8 +196,8 @@ impl MuPdfBackend {
                 return SearchHitResponse::AbortSearch;
             };
             if next_quad_count > SEARCH_QUAD_CAPACITY {
-                // Never split a multi-line hit at the memory boundary. A partial
-                // hit would make navigation and the painted result disagree.
+                // メモリ境界で複数行のヒットを分割しない。部分的なヒットにすると、ナビゲーションと
+                // 描画結果が一致しなくなる。
                 result.truncated = true;
                 return SearchHitResponse::AbortSearch;
             }
@@ -216,7 +216,7 @@ impl MuPdfBackend {
         })
     }
 
-    /// Renders a bounded whole-page image through the same annotated tile path.
+    /// 同じ注釈付きタイル経路を使って、上限付きのページ全体画像を描画する。
     pub(super) fn render_thumbnail(
         &mut self,
         request: ThumbnailRequest,
@@ -275,8 +275,8 @@ impl MuPdfBackend {
     }
 
     pub(super) fn render_tile(&mut self, request: TileRequest) -> Result<Option<RenderedTile>> {
-        // A non-finite or non-positive matrix produces meaningless dimensions
-        // in MuPDF, so invalid zoom state is rejected at the adapter boundary.
+        // 有限でない、または正でない行列は MuPDF で意味のない寸法を生むため、
+        // 無効なズーム状態はアダプター境界で拒否する。
         ensure!(
             request.scale.is_finite() && request.scale > 0.0,
             "render scale must be finite and positive"
@@ -286,8 +286,8 @@ impl MuPdfBackend {
             "tile dimensions must be positive"
         );
         page_number(request.page_index, self.page_bounds.len())?;
-        // A mutation can overtake queued prefetch work. Stale tiles are normal
-        // cancellation, not a document error that should be shown to the user.
+        // 変更がキュー済みの先読み処理を追い越すことがある。古いタイルは通常のキャンセルであり、
+        // ユーザーに表示すべきドキュメントエラーではない。
         if request.expected_revision != self.revision {
             return Ok(None);
         }
@@ -304,8 +304,8 @@ impl MuPdfBackend {
             .context("MuPDF returned a negative page pixel height")?;
         let clip = tile_clip(page_pixel_bounds, request.spec)?;
         let mut pixmap = Pixmap::new_with_rect(&Colorspace::device_rgb(), clip, false)?;
-        // MuPDF does not initialize a newly allocated pixmap. Opaque white is
-        // the PDF page background expected outside painted content.
+        // MuPDF は新しく割り当てた Pixmap を初期化しない。塗りつぶされた内容の外側で
+        // 想定される PDF ページ背景は不透明な白である。
         pixmap.clear_with(255)?;
         let device = Device::from_pixmap_with_clip(&pixmap, clip)?;
         let display_list = self.display_list(request.page_index)?;
@@ -372,13 +372,13 @@ impl MuPdfBackend {
             .list)
     }
 
-    /// Extracts a Rust-owned text snapshot for one currently visible page.
+    /// 現在表示中の 1 ページについて Rust 所有のテキストスナップショットを抽出する。
     pub(super) fn text_snapshot(
         &self,
         request: TextSnapshotRequest,
     ) -> Result<Option<TextPageSnapshot>> {
-        // Annotation mutations can overtake queued extraction. The UI keys
-        // snapshots by revision, so stale work is discarded before allocation.
+        // 注釈の変更がキュー済みの抽出処理を追い越すことがある。UI はリビジョンで
+        // スナップショットを識別するため、古い処理は割り当て前に破棄する。
         if request.expected_revision != self.revision {
             return Ok(None);
         }
@@ -392,7 +392,7 @@ impl MuPdfBackend {
         }))
     }
 
-    /// Reads one revision-bound page of editable annotation metadata.
+    /// リビジョンに束縛された 1 ページ分の編集可能な注釈メタデータを読み取る。
     pub(super) fn annotation_page(
         &self,
         request: AnnotationPageRequest,
@@ -434,10 +434,10 @@ impl MuPdfBackend {
         }))
     }
 
-    /// Reads a bounded, revision-bound batch for the persistent Highlight list.
+    /// 永続的な Highlight リスト用に、上限付きでリビジョンに束縛されたバッチを読み取る。
     ///
-    /// Geometry is deliberately omitted because sidebar rows never paint PDF
-    /// annotation quads. Keeping batches page-bounded limits cancellation delay.
+    /// サイドバーの行は PDF 注釈の Quad を描画しないため、形状は意図的に省略する。
+    /// バッチをページ単位に制限してキャンセル遅延を抑える。
     pub(super) fn highlight_index_batch(
         &self,
         request: HighlightIndexRequest,
@@ -497,9 +497,9 @@ impl MuPdfBackend {
     ) -> Result<SelectionSnapshot> {
         let (_text_page, glyphs, _non_text_targets, extraction_time) =
             load_text_snapshot(&self.document, page_index, self.page_bounds.len())?;
-        // The drag preview already resolves pointer positions to snapshot glyphs.
-        // Re-running MuPDF's point selection here excludes endpoint glyphs, so
-        // confirmed display, copy and Highlight all derive from that same range.
+        // ドラッグプレビューは既にポインター位置をスナップショットの字形へ解決している。
+        // ここで MuPDF の点選択を再実行すると端点の字形が除外されるため、確定表示、コピー、
+        // Highlight は全て同じ範囲から導出する。
         let selection_quads = selected_quads(&glyphs, start, end);
 
         Ok(SelectionSnapshot {
@@ -512,8 +512,8 @@ impl MuPdfBackend {
         })
     }
 
-    /// Creates one in-memory Highlight and returns the exact MuPDF identity
-    /// needed to undo this operation without inspecting coordinates or order.
+    /// メモリ上に 1 つの Highlight を作成し、座標や順序を調べずにこの操作を Undo するために
+    /// 必要な MuPDF の正確な識別子を返す。
     pub(super) fn create_highlight(
         &mut self,
         page_index: usize,
@@ -538,8 +538,8 @@ impl MuPdfBackend {
             blue: 0.0,
         })?;
         let annotation_xref = annotation.xref()?;
-        // PDF xrefs are positive indirect-object numbers; zero is not stable
-        // enough to identify an application-owned annotation for undo.
+        // PDF の xref は正の間接オブジェクト番号であり、0 ではアプリケーション所有の注釈を
+        // Undo 用に安定して識別できない。
         ensure!(
             annotation_xref > 0,
             "MuPDF returned an invalid xref for the created Highlight"
@@ -575,7 +575,7 @@ impl MuPdfBackend {
         Ok(action)
     }
 
-    /// Updates supported fields on one exact revision-bound annotation xref.
+    /// 正確なリビジョンに束縛された 1 つの注釈 xref の対応フィールドを更新する。
     pub(super) fn update_annotation(
         &mut self,
         request: AnnotationUpdateRequest,
@@ -631,7 +631,7 @@ impl MuPdfBackend {
         Ok(action)
     }
 
-    /// Deletes one exact revision-bound annotation while retaining an exact undo snapshot.
+    /// 正確なリビジョンに束縛された 1 つの注釈を削除し、正確な Undo スナップショットを保持する。
     pub(super) fn delete_annotation(
         &mut self,
         request: AnnotationDeleteRequest,
@@ -768,8 +768,8 @@ impl MuPdfBackend {
         let mut options = PdfWriteOptions::default();
         options
             .set_incremental(false)
-            // Undo bytes must retain the current security settings; the
-            // default writer option would remove encryption from the snapshot.
+            // Undo 用バイト列では現在のセキュリティ設定を保持する必要がある。ライターの
+            // デフォルトオプションではスナップショットから暗号化が除去される。
             .set_encryption(Encryption::Keep);
         self.document
             .write_to_with_options(&mut bytes, options)
@@ -788,8 +788,8 @@ impl MuPdfBackend {
         self.document = document;
         self.page_bounds = page_bounds;
         self.display_list = None;
-        // A memory-backed restored document cannot use MuPDF's path-associated
-        // incremental writer safely; the next save must use verified full rewrite.
+        // メモリを基盤とする復元済みドキュメントでは MuPDF のパス関連増分ライターを安全に
+        // 使用できないため、次の保存では検証済みの全書き換えを使う必要がある。
         self.incremental_association_lost = true;
         Ok(())
     }
@@ -807,11 +807,11 @@ impl MuPdfBackend {
         }
     }
 
-    /// Undoes only the latest unsaved application edit.
+    /// 保存されていないアプリケーション編集のうち、最新のものだけを Undo する。
     ///
-    /// Create is reversed by its exact xref. Update and delete restore a
-    /// pre-mutation PDF snapshot so external appearance streams and metadata
-    /// are not reconstructed from an incomplete application model.
+    /// Create は正確な xref で反転する。Update と delete は変更前の PDF スナップショットを
+    /// 復元し、不完全なアプリケーションモデルから外部の外観ストリームやメタデータを再構築
+    /// しない。
     pub(super) fn undo(&mut self, action: EditAction) -> Result<()> {
         let pending = self
             .pending_edits
@@ -837,12 +837,11 @@ impl MuPdfBackend {
         Ok(())
     }
 
-    /// Saves the in-memory PDF, choosing MuPDF's safe incremental path first.
+    /// メモリ上の PDF を保存し、まず MuPDF の安全な増分経路を選択する。
     ///
-    /// A document that needs a full rewrite is written to a same-directory
-    /// temporary PDF, verified there, and atomically replaced only after the
-    /// original version is checked again. This keeps a failed write from
-    /// truncating the user's only copy.
+    /// 全書き換えが必要なドキュメントは同じディレクトリの一時 PDF に書き込み、そこで検証する。
+    /// 元のバージョンを再確認した後にだけアトミック置換することで、書き込み失敗時にユーザーの
+    /// 唯一のコピーを切り詰めないようにする。
     pub(super) fn save(&mut self) -> Result<usize> {
         ensure_current_version(&self.path, self.version)?;
         if self.should_save_incrementally() {
@@ -866,8 +865,8 @@ impl MuPdfBackend {
         let mut options = PdfWriteOptions::default();
         options
             .set_incremental(true)
-            // Keep the original encryption settings instead of allowing the
-            // writer default to silently change a protected document.
+            // ライターのデフォルトで保護されたドキュメントが黙って変更されないよう、
+            // 元の暗号化設定を保持する。
             .set_encryption(Encryption::Keep);
         self.document
             .save_with_options(file_name, options)
@@ -914,8 +913,8 @@ impl MuPdfBackend {
         let mut options = PdfWriteOptions::default();
         options
             .set_incremental(false)
-            // The temp path already carries the source file permissions. Keep
-            // the PDF encryption too; the writer default would remove it.
+            // 一時パスには既に元ファイルの権限が設定されている。ライターのデフォルトでは
+            // PDF の暗号化が除去されるため、これも保持する。
             .set_encryption(Encryption::Keep);
 
         if let Err(error) = self
@@ -945,12 +944,11 @@ impl MuPdfBackend {
         }
         drop(temporary_document);
 
-        // MuPDF's path-backed document may retain an ordinary FILE* handle.
-        // On Windows that handle can deny the replacement even after Rust drops
-        // its wrapper, so build a handle-free recovery document from the
-        // verified bytes before releasing the original handle. The transient
-        // whole-file copy is limited to this rare path and preserves the user's
-        // in-memory edits if the atomic replacement itself fails.
+        // MuPDF のパス基盤ドキュメントは通常の FILE* ハンドルを保持することがある。
+        // Windows では Rust がラッパーを破棄した後もそのハンドルが置換を拒否する可能性があるため、
+        // 元のハンドルを解放する前に検証済みバイト列からハンドルを持たない復旧用ドキュメントを
+        // 作成する。この一時的な全ファイルコピーはまれな経路に限定され、アトミック置換自体が
+        // 失敗した場合もユーザーのメモリ上の編集を保持する。
         let temporary_bytes = match fs::read(&temp_path)
             .with_context(|| format!("failed to read verified temporary PDF: {temp_name}"))
         {
@@ -1034,11 +1032,10 @@ fn ensure_current_version(path: &Path, expected: DocumentVersion) -> Result<()> 
     Ok(())
 }
 
-/// Replaces the original only while it still matches the version opened by this worker.
+/// このワーカーが開いたバージョンと元ファイルが一致している間だけ置換する。
 ///
-/// The comparison cannot make the rename a filesystem compare-and-swap, but keeping it
-/// adjacent to `persist` minimizes the unavoidable race and centralizes cleanup on every
-/// pre-replacement failure.
+/// 比較によって `rename` をファイルシステムの比較交換にはできないが、`persist` の
+/// 直前に置くことで避けられない競合を最小化し、置換前の全ての失敗でクリーンアップを一元化する。
 fn persist_temp_if_current(
     temp_path: TempPath,
     destination: &Path,
@@ -1064,9 +1061,9 @@ fn preserve_temp_permissions(source: &Path, temp_path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn preserve_temp_permissions(_source: &Path, _temp_path: &Path) -> Result<()> {
-    // ReplaceFileW merges the original file's DACL, attributes, encryption,
-    // compression, and named streams. Pre-copying Rust's readonly bit would be
-    // incomplete and tempfile::keep must normalize the replacement first.
+    // ReplaceFileW は元ファイルの DACL、属性、暗号化、圧縮、名前付きストリームをマージする。
+    // Rust の読み取り専用ビットを事前コピーするだけでは不完全であり、まず tempfile::keep で
+    // 置換ファイルを正規化する必要がある。
     Ok(())
 }
 
@@ -1104,8 +1101,8 @@ fn replace_temp_file(temp_path: TempPath, destination: &Path) -> Result<()> {
         Ok(path) => path,
         Err(error) => return cleanup_kept_temp_after_error(&replacement, error),
     };
-    // Passing no IGNORE_* flag is deliberate: a merge failure must abort
-    // instead of silently replacing the PDF with relaxed ACLs or attributes.
+    // IGNORE_* フラグを渡さないのは意図的である。マージ失敗時は ACL や属性を緩めて PDF を
+    // 黙って置換せず、中断しなければならない。
     let replaced = unsafe {
         ReplaceFileW(
             destination_wide.as_ptr(),
@@ -1144,8 +1141,8 @@ fn wide_path(path: &Path) -> Result<Vec<u16>> {
 fn cleanup_kept_temp_after_error(path: &Path, error: anyhow::Error) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Err(error),
-        // ReplaceFileW can consume the replacement while still reporting a
-        // merge/move error. Missing temp cleanup must not hide that first error.
+        // ReplaceFileW はマージまたは移動のエラーを報告しながら置換ファイルを消費することがある。
+        // 一時ファイルが見つからないというクリーンアップ結果で最初のエラーを隠してはならない。
         Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => Err(error),
         Err(cleanup_error) => Err(anyhow!(
             "{error:#}; additionally failed to remove temporary PDF: {cleanup_error}"
@@ -1175,9 +1172,8 @@ fn verify_saved_document(
             ExpectedAnnotationMutation::Present(state) => state.id,
             ExpectedAnnotationMutation::Absent(id) => *id,
         };
-        // Several unsaved actions can target one annotation. Only its latest
-        // expected state describes the final PDF; earlier entries remain solely
-        // for LIFO Undo and must not be verified as simultaneous states.
+        // 保存されていない複数の操作が 1 つの注釈を対象にできる。最新の期待状態だけが最終 PDF を
+        // 表し、以前のエントリは LIFO Undo のためだけに残るため、同時状態として検証してはならない。
         if verified_ids.insert(id) {
             verify_annotation_mutation(document, &pending.expected)?;
         }
@@ -1186,8 +1182,8 @@ fn verify_saved_document(
 }
 
 fn sync_file(path: &Path) -> Result<()> {
-    // Windows FlushFileBuffers requires a write-capable handle even though no
-    // bytes are changed here; a read-only handle makes every full rewrite fail.
+    // Windows の FlushFileBuffers はここでバイトを変更しなくても書き込み可能なハンドルを要求する。
+    // 読み取り専用ハンドルでは全ての全書き換えが失敗する。
     let file = fs::OpenOptions::new()
         .write(true)
         .open(path)
@@ -1212,8 +1208,8 @@ fn cleanup_temp_after_error(temp_path: TempPath, error: anyhow::Error) -> anyhow
 }
 
 fn read_document_version(path: &Path) -> Result<DocumentVersion> {
-    // Handle-based metadata supplies Windows volume/file IDs; path-only
-    // metadata may omit them and cannot detect same-size path replacement.
+    // ハンドルベースのメタデータは Windows のボリューム ID とファイル ID を提供する。
+    // パスのみのメタデータではこれらが欠落し、同じサイズのパス置換を検出できない場合がある。
     let file = fs::File::open(path)
         .with_context(|| format!("failed to open PDF metadata: {}", path.display()))?;
     let metadata = file
@@ -1230,7 +1226,7 @@ fn read_document_version(path: &Path) -> Result<DocumentVersion> {
     })
 }
 
-/// Rejects a path replacement or in-place write racing MuPDF's open/read pass.
+/// MuPDF の `open`・`read` 処理と競合するパス置換またはインプレース書き込みを拒否する。
 fn stable_open_version(before: DocumentVersion, after: DocumentVersion) -> Result<DocumentVersion> {
     ensure!(
         before == after,
@@ -1239,11 +1235,10 @@ fn stable_open_version(before: DocumentVersion, after: DocumentVersion) -> Resul
     Ok(after)
 }
 
-/// Converts a page-local tile request into MuPDF device coordinates.
+/// ページローカルのタイル要求を MuPDF のデバイス座標へ変換する。
 ///
-/// The final intersection tolerates a one-pixel edge difference between the
-/// Rust layout calculation and MuPDF's rectangle rounding, but rejects a tile
-/// that does not overlap the page at all.
+/// 最終的な交差判定では Rust のレイアウト計算と MuPDF の矩形丸めによる 1 ピクセルの端差を
+/// 許容するが、ページと全く重ならないタイルは拒否する。
 fn tile_clip(page_bounds: IRect, spec: TileSpec) -> Result<IRect> {
     let local_x0 = i32::try_from(spec.pixel_x).context("tile x exceeds MuPDF's range")?;
     let local_y0 = i32::try_from(spec.pixel_y).context("tile y exceeds MuPDF's range")?;
@@ -1286,8 +1281,8 @@ fn file_identity(_file: &fs::File, metadata: &fs::Metadata) -> Result<(u64, u64)
 #[cfg(windows)]
 fn file_identity(file: &fs::File, _metadata: &fs::Metadata) -> Result<(u64, u64)> {
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` owns a valid open handle and `information` remains writable
-    // for the duration of this synchronous Windows API call.
+    // 安全性: `file` は有効なオープンハンドルを所有し、`information` はこの同期 Windows API
+    // 呼び出しの期間中、書き込み可能なままである。
     let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
     ensure!(
         succeeded != 0,
@@ -1295,8 +1290,8 @@ fn file_identity(file: &fs::File, _metadata: &fs::Metadata) -> Result<(u64, u64)
         std::io::Error::last_os_error()
     );
 
-    // Windows splits the persistent 64-bit file index into two DWORDs; keep
-    // the complete value so a same-size path replacement is still detected.
+    // Windows は永続的な 64 ビットファイルインデックスを 2 つの DWORD に分割する。
+    // 同じサイズのパス置換も検出できるよう、完全な値を保持する。
     let file_index =
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
     Ok((u64::from(information.dwVolumeSerialNumber), file_index))
@@ -1338,9 +1333,9 @@ fn highlight_capability_from_constraints(
     annotation_allowed: bool,
     has_signed_signature: bool,
 ) -> HighlightCapability {
-    // These checks are ordered by the restriction the user can act on most
-    // directly. A non-incremental document remains editable because the save
-    // strategy now verifies and atomically replaces a full-file temporary.
+    // これらのチェックは、ユーザーが最も直接対処できる制限の順に並べている。
+    // 保存戦略が全ファイル一時コピーを検証してアトミック置換するため、増分非対応のドキュメントも
+    // 編集可能なままである。
     if file_is_read_only {
         HighlightCapability::ReadOnlyFile
     } else if !annotation_allowed {
@@ -1373,8 +1368,8 @@ fn load_text_snapshot(
 ) -> Result<(TextPage, Vec<GlyphSnapshot>, Vec<NonTextTarget>, Duration)> {
     let page = document.load_pdf_page(page_number(page_index, page_count)?)?;
     let extraction_started = Instant::now();
-    // Empty flags record MuPDF's standard extraction baseline. Typst-specific
-    // bounding-box adjustments require the documented comparison first.
+    // 空のフラグで MuPDF 標準の抽出ベースラインを記録する。Typst 固有のバウンディングボックス
+    // 調整には、まず文書化された比較が必要である。
     let text_page = page.to_text_page(TextPageFlags::empty())?;
     let structured = text_page.structured();
     let mut glyphs = Vec::new();
@@ -1881,9 +1876,9 @@ mod tests {
             HighlightCapability::ReadOnlyFile
         );
 
-        // Windows may deny deletion while the readonly attribute is set;
-        // restoring the original mode/attribute keeps tempfile cleanup
-        // portable without weakening the capability check above.
+        // 読み取り専用属性が設定されている間は Windows が削除を拒否することがある。
+        // 元のモードまたは属性を復元することで、上記の権限チェックを弱めずに一時ファイルの
+        // クリーンアップを移植可能に保つ。
         fs::set_permissions(path, original_permissions).unwrap();
     }
 
@@ -2784,8 +2779,8 @@ mod tests {
             std::env::var_os("LUNAPDF_ACCEPTANCE_OUTPUT")
                 .expect("LUNAPDF_ACCEPTANCE_OUTPUT must name the output PDF"),
         );
-        // Requiring an absolute destination prevents an explicit acceptance run
-        // from leaving an untracked artifact at a shell-dependent relative path.
+        // 絶対パスの宛先を要求し、明示的な受入れ実行でシェル依存の相対パスに追跡不能な
+        // 成果物を残さないようにする。
         assert!(
             output.is_absolute(),
             "LUNAPDF_ACCEPTANCE_OUTPUT must be an absolute path"
@@ -2796,8 +2791,8 @@ mod tests {
             let mut document = PdfDocument::new();
             let mut page = document.new_page(Size::new(400.0, 200.0)).unwrap();
             let mut shape = Shape::new(&mut page).unwrap();
-            // Keeping the text away from page edges makes the annotation easy to
-            // identify without depending on a viewer's page-margin presentation.
+            // テキストをページ端から離すことで、ビューアーのページ余白表示に依存せず注釈を
+            // 識別しやすくする。
             shape
                 .insert_text(
                     Point::new(40.0, 100.0),
@@ -2876,8 +2871,8 @@ mod tests {
 
         let output_directory = output.parent().expect("absolute paths have a parent");
         fs::create_dir_all(output_directory).unwrap();
-        // create_new is the non-overwrite guarantee: a separate process cannot
-        // replace the existence check between validation and the final copy.
+        // create_new は上書きしないことを保証する。別プロセスが検証と最終コピーの間に
+        // 存在チェックの結果を置き換えることはできない。
         let mut source_file = fs::File::open(source).unwrap();
         let mut output_file = fs::OpenOptions::new()
             .write(true)
@@ -2905,9 +2900,9 @@ mod tests {
         page.add_redact_annotation(Rect::new(0.0, 0.0, 10.0, 10.0))
             .unwrap();
         assert!(page.apply_redactions().unwrap());
-        // Production commands never retain a page outside one backend call.
-        // Drop this test-only handle before ReplaceFileW so the test exercises
-        // the backend's actual ownership boundary on Windows.
+        // 本番コマンドが 1 回のバックエンド呼び出しの外でページを保持することはない。
+        // このテスト専用ハンドルを ReplaceFileW の前に破棄し、Windows でバックエンドの
+        // 実際の所有権境界をテストする。
         drop(page);
         assert!(!backend.document.can_be_saved_incrementally());
         assert_eq!(
@@ -2960,9 +2955,8 @@ mod tests {
         let recovery = PdfDocument::from_bytes(&bytes).unwrap();
         let mut backend = MuPdfBackend::open(path).unwrap();
 
-        // MuPDF may report a byte-backed document as incrementally writable;
-        // the backend therefore tracks path association explicitly instead of
-        // trusting this value for a recovery retry.
+        // MuPDF はバイトを基盤とするドキュメントを増分書き込み可能と報告することがある。
+        // そのためバックエンドは、復旧再試行でこの値を信頼せず、パスとの関連付けを明示的に追跡する。
         assert!(recovery.can_be_saved_incrementally());
         backend.document = recovery;
         backend.incremental_association_lost = true;

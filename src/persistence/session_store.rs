@@ -15,20 +15,20 @@ pub(crate) struct SessionStore {
 }
 
 impl SessionStore {
-    /// Resolves the per-user session location without falling back to the
-    /// current directory when an operating-system config directory is absent.
+    /// OSの設定ディレクトリがない場合もカレントディレクトリへフォールバックせず、
+    /// ユーザーごとのセッション保存先を解決する。
     pub(crate) fn for_current_user() -> Result<Self> {
         let path = config_path_for_current_user()?;
         Ok(Self::new(path))
     }
 
-    /// Creates a store at an explicit path, primarily for isolated tests.
+    /// 主に分離されたテスト用として、明示したパスにストアを作成する。
     pub(crate) fn new(path: PathBuf) -> Self {
         Self { path }
     }
 
-    /// Loads, parses, and validates a session, returning `None` when it has
-    /// not been created yet so first launch remains an ordinary empty session.
+    /// セッションを読み込み、解析して検証する。まだ作成されていない場合は`None`を返し、
+    /// 初回起動を通常の空セッションとして扱えるようにする。
     pub(crate) fn load(&self) -> Result<Option<SessionState>> {
         let file = match File::open(&self.path) {
             Ok(file) => file,
@@ -46,11 +46,10 @@ impl SessionStore {
         Ok(Some(state))
     }
 
-    /// Validates and atomically replaces the session file with pretty JSON.
+    /// セッションファイルを検証し、整形済みJSONでアトミックに置き換える。
     ///
-    /// The temporary file is kept beside the destination so the final rename
-    /// remains on one filesystem; flushing and syncing it makes the replace
-    /// boundary explicit without leaving backups or sidecar files behind.
+    /// 一時ファイルを保存先の隣に置くことで最終的な名前変更を同一ファイルシステム内に保つ。
+    /// フラッシュと同期で置換境界を明示し、バックアップやサイドカーファイルを残さない。
     pub(crate) fn save(&self, state: &SessionState) -> Result<()> {
         state.validate().context("validate session before save")?;
         let parent = self
@@ -110,8 +109,8 @@ fn config_path_for_current_user() -> Result<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn linux_config_path(xdg: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
-    // A relative XDG value would make persistence depend on the launch
-    // directory, so follow the XDG fallback under the user's absolute HOME.
+    // XDGの相対値では保存先が起動ディレクトリに依存するため、ユーザーの絶対HOME配下に
+    // XDGのフォールバックを置く。
     let base = match xdg.filter(|path| path.is_absolute()) {
         Some(path) => path.to_path_buf(),
         None => {

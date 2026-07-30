@@ -37,7 +37,7 @@ pub(crate) enum DocumentCommand {
     CreateHighlight(HighlightRequest),
     UpdateAnnotation(AnnotationUpdateRequest),
     DeleteAnnotation(AnnotationDeleteRequest),
-    /// Removes the exact application-owned edit identified by the backend.
+    /// バックエンドが識別した、アプリケーション所有の編集だけを削除する。
     Undo(EditAction),
     LoadOutline,
     SetSearchGeneration(u64),
@@ -77,9 +77,9 @@ pub(crate) enum DocumentEvent {
         request: HighlightIndexRequest,
         message: String,
     },
-    /// Returns the stable identity produced when a document edit completes.
+    /// ドキュメント編集の完了時に生成された安定した識別子を返す。
     EditActionCreated(EditAction),
-    /// Confirms that the requested edit was removed from the in-memory PDF.
+    /// 要求された編集がメモリ上の PDF から削除されたことを確認する。
     EditActionUndone(EditAction),
     OutlineReady(Vec<OutlineItem>),
     SearchPageReady(SearchPageResult),
@@ -164,22 +164,23 @@ impl WorkerTileKey {
     }
 }
 
-// Each 512 px RGBA result is at most 1 MiB. Seven queued results plus the
-// transient Pixmap/RGBA pair, or eight blocked results without a new raster,
-// cap one worker's transfer memory at 9 MiB. The application separately
-// suspends inactive clean documents after crossing its process-memory limit.
+// 512 px の RGBA 結果はそれぞれ最大 1 MiB である。キューに入った 7 件に
+// 一時的な Pixmap/RGBA ペアを加えた場合、または新しいラスタライズを伴わず
+// 8 件が滞留した場合でも、1 ワーカーの転送メモリは 9 MiB に収まる。アプリ
+// ケーションは別途、プロセスメモリ上限を超えた後に非アクティブで変更のない
+// ドキュメントを一時停止する。
 const BUFFERED_EVENT_CAPACITY: usize = 8;
 
 impl DocumentService {
-    /// Starts the single-owner MuPDF worker required by the document contract.
+    /// ドキュメント契約で必要な、単一所有者の MuPDF ワーカーを起動する。
     ///
-    /// All MuPDF values are constructed and dropped on this worker. The caller
-    /// exchanges only application-owned commands and snapshots.
+    /// すべての MuPDF 値はこのワーカー上で生成・破棄する。呼び出し側が
+    /// 交換するのはアプリケーション所有のコマンドとスナップショットだけである。
     pub(crate) fn spawn(path: PathBuf) -> Self {
         Self::spawn_with_version(path, None)
     }
 
-    /// Reopens a suspended PDF only if its file identity and metadata match.
+    /// ファイル識別子とメタデータが一致する場合に限り、一時停止した PDF を再オープンする。
     pub(crate) fn resume(path: PathBuf, expected_version: DocumentVersion) -> Self {
         Self::spawn_with_version(path, Some(expected_version))
     }
@@ -237,7 +238,7 @@ impl DocumentService {
         }
     }
 
-    /// Queues a document operation and reports whether the owner still exists.
+    /// ドキュメント操作をキューに入れ、所有者がまだ存在するかを返す。
     pub(crate) fn send(&self, command: DocumentCommand) -> bool {
         match command {
             DocumentCommand::RenderTile(request) => self.queue_render(request),
@@ -248,8 +249,8 @@ impl DocumentService {
                 self.background_sender.send(command).is_ok()
             }
             DocumentCommand::SetHighlightIndexGeneration(generation) => {
-                // The atomic token is visible during a non-preemptible MuPDF
-                // batch, so a completed old batch is suppressed before send.
+                // プリエンプトできない MuPDF バッチの実行中もアトミックなトークンは可視であるため、
+                // 完了した古いバッチを送信前に抑止する。
                 self.active_highlight_index_generation
                     .store(generation, Ordering::Release);
                 self.foreground_sender.send(command).is_ok()
@@ -258,9 +259,9 @@ impl DocumentService {
         }
     }
 
-    /// Removes a queued tile from the worker scheduler.
+    /// ワーカー・スケジューラからキュー済みのタイルを削除する。
     ///
-    /// The channel message remains but is discarded before it can call MuPDF.
+    /// チャネルのメッセージは残るが、MuPDF を呼び出す前に破棄される。
     pub(crate) fn cancel_render(&self, request: &TileRequest) {
         let key = WorkerTileKey::from_request(request);
         self.scheduled_tiles
@@ -269,7 +270,7 @@ impl DocumentService {
             .remove(&key);
     }
 
-    /// Removes a text extraction request before the worker can enter MuPDF.
+    /// ワーカーが MuPDF に入る前にテキスト抽出要求を削除する。
     pub(crate) fn cancel_text_snapshot(&self, request: &TextSnapshotRequest) {
         cancel_scheduled_text_snapshot(&self.scheduled_text_snapshots, request);
     }
@@ -556,10 +557,10 @@ fn run_worker(
     }
 }
 
-/// Claims only the latest priority entry for a tile request.
+/// タイル要求について最新の優先度エントリだけを取得する。
 ///
-/// Lower-priority channel messages remain as cheap tombstones after a tile is
-/// promoted, so they must not reach MuPDF after the promoted request runs.
+/// タイルが昇格した後も低優先度のチャネル・メッセージは安価な墓標として
+/// 残るため、昇格した要求の実行後に MuPDF へ到達させてはならない。
 fn take_scheduled_render(
     scheduled_tiles: &Mutex<HashMap<WorkerTileKey, RenderPriority>>,
     request: &TileRequest,
@@ -577,8 +578,8 @@ fn take_scheduled_render(
 
 fn next_worker_command(channels: &WorkerChannels) -> Option<DocumentCommand> {
     loop {
-        // Each non-blocking probe preserves the documented render tiers even
-        // when several queues become ready between two MuPDF operations.
+        // 複数のキューが 2 回の MuPDF 操作の間に準備完了しても、各ノンブロッキング
+        // 非ブロッキング確認によって文書化されたレンダリング層の順序を保つ。
         if let Ok(command) = channels.foreground.try_recv() {
             return Some(command);
         }
@@ -638,8 +639,8 @@ fn take_scheduled_text_snapshot(
         (request, !scheduled.is_empty())
     };
     if has_more {
-        // At most one wake token exists; the remaining wanted page is claimed
-        // on the next scheduling cycle without producing one message per page.
+        // 起床トークンは最大 1 個だけ存在する。残りの要求ページは次のスケジュール
+        // サイクルで取得し、ページごとに 1 メッセージを生成することはない。
         let _ = wake_sender.try_send(());
     }
     Some(request)
@@ -664,8 +665,8 @@ fn next_command(
     previous_viewport: &Receiver<DocumentCommand>,
     background: &Receiver<DocumentCommand>,
 ) -> Option<DocumentCommand> {
-    // A ready visible/interactive command always wins before the worker starts
-    // another prefetch tile. An in-progress MuPDF tile is not interrupted.
+    // ワーカーが別の先読みタイルを開始する前は、準備完了した可視・対話的
+    // コマンドが必ず優先される。実行中の MuPDF タイルは中断しない。
     if let Ok(command) = foreground.try_recv() {
         return Some(command);
     }

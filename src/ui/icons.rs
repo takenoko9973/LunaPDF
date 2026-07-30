@@ -1,8 +1,8 @@
 use eframe::egui::{Color32, Rect, Response, Sense, Ui, Vec2};
 
 const ICON_SIZE: f32 = 18.0;
-// Sumatra starts from an 18px icon and adds only a small vertical pad; a 24pt
-// control keeps a comparable ratio while preserving a usable click target.
+// Sumatra は18pxのアイコンを基準に小さな垂直パディングだけを加える。24ptの
+// コントロールは同程度の比率を保ちつつ、実用的なクリック領域を確保する。
 pub(crate) const TOOLBAR_CONTROL_HEIGHT: f32 = 24.0;
 
 macro_rules! embedded_icon {
@@ -58,7 +58,7 @@ impl ToolbarIcon {
     }
 }
 
-/// Allocates a fixed toolbar click area, paints its centered SVG, and returns its response.
+/// 固定されたツールバーのクリック領域を確保し、中央に SVG を描画して Response を返す。
 pub(crate) fn icon_button(
     ui: &mut Ui,
     icon: ToolbarIcon,
@@ -76,7 +76,7 @@ pub(crate) fn icon_button(
 
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact(&response);
-        // Keep rest and disabled buttons transparent; only interaction states paint a fill.
+        // 通常状態と無効状態のボタンは透明に保ち、操作状態だけ塗りつぶす。
         let background = if !enabled {
             Color32::TRANSPARENT
         } else if response.is_pointer_button_down_on() {
@@ -98,8 +98,8 @@ pub(crate) fn icon_button(
         };
         let image = eframe::egui::Image::new(icon.source())
             .fit_to_exact_size(Vec2::splat(ICON_SIZE))
-            // SVG currentColor resolves to white so egui's multiplicative tint can supply
-            // the active theme color without theme-specific icon files.
+            // SVG の `currentColor` は白に解決されるため、egui の乗算色調で
+            // テーマ別のアイコンファイルなしに現在のテーマ色を与えられる。
             .tint(color);
         let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(ICON_SIZE));
         image.paint_at(ui, icon_rect);

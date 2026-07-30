@@ -21,9 +21,9 @@ impl PageRect {
     }
 }
 
-// A 512 px RGBA tile is at most 1 MiB. This keeps each non-preemptible MuPDF
-// raster and GPU upload bounded while Phase 2 performance measurements decide
-// whether a larger tile would improve throughput.
+// 512 pxのRGBAタイルは最大1 MiBとなる。これによりプリエンプトできないMuPDFの
+// ラスタ処理とGPUアップロードを上限内に保ち、より大きなタイルでスループットが
+// 向上するかをフェーズ2の性能測定で判断できる。
 pub(crate) const TILE_EDGE_PIXELS: u32 = 512;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -110,12 +110,12 @@ pub(crate) enum HighlightCapability {
 }
 
 impl HighlightCapability {
-    /// Reports whether the UI may create a change that the current save path can persist.
+    /// 現在の保存先で永続化できる変更をUIが作成できるかどうかを報告する。
     pub(crate) fn is_allowed(self) -> bool {
         self == Self::Allowed
     }
 
-    /// Explains why Highlight creation is unavailable without guessing a fallback save path.
+    /// フォールバック保存先を推測せずにHighlight作成が利用できない理由を説明する。
     pub(crate) fn restriction(self) -> Option<&'static str> {
         match self {
             Self::Allowed => None,
@@ -128,7 +128,7 @@ impl HighlightCapability {
     }
 }
 
-/// Rust-owned file identity used to reject stale suspended-document restores.
+/// Rustが所有するファイル識別子で、古い中断文書の復元を拒否するために使う。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DocumentVersion {
     pub(crate) identity_primary: u64,
@@ -143,12 +143,11 @@ pub(crate) struct HighlightRequest {
     pub(crate) quads: Vec<PageQuad>,
 }
 
-/// Identifies one application-created document edit for the tab-local undo log.
+/// タブ単位のundoログに記録する、アプリケーションが作成した1つの文書編集を識別する。
 ///
-/// The enum is intentionally broader than Highlight today so future edit kinds
-/// can carry their own stable backend identity without turning the UI contract
-/// into a highlight-specific API. MuPDF xrefs are document-local, therefore the
-/// page index travels with the xref and is validated again by the backend.
+/// この列挙型は現在のHighlightより意図的に広くしており、将来の編集種別がそれぞれの
+/// 安定したバックエンド識別子を持てるようにする。一方でUI契約をHighlight専用APIにはしない。
+/// MuPDFのxrefは文書ローカルなので、ページインデックスをxrefとともに渡し、バックエンドでも再検証する。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EditAction {
     CreateHighlight {
@@ -174,8 +173,8 @@ pub(crate) struct OutlineItem {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SearchMatch {
-    // One logical MuPDF hit can span lines and therefore own several Quads.
-    // Keeping the boundary lets Enter move once per hit instead of once per line.
+    // 1つの論理的なMuPDFヒットは複数行にまたがり、複数のQuadを持つことがある。
+    // 境界を維持することで、Enterは行ごとではなくヒットごとに1回移動できる。
     pub(crate) quads: Vec<PageQuad>,
 }
 

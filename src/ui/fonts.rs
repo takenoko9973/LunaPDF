@@ -34,8 +34,8 @@ fn is_exact_ui_font(
     properties: Properties,
     requested_properties: Properties,
 ) -> bool {
-    // Platform matchers may substitute a nearby family or face. Accepting either would make
-    // the configured family name advisory instead of the exact cross-platform contract.
+    // プラットフォームのマッチャーは近いファミリやフェイスを代用することがある。
+    // どちらも受け入れると、設定したファミリ名が厳密なクロスプラットフォーム契約ではなく目安になってしまう。
     family == UI_FONT_FAMILY && properties == requested_properties
 }
 
@@ -70,8 +70,8 @@ fn load_family_font() -> Option<LoadedUiFont> {
         return None;
     }
 
-    // Convert both font-kit handle variants to the owned bytes egui requires while preserving
-    // the collection face index selected by the platform source.
+    // font-kit の2種類のハンドルを、egui が要求する所有バイト列へ変換しつつ、
+    // プラットフォームのソースが選択したコレクションのフェイスインデックスを保持する。
     let (data, face_index) = match handle {
         Handle::Path { path, font_index } => {
             let data = match fs::read(&path) {
@@ -132,7 +132,7 @@ fn load_family_font() -> Option<LoadedUiFont> {
             return None;
         }
     };
-    // DirectWrite may return a nearest match; silently registering it would change UI weight.
+    // DirectWrite は最近傍の一致を返すことがある。黙って登録すると UI のウェイトが変わる。
     if font.weight() != FontWeight::Regular
         || font.stretch() != FontStretch::Normal
         || font.style() != FontStyle::Normal
@@ -153,7 +153,7 @@ fn load_family_font() -> Option<LoadedUiFont> {
             return None;
         }
     };
-    // egui accepts one font blob and face index, so a face backed by multiple files is unusable.
+    // egui は1つのフォントデータとフェイスインデックスを受け取るため、複数ファイルに支えられたフェイスは利用できない。
     let [font_file] = font_files.as_slice() else {
         debug_font_warning(&format!(
             "UI font regular face did not use exactly one file: {UI_FONT_FAMILY}"
@@ -212,9 +212,9 @@ fn font_insert(data: Vec<u8>, face_index: u32) -> FontInsert {
     )
 }
 
-/// Installs the exact regular system UI font for proportional and monospace text.
+/// プロポーショナル文字と等幅文字に、厳密な通常ウェイトのシステム UI フォントを設定する。
 ///
-/// Family resolution is platform-specific and never falls back to another family or face.
+/// ファミリ解決はプラットフォーム依存で、別のファミリやフェイスへフォールバックしない。
 pub(crate) fn install_ui_font(ctx: &egui::Context) {
     let Some(loaded) = load_family_font() else {
         debug_font_warning("no exact system UI font was found");

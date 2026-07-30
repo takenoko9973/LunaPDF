@@ -54,7 +54,7 @@ pub(crate) struct AnnotationSummary {
 }
 
 impl AnnotationSnapshot {
-    /// Drops page-rendering geometry while preserving stable edit capabilities.
+    /// ページ描画用ジオメトリを破棄しつつ、安定した編集機能を保持する。
     pub(crate) fn summary(&self) -> AnnotationSummary {
         AnnotationSummary {
             id: self.id,
@@ -108,9 +108,9 @@ pub(crate) struct HighlightIndexBatch {
 pub(crate) struct AnnotationUpdateRequest {
     pub(crate) id: AnnotationId,
     pub(crate) expected_revision: u64,
-    /// `None` means unchanged; the editor has no operation that removes Contents.
+    /// `None`は変更なしを意味する。エディタにはContentsを削除する操作がない。
     pub(crate) contents: Option<String>,
-    /// `None` means unchanged, preserving unreadable or non-RGB external colors.
+    /// `None`は変更なしを意味し、読み取れない外部色や非RGBの外部色を保持する。
     pub(crate) color: Option<PdfAnnotationColor>,
 }
 
@@ -127,7 +127,7 @@ pub(crate) enum AnnotationCandidateDecision {
     Choose,
 }
 
-/// Returns every annotation whose exact Quad geometry contains the page point.
+/// 正確なQuadジオメトリにページ上の点を含むすべての注釈を返す。
 pub(crate) fn annotations_at_point(
     annotations: &[AnnotationSnapshot],
     point: PagePoint,
@@ -138,7 +138,7 @@ pub(crate) fn annotations_at_point(
         .collect()
 }
 
-/// Applies the current zero/one/many candidate policy without choosing among overlaps.
+/// 現在の0個/1個/複数候補ポリシーを適用し、重複候補の間で選択は行わない。
 pub(crate) fn decide_annotation_candidates(
     candidates: &[&AnnotationSnapshot],
 ) -> AnnotationCandidateDecision {

@@ -13,9 +13,9 @@ use eframe::egui;
 use crate::app::PrototypeApp;
 use crate::persistence::session_store::SessionStore;
 
-/// Starts LunaPDF with zero or more PDF paths supplied on the command line.
+/// コマンドラインで渡された0個以上のPDFパスを指定してLunaPDFを起動する。
 ///
-/// Additional documents can be opened by dropping PDF files onto the window.
+/// ウィンドウへPDFファイルをドロップして追加の文書を開くこともできる。
 fn main() -> Result<()> {
     let pdf_paths = pdf_paths_from_args();
     let session_store = SessionStore::for_current_user()?;

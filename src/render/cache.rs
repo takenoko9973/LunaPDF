@@ -7,22 +7,21 @@ struct Entry<V> {
     weight: usize,
 }
 
-/// Describes the changes made by inserting one weighted value.
+/// 重み付き値を1つ挿入したときの変更内容を表す。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct InsertOutcome<K, V> {
-    /// Whether the new value was retained in the cache.
+    /// 新しい値がキャッシュに保持されたかどうか。
     pub(crate) inserted: bool,
-    /// The value replaced by the insertion, if the key was already present.
+    /// キーがすでに存在していた場合に、挿入によって置き換えられた値。
     pub(crate) replaced: Option<(K, V)>,
-    /// Values evicted from oldest to newest to satisfy the byte budget.
+    /// バイト予算を満たすために古い順から追い出された値。
     pub(crate) evicted: Vec<(K, V)>,
 }
 
-/// A least-recently-used cache constrained by the sum of entry byte weights.
+/// エントリのバイト重みの合計で制約されるLRUキャッシュ。
 ///
-/// Keys are touched on successful [`Self::get`] calls. Insertion and access
-/// are deterministic: the front of the internal order is the oldest entry,
-/// and entries evicted for the byte budget are returned in that order.
+/// [`Self::get`]の成功時にキーへアクセス時刻を付ける。挿入とアクセスの順序は決定的で、
+/// 内部順序の先頭が最古のエントリとなり、バイト予算のために追い出されたエントリもその順で返す。
 pub(crate) struct WeightedLruCache<K, V>
 where
     K: Clone + Eq + Hash,
@@ -37,7 +36,7 @@ impl<K, V> WeightedLruCache<K, V>
 where
     K: Clone + Eq + Hash,
 {
-    /// Creates an empty cache with the supplied maximum number of bytes.
+    /// 指定された最大バイト数で空のキャッシュを作成する。
     pub(crate) fn new(budget: usize) -> Self {
         Self {
             budget,
@@ -47,36 +46,35 @@ where
         }
     }
 
-    /// Returns the maximum number of bytes retained by this cache.
+    /// このキャッシュが保持できる最大バイト数を返す。
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn budget(&self) -> usize {
         self.budget
     }
 
-    /// Returns the sum of weights of all retained entries.
+    /// 保持中の全エントリの重みの合計を返す。
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn current_bytes(&self) -> usize {
         self.current_bytes
     }
 
-    /// Returns the number of retained entries.
+    /// 保持中のエントリ数を返す。
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Returns whether the cache has no retained entries.
+    /// キャッシュに保持中のエントリがないかどうかを返す。
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Inserts a value with its byte weight and reports replacements/evictions.
+    /// バイト重み付きで値を挿入し、置換と追い出しを報告する。
     ///
-    /// An entry heavier than the whole budget is rejected (`inserted == false`)
-    /// after any previous value for the same key is removed. This makes a
-    /// replacement behave like every other insertion and avoids retaining an
-    /// entry that can never satisfy the cache's invariant.
+    /// 予算全体より重いエントリは、同じキーの以前の値を削除した後に拒否される（`inserted == false`）。
+    /// これにより置換も他の挿入と同じように扱われ、キャッシュの不変条件を決して満たせない
+    /// エントリを保持しない。
     pub(crate) fn insert(&mut self, key: K, value: V, weight: usize) -> InsertOutcome<K, V> {
         let replaced = self
             .remove_entry(&key)
@@ -99,17 +97,16 @@ where
             let Some(oldest_key) = self.order.pop_front() else {
                 break;
             };
-            // The order and map are maintained together, so this key is
-            // present. Keeping the branch explicit avoids panicking if that
-            // invariant is ever violated during a future change.
+            // 順序とマップは一緒に維持されるため、このキーは存在する。
+            // 将来の変更で不変条件が破られた場合にもパニックしないよう分岐を明示する。
             if let Some(entry) = self.entries.remove(&oldest_key) {
                 self.current_bytes -= entry.weight;
                 outcome.evicted.push((oldest_key, entry.value));
             }
         }
 
-        // The loop above establishes that this addition fits the budget;
-        // checked arithmetic also handles a usize overflow before insertion.
+        // 上のループにより加算後も予算内に収まることが確定する。
+        // 挿入前のchecked算術はusizeのオーバーフローも処理する。
         self.current_bytes = self
             .current_bytes
             .checked_add(weight)
@@ -120,7 +117,7 @@ where
         outcome
     }
 
-    /// Returns a retained value and marks its key as most recently used.
+    /// 保持中の値を返し、そのキーを最も最近使われたものとして記録する。
     pub(crate) fn get(&mut self, key: &K) -> Option<&V> {
         if !self.touch(key) {
             return None;
@@ -128,7 +125,7 @@ where
         self.entries.get(key).map(|entry| &entry.value)
     }
 
-    /// Marks a retained key as most recently used and reports whether it exists.
+    /// 保持中のキーを最も最近使われたものとして記録し、存在するかどうかを報告する。
     pub(crate) fn touch(&mut self, key: &K) -> bool {
         let Some(position) = self.order.iter().position(|candidate| candidate == key) else {
             return false;
@@ -141,7 +138,7 @@ where
         true
     }
 
-    /// Removes a key and returns its value and byte weight, if retained.
+    /// キーを削除し、保持されていればその値とバイト重みを返す。
     pub(crate) fn remove(&mut self, key: &K) -> Option<(V, usize)> {
         self.remove_entry(key)
             .map(|(_, entry)| (entry.value, entry.weight))

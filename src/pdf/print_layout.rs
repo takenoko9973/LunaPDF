@@ -16,14 +16,14 @@ pub(super) struct PrintLayout {
 }
 
 impl PrintLayout {
-    /// Fits one PDF page within the printer's printable device-pixel area.
+    /// 1 ページの PDF をプリンターの印刷可能なデバイスピクセル領域内に収める。
     pub(super) fn fit(
         bounds: PageRect,
         printable_width: u32,
         printable_height: u32,
     ) -> Option<Self> {
-        // Printer caps and page boxes cross OS/PDF boundaries. Rejecting all
-        // non-physical values here avoids ambiguous scaling later in GDI.
+        // プリンターの能力値とページボックスは OS/PDF の境界をまたぐため、ここで
+        // 物理的に無効な値をすべて拒否し、後段の GDI で曖昧なスケーリングを避ける。
         if printable_width == 0
             || printable_height == 0
             || !bounds.width().is_finite()
@@ -39,13 +39,13 @@ impl PrintLayout {
             return None;
         }
 
-        // MuPDF rounds the transformed page box rather than only its width.
-        // Matching that rule keeps the requested strips inside non-zero page boxes.
+        // MuPDF は幅だけでなく変換後のページボックスを丸める。この規則に合わせることで、
+        // 要求する帯をゼロでないページボックス内に収める。
         let mut pixel_width = scaled_extent(bounds.x0, bounds.x1, scale)?;
         let mut pixel_height = scaled_extent(bounds.y0, bounds.y1, scale)?;
         if pixel_width > printable_width || pixel_height > printable_height {
-            // Transforming a non-zero page box can round its two edges outward
-            // by one pixel. Reduce only that rounding excess before giving up.
+            // ゼロでないページボックスを変換すると、両端が外側へ 1 ピクセル丸められる
+            // ことがある。諦める前に、その丸めによる超過分だけを減らす。
             let width_correction = printable_width as f32 / pixel_width as f32;
             let height_correction = printable_height as f32 / pixel_height as f32;
             scale *= width_correction.min(height_correction);
@@ -66,7 +66,7 @@ impl PrintLayout {
         })
     }
 
-    /// Splits the raster into complete scanline strips under a fixed RGBA budget.
+    /// 固定された RGBA 予算の範囲でラスタを完全な走査線単位の帯に分割する。
     pub(super) fn strips(self, byte_budget: usize) -> Option<Vec<PrintStrip>> {
         let row_bytes = usize::try_from(self.pixel_width).ok()?.checked_mul(4)?;
         if row_bytes == 0 || row_bytes > byte_budget {

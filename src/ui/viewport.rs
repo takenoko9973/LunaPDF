@@ -99,19 +99,19 @@ impl PagePressKind {
     }
 }
 
-/// Returns the cursor for one PDF frame without mutating the interaction state.
+/// 操作状態を変更せず、1つの PDF フレームに対するカーソルを返す。
 pub(crate) fn pdf_cursor_icon(
     target: Option<PageCursorTarget>,
     _autoscroll_active: bool,
     blank_pan_active: bool,
 ) -> CursorIcon {
     if blank_pan_active {
-        // An established pan keeps the four-direction arrow while crossing
-        // text, using egui's standard cursor instead of custom artwork.
+        // 開始済みのパンではテキスト上を通過しても4方向矢印を維持し、
+        // カスタム画像ではなく egui の標準カーソルを使う。
         CursorIcon::AllScroll
     } else {
-        // Middle-button autoscroll intentionally does not override the target
-        // cursor, so pressing the wheel causes no cursor-only visual change.
+        // 中ボタンのオートスクロールでは意図的に対象カーソルを上書きしないため、
+        // ホイールを押してもカーソルだけが視覚的に変化することはない。
         match target {
             Some(PageCursorTarget::Text) => CursorIcon::Text,
             Some(PageCursorTarget::Link) => CursorIcon::PointingHand,
@@ -139,7 +139,7 @@ pub(crate) struct PageInteractionInput<'a> {
 }
 
 impl PageViewport {
-    /// Paints one tile in its page-relative raster position.
+    /// ページ相対のラスタ位置に1つのタイルを描画する。
     pub(crate) fn paint_tile(
         ui: &Ui,
         page_screen_rect: Rect,
@@ -155,7 +155,7 @@ impl PageViewport {
         );
     }
 
-    /// Paints search geometry without changing the logical text selection.
+    /// 論理的なテキスト選択を変更せず、検索ジオメトリを描画する。
     pub(crate) fn paint_search_matches(
         ui: &Ui,
         screen_rect: Rect,
@@ -164,8 +164,8 @@ impl PageViewport {
         selected_match: Option<usize>,
     ) {
         for (match_index, search_match) in matches.iter().enumerate() {
-            // A distinct color makes the result Enter selected visible while
-            // retaining every other hit as document-wide search context.
+            // 別の色で Enter 選択中の結果を見えるようにしつつ、他のヒットは
+            // 文書全体の検索コンテキストとして残す。
             let selected = selected_match == Some(match_index);
             let (fill, stroke) = if selected {
                 (
@@ -191,7 +191,7 @@ impl PageViewport {
         }
     }
 
-    /// Handles selection interaction and overlays for one logical PDF page.
+    /// 1つの論理 PDF ページの選択操作とオーバーレイを処理する。
     pub(crate) fn interact_at(
         &mut self,
         ui: &mut Ui,
@@ -442,7 +442,7 @@ impl PageViewport {
         interaction
     }
 
-    /// Handles the gray viewport area that is outside every rendered PDF page.
+    /// すべての描画済み PDF ページの外側にある灰色のビューポート領域を処理する。
     pub(crate) fn interact_background(
         &mut self,
         ui: &mut Ui,
@@ -504,17 +504,17 @@ impl PageViewport {
         interaction
     }
 
-    /// Reports whether the shared viewport currently owns a primary-button gesture.
+    /// 共有ビューポートが現在プライマリボタンのジェスチャーを所有しているか報告する。
     pub(crate) fn primary_interaction_in_progress(&self) -> bool {
         self.primary_press.is_some()
     }
 
-    /// Reports whether blank-page panning has crossed the drag threshold.
+    /// 空白ページのパンがドラッグしきい値を越えたか報告する。
     pub(crate) fn blank_pan_in_progress(&self) -> bool {
         self.blank_pan.is_some_and(|pan| pan.active)
     }
 
-    /// Cancels page-owned primary input without changing selection or scroll position.
+    /// 選択やスクロール位置を変更せず、ページが所有するプライマリ入力をキャンセルする。
     pub(crate) fn cancel_primary_interaction(&mut self) {
         self.drag_page = None;
         self.drag_start = None;
@@ -560,8 +560,8 @@ fn annotation_hover_is_allowed(
     selection_drag_active: bool,
     context_menu_open: bool,
 ) -> bool {
-    // Tooltip creation is disabled while another pointer-owned annotation or
-    // document interaction is active, so it cannot compete for the same hit.
+    // 別のポインタ所有の注釈操作または文書操作が有効な間はツールチップを作らず、
+    // 同じヒットを取り合わないようにする。
     !externally_suppressed && !selection_drag_active && !context_menu_open
 }
 
@@ -585,9 +585,9 @@ fn classify_page_press(
         return PagePressKind::Text(glyph);
     }
     let Some(annotation_page) = annotation_page else {
-        // Until annotation metadata arrives, treating non-text page space as
-        // occupied avoids panning through a Highlight the worker has not
-        // described yet. Glyph selection remains available above.
+        // 注釈メタデータが届くまでは、テキスト以外のページ領域を占有済みとして扱う。
+        // これにより、ワーカーがまだ記述していない Highlight を通過してパンすることを防ぐ。
+        // グリフ選択は引き続き利用できる。
         return PagePressKind::Unavailable;
     };
     let annotation_hit = !annotations_at_point(&annotation_page.annotations, point).is_empty();
@@ -605,8 +605,8 @@ fn classify_page_press(
         .non_text_targets
         .iter()
         .any(|target| target.quad.contains(point));
-    // Forms and images still own their pointer region even though this viewer
-    // does not currently expose a dedicated left-click action for every type.
+    // このビューアーが現在すべての種類に専用の左クリック操作を提供していなくても、
+    // フォームと画像はポインタ領域を引き続き所有する。
     if independent_hit {
         PagePressKind::OtherInteractive
     } else {
@@ -622,9 +622,9 @@ fn glyph_hit_tolerance_in_page_points(
     if screen_rect.width() <= 0.0 || screen_rect.height() <= 0.0 {
         return 0.0;
     }
-    // egui's click tolerance is already expressed in DPI-independent logical
-    // points. Converting through the rendered page scale keeps the same screen
-    // hit radius at every PDF zoom without a fixed device-pixel threshold.
+    // egui のクリック許容値は DPI 非依存の論理ポイントで表されている。描画済みページの
+    // スケールを通じて変換することで、固定デバイスピクセルしきい値なしに PDF の各ズームで
+    // 同じ画面上のヒット半径を保つ。
     let page_units_per_screen_x = bounds.width() / screen_rect.width();
     let page_units_per_screen_y = bounds.height() / screen_rect.height();
     logical_tolerance * page_units_per_screen_x.max(page_units_per_screen_y)
@@ -651,12 +651,12 @@ fn update_blank_pan(
 }
 
 fn selection_drag_exceeds_threshold(origin: Pos2, current: Pos2, threshold: f32) -> bool {
-    // The threshold is egui's logical-point click tolerance, so the decision
-    // remains consistent across native DPI and application zoom settings.
+    // このしきい値は egui の論理ポイントによるクリック許容値なので、ネイティブ DPI と
+    // アプリケーションのズーム設定をまたいでも判定が一貫する。
     origin.distance_sq(current) > threshold * threshold
 }
 
-/// Maps a raster tile's device-pixel window into normalized page-screen coordinates.
+/// ラスタタイルのデバイスピクセル範囲を正規化されたページ画面座標へ対応付ける。
 pub(crate) fn screen_rect_for_tile(page_screen_rect: Rect, tile: &RenderedTile) -> Rect {
     let page_pixel_width = tile.page_pixel_width as f32;
     let page_pixel_height = tile.page_pixel_height as f32;
@@ -695,8 +695,8 @@ fn paint_quad(
 }
 
 fn page_point_from_screen(position: Pos2, screen_rect: Rect, bounds: PageRect) -> PagePoint {
-    // Pointer positions are clamped at the rendered page edge so a drag that
-    // ends just outside the widget still maps to a valid PDF selection point.
+    // ポインタ位置を描画済みページの端でクランプし、ウィジェットのすぐ外で終わるドラッグも
+    // 有効な PDF 選択点に対応付けられるようにする。
     let x = position.x.clamp(screen_rect.left(), screen_rect.right());
     let y = position.y.clamp(screen_rect.top(), screen_rect.bottom());
     let normalized_x = (x - screen_rect.left()) / screen_rect.width();

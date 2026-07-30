@@ -2,8 +2,8 @@ use std::ops::Range;
 
 use crate::domain::document::PageRect;
 
-// Sixteen logical pixels keeps page boundaries visible at 100% without
-// coupling document geometry to the GUI theme's widget spacing.
+// 16論理ピクセルにすると100%表示でページ境界が見やすくなり、
+// 文書のジオメトリをGUIテーマのウィジェット間隔に結び付けずに済む。
 pub(crate) const PAGE_GAP: f32 = 16.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -36,7 +36,7 @@ pub(crate) struct ContinuousLayout {
 }
 
 impl ContinuousLayout {
-    /// Computes document-space page placement for one zoom and viewport width.
+    /// 1つのズーム率とビューポート幅に対する文書空間のページ配置を計算する。
     pub(crate) fn new(page_bounds: &[PageRect], zoom: f32, viewport_width: f32) -> Self {
         let mut y = PAGE_GAP;
         let mut placements = Vec::with_capacity(page_bounds.len());
@@ -69,7 +69,7 @@ impl ContinuousLayout {
         self.placements.get(page_index).copied()
     }
 
-    /// Returns pages intersecting the viewport plus a bounded prefetch margin.
+    /// ビューポートと交差するページに、上限付きの先読み余白を加えて返す。
     pub(crate) fn visible_pages(&self, viewport: Range<f32>, prefetch_margin: f32) -> Range<usize> {
         let visible_start = (viewport.start - prefetch_margin).max(0.0);
         let visible_end = viewport.end + prefetch_margin;
@@ -91,7 +91,7 @@ impl ContinuousLayout {
             .map(|placement| placement.page_index)
     }
 
-    /// Captures a document position as a page and normalized two-axis offset.
+    /// 文書位置をページと2軸の正規化オフセットとして取得する。
     pub(crate) fn anchor_at(&self, x: f32, y: f32) -> Option<PageAnchor> {
         let page_index = self.page_at_y(y)?;
         let placement = self.placement(page_index)?;
@@ -104,7 +104,7 @@ impl ContinuousLayout {
         })
     }
 
-    /// Returns the scroll offset that places an anchor at viewport center.
+    /// アンカーをビューポート中央に配置するスクロールオフセットを返す。
     pub(crate) fn centered_offset(
         &self,
         anchor: PageAnchor,

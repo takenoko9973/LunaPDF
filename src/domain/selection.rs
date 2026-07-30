@@ -42,7 +42,7 @@ impl PageQuad {
         (x0, y0, x1, y1)
     }
 
-    /// Tests a point against the visible interior of this convex PDF Quad.
+    /// 点がこの凸PDF Quadの可視な内部にあるかを判定する。
     pub(crate) fn contains(self, point: PagePoint) -> bool {
         let corners = [
             self.upper_left,
@@ -57,8 +57,8 @@ impl PageQuad {
             .map(|(start, end)| start.x * end.y - end.x * start.y)
             .sum::<f32>();
         if polygon_area_twice == 0.0 {
-            // A degenerate Quad has no visible interior and must not become a
-            // selection or annotation target because all edge products are zero.
+            // 退化したQuadには可視の内部がなく、すべての辺の積が0になるため、
+            // 選択や注釈の対象にしてはならない。
             return false;
         }
 
@@ -71,8 +71,7 @@ impl PageQuad {
                 (end.x - start.x) * (point.y - start.y) - (end.y - start.y) * (point.x - start.x);
             has_clockwise_edge |= cross < 0.0;
             has_counterclockwise_edge |= cross > 0.0;
-            // Convex PDF Quad points contain a point only while all non-zero
-            // edge products have the same orientation.
+            // 凸PDF Quadが点を含むのは、0でない辺の積がすべて同じ向きの場合だけである。
             if has_clockwise_edge && has_counterclockwise_edge {
                 return false;
             }
@@ -95,7 +94,7 @@ pub(crate) struct TextSnapshotRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Identifies why a non-text page region owns pointer interaction.
+/// 非テキストのページ領域がポインター操作を占有する理由を識別する。
 pub(crate) enum NonTextTargetKind {
     Image,
     Link,
@@ -103,7 +102,7 @@ pub(crate) enum NonTextTargetKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-/// Preserves non-text hit geometry and its cursor-relevant PDF role.
+/// 非テキストのヒットジオメトリと、カーソルに関係するPDF上の役割を保持する。
 pub(crate) struct NonTextTarget {
     pub(crate) kind: NonTextTargetKind,
     pub(crate) quad: PageQuad,
@@ -114,7 +113,7 @@ pub(crate) struct TextPageSnapshot {
     pub(crate) page_index: usize,
     pub(crate) revision: u64,
     pub(crate) glyphs: Vec<GlyphSnapshot>,
-    /// Page elements that own pointer interaction independently of text selection.
+    /// テキスト選択とは独立してポインター操作を占有するページ要素。
     pub(crate) non_text_targets: Vec<NonTextTarget>,
 }
 
@@ -128,7 +127,7 @@ pub(crate) struct SelectionSnapshot {
     pub(crate) extraction_time: Duration,
 }
 
-/// Reports whether the page point is inside the current selection display geometry.
+/// ページ上の点が現在の選択表示ジオメトリ内にあるかを報告する。
 pub(crate) fn selection_contains_point(
     selection: &SelectionSnapshot,
     page_index: usize,
@@ -141,11 +140,11 @@ pub(crate) fn selection_contains_point(
             .any(|quad| quad.contains(point))
 }
 
-/// Creates the logical copy string independently from the display quads.
+/// 表示用Quadとは独立して論理的なコピー文字列を作成する。
 ///
-/// MuPDF 0.8 exposes standard selection quads but not its range-copy string.
-/// Keeping this ordered glyph selection separate ensures future Typst-only
-/// display correction cannot silently alter copy order.
+/// MuPDF 0.8は標準の選択Quadを提供するが、範囲コピー文字列は提供しない。
+/// 順序付けた字形選択を分離しておくことで、将来Typstだけの表示補正を行ってもコピー順序が
+/// 暗黙に変わらないようにする。
 pub(crate) fn selected_text(glyphs: &[GlyphSnapshot], start: PagePoint, end: PagePoint) -> String {
     let Some(selected_glyphs) = selected_glyphs(glyphs, start, end) else {
         return String::new();
@@ -163,7 +162,7 @@ pub(crate) fn selected_text(glyphs: &[GlyphSnapshot], start: PagePoint, end: Pag
     text
 }
 
-/// Returns merged display and annotation Quads for the same inclusive glyph range as copy text.
+/// コピー文字列と同じ包含字形範囲に対する、結合済み表示・注釈Quadを返す。
 pub(crate) fn selected_quads(
     glyphs: &[GlyphSnapshot],
     start: PagePoint,
@@ -175,7 +174,7 @@ pub(crate) fn selected_quads(
     merge_line_bands(selected_glyphs)
 }
 
-/// Returns the geometry used only to paint the selected glyph range.
+/// 選択した字形範囲の描画だけに使うジオメトリを返す。
 pub(crate) fn selected_display_quads(
     glyphs: &[GlyphSnapshot],
     start: PagePoint,
@@ -199,9 +198,8 @@ fn merge_line_bands(glyphs: &[GlyphSnapshot]) -> Vec<PageQuad> {
             break;
         }
         let direction = Some(glyph_direction(&glyphs[index - 1], &glyphs[index]));
-        // A run ends before the current glyph when a line, continuity gap,
-        // or writing direction changes; this keeps one annotation from
-        // spanning unrelated columns or differently oriented text.
+        // 行、連続性の空白、書字方向のいずれかが変わると現在の字形の前でランを終了する。
+        // これにより1つの注釈が無関係な列や異なる向きのテキストにまたがらない。
         let continuity_break = !glyphs_are_continuous(glyphs, index - 1, index);
         let run_ended = glyphs[index].line_index != glyphs[run_start].line_index
             || continuity_break
@@ -210,8 +208,8 @@ fn merge_line_bands(glyphs: &[GlyphSnapshot]) -> Vec<PageQuad> {
             if let Some((space_start, space_end)) = wide_whitespace_bridge(glyphs, index - 1, index)
             {
                 if space_end <= run_start {
-                    // The wide whitespace was already removed from this run;
-                    // skip its trailing pair without creating an empty band.
+                    // 幅の広い空白はこのランからすでに除外されているため、空の帯を作らず
+                    // その末尾の組をスキップする。
                     index += 1;
                     continue;
                 }
@@ -234,8 +232,8 @@ fn merge_line_bands(glyphs: &[GlyphSnapshot]) -> Vec<PageQuad> {
     bands
 }
 
-/// Returns a whitespace range that must be omitted when its non-space anchors
-/// are farther apart than either neighboring glyph can account for.
+/// 空白でないアンカー間の距離が、隣接するどちらの字形でも説明できない場合に
+/// 除外すべき空白範囲を返す。
 fn wide_whitespace_bridge(
     glyphs: &[GlyphSnapshot],
     previous_index: usize,
@@ -293,9 +291,9 @@ fn glyphs_are_continuous(
             return true;
         };
         if left_index != previous_index || right_index != next_index {
-            // A wide space glyph can have zero inter-glyph gap on both sides.
-            // Compare the surrounding non-space edges so a column-sized blank
-            // does not silently become one continuous highlight band.
+            // 幅の広い空白字形は両側の字形間ギャップが0になることがある。
+            // 周囲の空白でない辺を比較し、列幅の空白が暗黙に1つの連続したハイライト帯に
+            // ならないようにする。
             return glyphs_are_continuous_without_spaces(glyphs, left_index, right_index);
         }
     }
@@ -334,10 +332,9 @@ fn glyphs_are_continuous_without_spaces(
         (gap, previous_y1 - previous_y0, next_y1 - next_y0)
     };
 
-    // A run may include normal inter-glyph spacing (including a word space),
-    // but a gap larger than either adjacent glyph's own extent indicates a
-    // column or unrelated region.  This scales with page/text size instead
-    // of imposing a fixed PDF-point threshold.
+    // ランには通常の字形間隔（単語間の空白を含む）を含められるが、隣接するどちらの字形の
+    // 自身の範囲より大きいギャップは列または無関係な領域を示す。固定のPDFポイントしきい値を
+    // 課す代わりに、ページやテキストのサイズに合わせて変化する。
     let continuity_bound = previous_extent.max(next_extent);
     gap <= continuity_bound
 }
@@ -358,9 +355,9 @@ fn merge_line_band(glyphs: &[GlyphSnapshot]) -> PageQuad {
             quad.upper_right,
             quad.lower_right,
         );
-        // MuPDF always stores text-progression edges as [ul,ll] and [ur,lr],
-        // including rotated and bidi text. Extending the nearer edge follows
-        // that contract without reinterpreting the corner names in page axes.
+        // MuPDFは回転テキストやbidiテキストを含め、テキスト進行辺を常に[ul,ll]および
+        // [ur,lr]として保存する。近い辺を延長することで、ページ軸上の角名を再解釈せずに
+        // この契約に従える。
         if forward_gap <= reverse_gap {
             band.upper_right = quad.upper_right;
             band.lower_right = quad.lower_right;
@@ -388,7 +385,7 @@ fn point_distance_squared(first: PagePoint, second: PagePoint) -> f32 {
     delta_x * delta_x + delta_y * delta_y
 }
 
-/// Borrows the canonical inclusive glyph range without allocating during drag preview.
+/// ドラッグプレビュー中に割り当てを行わず、正規の包含字形範囲を借用する。
 pub(crate) fn selected_glyphs(
     glyphs: &[GlyphSnapshot],
     start: PagePoint,
@@ -398,13 +395,13 @@ pub(crate) fn selected_glyphs(
     Some(&glyphs[range])
 }
 
-/// Maps a pointer to a stable character center in the Rust-owned text snapshot.
+/// ポインターをRust所有のテキストスナップショット内の安定した文字中心へ対応付ける。
 pub(crate) fn snap_to_glyph(glyphs: &[GlyphSnapshot], point: PagePoint) -> Option<PagePoint> {
     let glyph = glyphs.get(nearest_glyph_index(glyphs, point)?)?;
     Some(glyph_center(glyph))
 }
 
-/// Maps a pointer only when it is within the caller's page-space hit tolerance.
+/// 呼び出し元が指定したページ空間のヒット許容範囲内にある場合だけ、ポインターを対応付ける。
 pub(crate) fn snap_to_glyph_with_max_distance(
     glyphs: &[GlyphSnapshot],
     point: PagePoint,
@@ -425,7 +422,7 @@ fn glyph_center(glyph: &GlyphSnapshot) -> PagePoint {
     PagePoint::new((x0 + x1) / 2.0, (y0 + y1) / 2.0)
 }
 
-/// Returns the logical glyph range selected by two already page-local points.
+/// すでにページ内座標となっている2点で選択される論理字形範囲を返す。
 pub(crate) fn selected_glyph_range(
     glyphs: &[GlyphSnapshot],
     start: PagePoint,

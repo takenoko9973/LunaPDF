@@ -1,8 +1,8 @@
 use crate::domain::document::{PageRect, TILE_EDGE_PIXELS, TileSpec};
 
-// MuPDF's `fz_round_rect` ignores sub-thousandth-device-pixel error before
-// rasterization. The UI grid must use the same threshold or an edge tile can
-// differ by one pixel from the worker result and fail cache-key validation.
+// MuPDFの`fz_round_rect`はラスタライズ前に1000分の1デバイスピクセル未満の誤差を無視する。
+// UIグリッドも同じしきい値を使わないと、端のタイルがワーカー結果と1ピクセルずれて
+// キャッシュキー検証に失敗する可能性がある。
 const MUPDF_RECT_ROUNDING_EPSILON: f32 = 0.001;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,11 +12,10 @@ pub(crate) struct TileGrid {
 }
 
 impl TileGrid {
-    /// Computes the page-local raster grid for one PDF page and device scale.
+    /// 1つのPDFページとデバイススケールに対するページ内ラスタグリッドを計算する。
     ///
-    /// Returns `None` when bounds or scale cannot be represented in MuPDF's
-    /// signed device-coordinate range. No tile requests should be emitted in
-    /// that state.
+    /// 境界またはスケールをMuPDFの符号付きデバイス座標範囲で表現できない場合は`None`を返す。
+    /// その状態ではタイル要求を発行してはならない。
     pub(crate) fn new(bounds: PageRect, scale: f32) -> Option<Self> {
         if !scale.is_finite() || scale <= 0.0 {
             return None;
@@ -40,10 +39,10 @@ impl TileGrid {
         self.pixel_height
     }
 
-    /// Enumerates only tiles intersecting a page-local pixel rectangle.
+    /// ページ内ピクセル矩形と交差するタイルだけを列挙する。
     ///
-    /// The viewport must constrain enumeration before allocation; constructing
-    /// the full grid can exhaust the UI thread for a legal, very large page.
+    /// 割り当て前にビューポートで列挙範囲を制約する必要がある。非常に大きい合法なページでは
+    /// グリッド全体を構築するとUIスレッドを使い果たす可能性がある。
     pub(crate) fn specs_in_pixel_rect(
         self,
         min_x: u32,
@@ -85,8 +84,8 @@ impl TileGrid {
 }
 
 fn scaled_extent(start: f32, end: f32, scale: f32) -> Option<u32> {
-    // Match `fz_round_rect`: without its tolerance, a value such as
-    // 748.00006 is ceiled to 749 here but rounded to 748 by MuPDF.
+    // `fz_round_rect`に合わせる。この許容誤差がないと、748.00006のような値は
+    // ここでは749に切り上げられるが、MuPDFでは748に丸められる。
     let first_pixel = (start * scale + MUPDF_RECT_ROUNDING_EPSILON).floor();
     let last_pixel = (end * scale - MUPDF_RECT_ROUNDING_EPSILON).ceil();
     let extent = last_pixel - first_pixel;

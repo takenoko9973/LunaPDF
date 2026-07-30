@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 const SCHEMA_VERSION: u32 = 1;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 4.0;
-// Five entries fit the compact editor history while bounding schema-1 storage.
+// 5エントリでコンパクトなエディタ履歴に収まり、schema-1の保存容量も上限内に保てる。
 pub(crate) const MAX_RECENT_ANNOTATION_COLORS: usize = 5;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub(crate) struct SessionState {
     pub(crate) sidebar_tab: SidebarTab,
     pub(crate) tabs: Vec<SessionTab>,
     #[serde(default)]
-    // Additive default keeps existing schema-1 session JSON readable.
+    // 追加フィールドのデフォルトにより、既存のschema-1セッションJSONを読み取れる。
     pub(crate) recent_annotation_colors: Vec<[u8; 3]>,
 }
 
@@ -77,11 +77,10 @@ impl Default for SessionState {
 }
 
 impl SessionState {
-    /// Validates the persisted contract before it is used to restore UI state.
+    /// UI状態の復元に使う前に永続化契約を検証する。
     ///
-    /// Zoom is bounded to the same 0.25–4.0 range used by the renderer, while
-    /// page anchors are normalized fractions so they remain meaningful across
-    /// viewport sizes.
+    /// ズームはレンダラーと同じ0.25–4.0の範囲に制限し、ページアンカーはビューポートサイズが
+    /// 変わっても意味を保てるよう正規化した分数で表す。
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.schema_version != SCHEMA_VERSION {
             bail!(
@@ -95,8 +94,8 @@ impl SessionState {
                 bail!("an empty session cannot select a tab");
             }
         } else {
-            // Runtime sessions always select one of their open tabs. Rejecting
-            // an absent selection avoids inventing a different active tab.
+            // 実行中のセッションは常に開いているタブの1つを選択する。
+            // 選択がない状態を拒否することで、別のアクティブタブを勝手に作らない。
             let selected = self
                 .selected_tab
                 .ok_or_else(|| anyhow::anyhow!("a nonempty session must select a tab"))?;
@@ -116,8 +115,8 @@ impl SessionState {
                 );
             }
         }
-        // Keep the preference bounded and deterministic so malformed session files
-        // cannot grow memory or present the same color repeatedly.
+        // 壊れたセッションファイルでメモリが増大したり同じ色が繰り返し表示されたりしないよう、
+        // 設定を上限内かつ決定的に保つ。
         if self.recent_annotation_colors.len() > MAX_RECENT_ANNOTATION_COLORS {
             bail!("session contains more than {MAX_RECENT_ANNOTATION_COLORS} recent colors");
         }
@@ -157,8 +156,8 @@ fn validate_view(view: &SessionView) -> anyhow::Result<()> {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    // Session restore must not require the document to exist, so normalize
-    // lexical `.` and `..` components without filesystem canonicalization.
+    // セッション復元で文書の存在を要求してはならないため、ファイルシステムの正規化は行わず
+    // 字句的な`.`と`..`要素を正規化する。
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
