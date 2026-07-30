@@ -1831,17 +1831,54 @@ mod tests {
         let cmyk_nearby = PdfAnnotationColor::Cmyk {
             cyan: 0.1 + PDF_PROPERTY_TOLERANCE * 0.5,
             magenta: 0.2 - PDF_PROPERTY_TOLERANCE * 0.5,
-            yellow: 0.3,
+            yellow: 0.3 + PDF_PROPERTY_TOLERANCE * 0.5,
             key: 0.4 + PDF_PROPERTY_TOLERANCE * 0.5,
         };
-        let cmyk_far = PdfAnnotationColor::Cmyk {
-            cyan: 0.1 + PDF_PROPERTY_TOLERANCE * 2.0,
-            magenta: 0.2,
-            yellow: 0.3,
-            key: 0.4,
-        };
+        let distant_cmyk_colors = [
+            (
+                "cyan",
+                PdfAnnotationColor::Cmyk {
+                    cyan: 0.1 + PDF_PROPERTY_TOLERANCE * 2.0,
+                    magenta: 0.2,
+                    yellow: 0.3,
+                    key: 0.4,
+                },
+            ),
+            (
+                "magenta",
+                PdfAnnotationColor::Cmyk {
+                    cyan: 0.1,
+                    magenta: 0.2 + PDF_PROPERTY_TOLERANCE * 2.0,
+                    yellow: 0.3,
+                    key: 0.4,
+                },
+            ),
+            (
+                "yellow",
+                PdfAnnotationColor::Cmyk {
+                    cyan: 0.1,
+                    magenta: 0.2,
+                    yellow: 0.3 + PDF_PROPERTY_TOLERANCE * 2.0,
+                    key: 0.4,
+                },
+            ),
+            (
+                "key",
+                PdfAnnotationColor::Cmyk {
+                    cyan: 0.1,
+                    magenta: 0.2,
+                    yellow: 0.3,
+                    key: 0.4 + PDF_PROPERTY_TOLERANCE * 2.0,
+                },
+            ),
+        ];
         assert!(annotation_colors_match(Some(cmyk), Some(cmyk_nearby)));
-        assert!(!annotation_colors_match(Some(cmyk), Some(cmyk_far)));
+        for (component, distant) in distant_cmyk_colors {
+            assert!(
+                !annotation_colors_match(Some(cmyk), Some(distant)),
+                "{component} outside the tolerance must not match"
+            );
+        }
         assert!(!annotation_colors_match(Some(cmyk), Some(gray)));
     }
 
@@ -1871,9 +1908,41 @@ mod tests {
         nearby.ul.x += PDF_COORDINATE_TOLERANCE * 0.5;
         assert!(quad_matches(&nearby, &expected));
 
-        let mut distant = mupdf_quad_from_page(&expected);
-        distant.ul.x += PDF_COORDINATE_TOLERANCE * 2.0;
-        assert!(!quad_matches(&distant, &expected));
+        type DistantCoordinateChange = (&'static str, fn(&mut Quad));
+        let distant_coordinate_changes: [DistantCoordinateChange; 8] = [
+            ("ul.x", |quad| {
+                quad.ul.x += PDF_COORDINATE_TOLERANCE * 2.0;
+            }),
+            ("ul.y", |quad| {
+                quad.ul.y += PDF_COORDINATE_TOLERANCE * 2.0;
+            }),
+            ("ur.x", |quad| {
+                quad.ur.x += PDF_COORDINATE_TOLERANCE * 2.0;
+            }),
+            ("ur.y", |quad| {
+                quad.ur.y += PDF_COORDINATE_TOLERANCE * 2.0;
+            }),
+            ("ll.x", |quad| {
+                quad.ll.x += PDF_COORDINATE_TOLERANCE * 2.0;
+            }),
+            ("ll.y", |quad| {
+                quad.ll.y += PDF_COORDINATE_TOLERANCE * 2.0;
+            }),
+            ("lr.x", |quad| {
+                quad.lr.x += PDF_COORDINATE_TOLERANCE * 2.0;
+            }),
+            ("lr.y", |quad| {
+                quad.lr.y += PDF_COORDINATE_TOLERANCE * 2.0;
+            }),
+        ];
+        for (coordinate, change) in distant_coordinate_changes {
+            let mut distant = mupdf_quad_from_page(&expected);
+            change(&mut distant);
+            assert!(
+                !quad_matches(&distant, &expected),
+                "{coordinate} outside the tolerance must not match"
+            );
+        }
     }
 
     #[cfg(windows)]
