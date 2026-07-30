@@ -3074,7 +3074,7 @@ impl PrototypeApp {
                         let page_input_width = page_number_input_width(ui, page_count);
                         let page_response = ui.add_sized(
                             [page_input_width, TOOLBAR_CONTROL_HEIGHT],
-                            egui::TextEdit::singleline(&mut self.documents[index].page_input)
+                            toolbar_singleline_text_edit(&mut self.documents[index].page_input)
                                 .id(page_id)
                                 .desired_width(page_input_width)
                                 .horizontal_align(egui::Align::Center),
@@ -3179,7 +3179,7 @@ impl PrototypeApp {
                         let search = &mut self.documents[index].search;
                         let response = ui.add_sized(
                             [180.0, TOOLBAR_CONTROL_HEIGHT],
-                            egui::TextEdit::singleline(&mut search.query)
+                            toolbar_singleline_text_edit(&mut search.query)
                                 .id(search_query_id(document_id))
                                 .desired_width(180.0)
                                 .hint_text("PDF内を検索"),
@@ -6193,6 +6193,14 @@ fn page_number_input_columns(page_count: usize) -> usize {
         .max(PAGE_INPUT_MINIMUM_COLUMNS)
 }
 
+/// Builds a toolbar single-line editor whose galley is centered in its fixed-height clip rect.
+///
+/// The font tweak shifts glyphs inside the galley; this alignment only positions
+/// that galley inside TextEdit, so it does not add another fixed glyph offset.
+fn toolbar_singleline_text_edit(text: &mut dyn egui::TextBuffer) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).vertical_align(egui::Align::Center)
+}
+
 fn page_number_input_width(ui: &egui::Ui, page_count: usize) -> f32 {
     let sample = "9".repeat(page_number_input_columns(page_count));
     let font_id = egui::TextStyle::Body.resolve(ui.style());
@@ -7756,6 +7764,20 @@ mod tests {
 
         assert!(widths[..6].windows(2).all(|pair| pair[0] == pair[1]));
         assert!(widths[6] >= widths[5]);
+    }
+
+    #[test]
+    fn toolbar_singleline_text_is_centered_inside_its_clip_rect() {
+        let context = egui::Context::default();
+        let _output = context.run_ui(Default::default(), |ui| {
+            let mut text = "日本語ABC123".to_owned();
+            let output = toolbar_singleline_text_edit(&mut text)
+                .min_size(Vec2::new(180.0, TOOLBAR_CONTROL_HEIGHT))
+                .show(ui);
+            let galley_center = output.galley_pos.y + output.galley.size().y / 2.0;
+
+            assert!((galley_center - output.text_clip_rect.center().y).abs() < 0.01);
+        });
     }
 
     #[test]
