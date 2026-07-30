@@ -15,8 +15,8 @@ if ([System.IO.Path]::GetFileName($resolvedExecutable) -ine 'LunaPDF.exe') {
 $classesRoot = 'Software\Classes'
 
 if (-not $PSCmdlet.ShouldProcess('the current user registry', 'Register LunaPDF as a PDF Open With candidate')) {
-    # WhatIf must stop before opening a writable registry handle so the preview
-    # cannot leave partially-created association keys.
+    # WhatIf は書き込み可能なレジストリハンドルを開く前に停止させ、
+    # プレビューで関連付けキーを部分的に作成しない。
     return
 }
 
@@ -30,8 +30,8 @@ try {
     $application.SetValue('FriendlyAppName', 'LunaPDF')
     $application.Dispose()
 
-    # Player plus %* asks Explorer to pass a multi-selection to one process;
-    # LunaPDF then applies its own documented twenty-tab limit.
+    # Player と %* により、Explorer の複数選択を1つのプロセスへ渡す。
+    # その後、LunaPDF 側で仕様上の20タブ上限を適用する。
     $applicationOpen = $classes.CreateSubKey('Applications\LunaPDF.exe\shell\open')
     $applicationOpen.SetValue('MultiSelectModel', 'Player')
     $applicationOpen.Dispose()
@@ -57,8 +57,8 @@ try {
     $documentCommand.Dispose()
 
     $pdfOpenWith = $classes.CreateSubKey('.pdf\OpenWithProgids')
-    # OpenWithProgids uses an empty REG_NONE value. It advertises a candidate
-    # without changing the protected UserChoice default application.
+    # OpenWithProgids は空の REG_NONE 値で候補を登録するため、
+    # 保護された UserChoice の既定アプリケーションを変更しない。
     $pdfOpenWith.SetValue(
         'LunaPDF.Document.1',
         [byte[]] @(),

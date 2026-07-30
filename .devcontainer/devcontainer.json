@@ -2,7 +2,7 @@
     "name": "luna-pdf-viewer-devcontainer",
     "dockerComposeFile": [
         "compose.base.yml",
-        // Optional overlays:
+        // 任意のオーバーレイ:
         "overlays/wlsg.compose.yml",
         "overlays/plantuml.compose.yml"
     ],
