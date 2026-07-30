@@ -554,17 +554,7 @@ impl MuPdfBackend {
             page_index,
             annotation_xref,
         };
-        let expected = ExpectedAnnotationState {
-            id: annotation_id,
-            quads: annotation
-                .quad_points()?
-                .iter()
-                .map(page_quad_from_mupdf)
-                .collect(),
-            contents: annotation.contents()?.unwrap_or_default().to_owned(),
-            color: annotation.color()?.map(annotation_color_from_mupdf),
-            opacity: annotation.opacity()?,
-        };
+        let expected = expected_annotation_state_from_annotation(annotation_id, &annotation)?;
         self.pending_edits.push(PendingEdit {
             action: action.clone(),
             undo: UndoEdit::DeleteCreatedAnnotation(annotation_id),
@@ -745,17 +735,7 @@ impl MuPdfBackend {
                 "annotation xref {} changed type after mutation",
                 id.xref
             );
-            return Ok(ExpectedAnnotationState {
-                id,
-                quads: annotation
-                    .quad_points()?
-                    .iter()
-                    .map(page_quad_from_mupdf)
-                    .collect(),
-                contents: annotation.contents()?.unwrap_or_default().to_owned(),
-                color: annotation.color()?.map(annotation_color_from_mupdf),
-                opacity: annotation.opacity()?,
-            });
+            return expected_annotation_state_from_annotation(id, &annotation);
         }
         Err(anyhow!(
             "Highlight xref {} disappeared after mutation",
@@ -1514,11 +1494,11 @@ fn verify_annotation_mutation(
                     id.xref
                 );
                 ensure!(
-                    annotation.contents()?.unwrap_or_default() == state.contents,
+                    annotation_contents(&annotation)? == state.contents,
                     "saved annotation xref {} changed Contents",
                     id.xref
                 );
-                let color = annotation.color()?.map(annotation_color_from_mupdf);
+                let color = annotation_color(&annotation)?;
                 ensure!(
                     annotation_colors_match(color, state.color),
                     "saved annotation xref {} changed color",
@@ -1644,6 +1624,33 @@ fn page_quad_from_mupdf(quad: &Quad) -> PageQuad {
     }
 }
 
+fn annotation_contents(annotation: &PdfAnnotation) -> Result<&str> {
+    // PDF では Contents を省略できるが、アプリケーションの注釈境界は所有 String を使う。
+    // 欠損と空文字をここで一度だけ正規化し、一覧・編集・保存後検証の解釈を一致させる。
+    Ok(annotation.contents()?.unwrap_or_default())
+}
+
+fn annotation_color(annotation: &PdfAnnotation) -> Result<Option<PdfAnnotationColor>> {
+    Ok(annotation.color()?.map(annotation_color_from_mupdf))
+}
+
+fn expected_annotation_state_from_annotation(
+    id: AnnotationId,
+    annotation: &PdfAnnotation,
+) -> Result<ExpectedAnnotationState> {
+    Ok(ExpectedAnnotationState {
+        id,
+        quads: annotation
+            .quad_points()?
+            .iter()
+            .map(page_quad_from_mupdf)
+            .collect(),
+        contents: annotation_contents(annotation)?.to_owned(),
+        color: annotation_color(annotation)?,
+        opacity: annotation.opacity()?,
+    })
+}
+
 fn annotation_summary(
     page_index: usize,
     annotation: &PdfAnnotation,
@@ -1664,8 +1671,8 @@ fn annotation_summary(
     Ok(Some(AnnotationSummary {
         id: AnnotationId { page_index, xref },
         kind: AnnotationKind::Highlight,
-        contents: annotation.contents()?.unwrap_or_default().to_owned(),
-        color: annotation.color()?.map(annotation_color_from_mupdf),
+        contents: annotation_contents(annotation)?.to_owned(),
+        color: annotation_color(annotation)?,
         can_edit_contents: document_allows_edits && !contents_locked,
         can_edit_color: document_allows_edits && !properties_locked,
         can_delete: document_allows_edits && !properties_locked,
@@ -1981,6 +1988,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn missing_highlight_contents_is_normalized_to_empty_string() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-highlight-contents.pdf");
+        let path_text = path.to_str().unwrap();
+        {
+            let mut document = PdfDocument::new();
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            let mut annotation = page
+                .add_highlight_annotation(Quad::from(Rect::new(30.0, 40.0, 130.0, 60.0)))
+                .unwrap();
+            annotation.update().unwrap();
+            page.update().unwrap();
+            drop(annotation);
+            drop(page);
+            document.save(path_text).unwrap();
+        }
+
+        let backend = MuPdfBackend::open(path).unwrap();
+        let snapshot = backend
+            .annotation_page(AnnotationPageRequest {
+                page_index: 0,
+                expected_revision: 0,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.annotations.len(), 1);
+        assert_eq!(snapshot.annotations[0].contents, "");
+
+        let batch = backend
+            .highlight_index_batch(HighlightIndexRequest {
+                generation: 1,
+                expected_revision: 0,
+                first_page: 0,
+                page_count: 1,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.pages.len(), 1);
+        assert_eq!(batch.pages[0].highlights.len(), 1);
+        assert_eq!(batch.pages[0].highlights[0].contents, "");
     }
 
     #[test]
