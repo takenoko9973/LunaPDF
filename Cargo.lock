@@ -1552,8 +1552,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "dwrote",
  "eframe",
  "egui_extras",
+ "font-kit",
  "memory-stats",
  "mupdf",
  "rfd",
