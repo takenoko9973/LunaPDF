@@ -1,5 +1,7 @@
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+#[cfg(debug_assertions)]
+use std::time::Duration;
+use std::time::SystemTime;
 
 use crate::domain::selection::PageQuad;
 
@@ -68,7 +70,8 @@ pub(crate) struct RenderedTile {
     pub(crate) page_index: usize,
     pub(crate) zoom: f32,
     pub(crate) pixels_per_point: f32,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    // 描画診断値はデバッグ表示専用であり、リリースの転送データへ保持しない。
+    #[cfg(debug_assertions)]
     pub(crate) scale: f32,
     pub(crate) generation: u64,
     pub(crate) revision: u64,
@@ -77,9 +80,9 @@ pub(crate) struct RenderedTile {
     pub(crate) page_pixel_height: u32,
     pub(crate) pixels_rgba: Vec<u8>,
     pub(crate) bounds: PageRect,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[cfg(debug_assertions)]
     pub(crate) render_time: Duration,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[cfg(debug_assertions)]
     pub(crate) physical_memory_bytes: Option<usize>,
 }
 
@@ -87,16 +90,18 @@ pub(crate) struct RenderedTile {
 pub(crate) struct DocumentInfo {
     pub(crate) path: PathBuf,
     pub(crate) page_bounds: Vec<PageRect>,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    // 注釈数と保存方式はバックエンド契約のテストでも検証するため、リリーステストに残す。
+    #[cfg(any(debug_assertions, test))]
     pub(crate) highlight_count: usize,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[cfg(any(debug_assertions, test))]
     pub(crate) can_save_incrementally: bool,
     pub(crate) highlight_capability: HighlightCapability,
     pub(crate) dirty: bool,
     pub(crate) revision: u64,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    // 時間とメモリは診断パネル専用なので、リリース版の文書情報から除外する。
+    #[cfg(debug_assertions)]
     pub(crate) open_time: Duration,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[cfg(debug_assertions)]
     pub(crate) physical_memory_bytes: Option<usize>,
     pub(crate) version: DocumentVersion,
 }

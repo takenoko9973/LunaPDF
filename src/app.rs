@@ -2609,9 +2609,9 @@ impl PrototypeApp {
         }
     }
 
-    fn status_panel(&self, root_ui: &mut egui::Ui) {
+    fn status_panel(&self, _root_ui: &mut egui::Ui) {
         #[cfg(debug_assertions)]
-        egui::Panel::bottom("debug-status").show(root_ui, |ui| {
+        egui::Panel::bottom("debug-status").show(_root_ui, |ui| {
             egui::CollapsingHeader::new("デバッグ情報")
                 .default_open(false)
                 .show(ui, |ui| {
@@ -2691,8 +2691,6 @@ impl PrototypeApp {
                     });
                 });
         });
-        #[cfg(not(debug_assertions))]
-        let _ = root_ui;
     }
 
     fn error_banner(&self, root_ui: &mut egui::Ui) {

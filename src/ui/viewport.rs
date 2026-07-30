@@ -743,6 +743,7 @@ mod tests {
             page_index: 0,
             zoom: 1.0,
             pixels_per_point: 1.0,
+            #[cfg(debug_assertions)]
             scale: 1.0,
             generation: 0,
             revision: 0,
@@ -751,7 +752,9 @@ mod tests {
             page_pixel_height: 512,
             pixels_rgba: Vec::new(),
             bounds: bounds(),
+            #[cfg(debug_assertions)]
             render_time: Duration::ZERO,
+            #[cfg(debug_assertions)]
             physical_memory_bytes: None,
         }
     }

@@ -46,26 +46,28 @@ where
         }
     }
 
+    // 予算と件数は診断パネル専用なので、リリース版ではアクセサも生成しない。
     /// このキャッシュが保持できる最大バイト数を返す。
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[cfg(debug_assertions)]
     pub(crate) fn budget(&self) -> usize {
         self.budget
     }
 
     /// 保持中の全エントリの重みの合計を返す。
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    // 追い出し後の不変条件をリリーステストでも検証するため、この値はテスト時に残す。
+    #[cfg(any(debug_assertions, test))]
     pub(crate) fn current_bytes(&self) -> usize {
         self.current_bytes
     }
 
     /// 保持中のエントリ数を返す。
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[cfg(debug_assertions)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// キャッシュに保持中のエントリがないかどうかを返す。
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[cfg(any(debug_assertions, test))]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

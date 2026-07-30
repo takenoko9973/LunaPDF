@@ -60,6 +60,7 @@ pub(super) struct MuPdfBackend {
     document: PdfDocument,
     page_bounds: Vec<PageRect>,
     version: DocumentVersion,
+    #[cfg(debug_assertions)]
     open_time: Duration,
     revision: u64,
     highlight_capability: HighlightCapability,
@@ -112,6 +113,8 @@ impl MuPdfBackend {
         let mupdf_path = path
             .to_str()
             .context("MuPDF requires a Unicode path on Windows")?;
+        // 起動時間はデバッグ表示専用なので、リリースでは計測自体を省く。
+        #[cfg(debug_assertions)]
         let open_started = Instant::now();
         let document = PdfDocument::open(mupdf_path)
             .with_context(|| format!("failed to open PDF: {}", path.display()))?;
@@ -124,6 +127,7 @@ impl MuPdfBackend {
         let highlight_capability = determine_highlight_capability(&document, &path)?;
         let version_after_open = read_document_version(&path)?;
         let version = stable_open_version(version_before_open, version_after_open)?;
+        #[cfg(debug_assertions)]
         let open_time = open_started.elapsed();
 
         Ok(Self {
@@ -131,6 +135,7 @@ impl MuPdfBackend {
             document,
             page_bounds,
             version,
+            #[cfg(debug_assertions)]
             open_time,
             revision: 0,
             highlight_capability,
@@ -144,7 +149,9 @@ impl MuPdfBackend {
         Ok(DocumentInfo {
             path: self.path.clone(),
             page_bounds: self.page_bounds.clone(),
+            #[cfg(any(debug_assertions, test))]
             highlight_count: highlight_count(&self.document)?,
+            #[cfg(any(debug_assertions, test))]
             can_save_incrementally: self.should_save_incrementally(),
             highlight_capability: self.highlight_capability,
             // MuPDF は Undo 操作後も xref の `dirty` ビットを保持する。アプリケーションの
@@ -152,7 +159,9 @@ impl MuPdfBackend {
             // 信頼せずクリーンなタブへ戻せるようにする。
             dirty: !self.pending_edits.is_empty(),
             revision: self.revision,
+            #[cfg(debug_assertions)]
             open_time: self.open_time,
+            #[cfg(debug_assertions)]
             physical_memory_bytes: physical_memory_bytes(),
             version: self.version,
         })
@@ -293,6 +302,8 @@ impl MuPdfBackend {
         }
 
         let bounds = self.page_bounds[request.page_index];
+        // レンダー診断値はリリースのタイル転送契約に含めないため計測しない。
+        #[cfg(debug_assertions)]
         let render_started = Instant::now();
         let transform = Matrix::new_scale(request.scale, request.scale);
         let page_pixel_bounds = Rect::new(bounds.x0, bounds.y0, bounds.x1, bounds.y1)
@@ -333,6 +344,7 @@ impl MuPdfBackend {
             page_index: request.page_index,
             zoom: request.zoom,
             pixels_per_point: request.pixels_per_point,
+            #[cfg(debug_assertions)]
             scale: request.scale,
             generation: request.generation,
             revision: self.revision,
@@ -346,7 +358,9 @@ impl MuPdfBackend {
             page_pixel_height,
             pixels_rgba,
             bounds,
+            #[cfg(debug_assertions)]
             render_time: render_started.elapsed(),
+            #[cfg(debug_assertions)]
             physical_memory_bytes: physical_memory_bytes(),
         }))
     }
@@ -1611,6 +1625,7 @@ fn outline_item(outline: Outline, page_count: usize) -> OutlineItem {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
 fn physical_memory_bytes() -> Option<usize> {
     memory_stats::memory_stats().map(|stats| stats.physical_mem)
 }

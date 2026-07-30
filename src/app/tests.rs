@@ -1470,7 +1470,9 @@ fn page_navigation_preserves_the_render_generation() {
         highlight_capability: crate::domain::document::HighlightCapability::Allowed,
         dirty: false,
         revision: 0,
+        #[cfg(debug_assertions)]
         open_time: Duration::ZERO,
+        #[cfg(debug_assertions)]
         physical_memory_bytes: None,
         version: crate::domain::document::DocumentVersion {
             identity_primary: 0,

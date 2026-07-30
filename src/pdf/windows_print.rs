@@ -58,16 +58,16 @@ pub(super) fn print_document(backend: &mut MuPdfBackend) -> Result<PrintOutcome>
     let started = unsafe { StartDocW(selection.dc.0, &document_info) };
     ensure!(started > 0, "Windows printer rejected StartDoc");
 
-    let result = print_selected_pages(
-        backend,
-        selection.dc.0,
-        selection.first_page,
-        selection.last_page,
+    let print_context = PrintJobContext {
+        dc: selection.dc.0,
+        first_page: selection.first_page,
+        last_page: selection.last_page,
         printable_width,
         printable_height,
-        info.revision,
-        &info.page_bounds,
-    );
+        revision: info.revision,
+        page_bounds: &info.page_bounds,
+    };
+    let result = print_selected_pages(backend, print_context);
     if let Err(error) = result {
         // StartDoc が成功した後、部分的に送信されたジョブを破棄する有効な方法は
         // AbortDoc だけである。開いたままにするとスプーラーが停止するおそれがある。
@@ -81,25 +81,26 @@ pub(super) fn print_document(backend: &mut MuPdfBackend) -> Result<PrintOutcome>
     Ok(PrintOutcome::Completed)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_selected_pages(
-    backend: &mut MuPdfBackend,
+/// `StartDoc` 後に固定され、すべてのページ帯で共有する印刷ジョブの条件。
+struct PrintJobContext<'a> {
     dc: HDC,
     first_page: usize,
     last_page: usize,
     printable_width: u32,
     printable_height: u32,
     revision: u64,
-    page_bounds: &[crate::domain::document::PageRect],
-) -> Result<()> {
-    for page_index in first_page..=last_page {
-        let bounds = page_bounds[page_index];
-        let layout = PrintLayout::fit(bounds, printable_width, printable_height)
+    page_bounds: &'a [crate::domain::document::PageRect],
+}
+
+fn print_selected_pages(backend: &mut MuPdfBackend, context: PrintJobContext<'_>) -> Result<()> {
+    for page_index in context.first_page..=context.last_page {
+        let bounds = context.page_bounds[page_index];
+        let layout = PrintLayout::fit(bounds, context.printable_width, context.printable_height)
             .context("PDF page does not fit the printer's printable area")?;
         let strips = layout
             .strips(PRINT_STRIP_BUDGET_BYTES)
             .context("printer scanline exceeds the print memory budget")?;
-        let started = unsafe { StartPage(dc) };
+        let started = unsafe { StartPage(context.dc) };
         ensure!(started > 0, "Windows printer rejected StartPage");
 
         for strip in strips {
@@ -109,7 +110,7 @@ fn print_selected_pages(
                 pixels_per_point: 1.0,
                 scale: layout.scale,
                 generation: 0,
-                expected_revision: revision,
+                expected_revision: context.revision,
                 spec: TileSpec {
                     pixel_x: 0,
                     pixel_y: strip.pixel_y,
@@ -136,7 +137,7 @@ fn print_selected_pages(
                 .context("print destination exceeds GDI coordinates")?;
             let copied = unsafe {
                 StretchDIBits(
-                    dc,
+                    context.dc,
                     layout.offset_x,
                     destination_y,
                     i32::try_from(layout.pixel_width)?,
@@ -158,7 +159,7 @@ fn print_selected_pages(
                 "Windows printer rejected a page bitmap strip"
             );
         }
-        let ended = unsafe { EndPage(dc) };
+        let ended = unsafe { EndPage(context.dc) };
         ensure!(ended > 0, "Windows printer rejected EndPage");
     }
     Ok(())
