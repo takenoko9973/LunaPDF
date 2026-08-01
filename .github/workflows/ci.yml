@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+
+jobs:
+  windows:
+    name: Windows MSVC
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.92.0 --component rustfmt --component clippy
+          rustup default 1.92.0
+          rustc --version
+          cargo --version
+
+      - name: Verify native build dependency
+        shell: pwsh
+        run: |
+          $libclang = Join-Path $env:LIBCLANG_PATH 'libclang.dll'
+          if (-not (Test-Path -LiteralPath $libclang -PathType Leaf)) {
+            throw "GitHub runner does not provide libclang.dll at $libclang."
+          }
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Windows tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Run Windows Clippy
+        run: cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc

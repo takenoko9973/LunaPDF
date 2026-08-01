@@ -1,0 +1,84 @@
+name: Windows distribution
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-distribution-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+
+jobs:
+  build:
+    name: Build installer and portable ZIP
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.92.0
+          rustup default 1.92.0
+          rustc --version
+          cargo --version
+
+      - name: Verify native distribution tools
+        shell: pwsh
+        run: |
+          $libclang = Join-Path $env:LIBCLANG_PATH 'libclang.dll'
+          if (-not (Test-Path -LiteralPath $libclang -PathType Leaf)) {
+            throw "GitHub runner does not provide libclang.dll at $libclang."
+          }
+
+          $innoCompiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $innoCompiler -PathType Leaf)) {
+            throw "GitHub runner does not provide Inno Setup 6 at $innoCompiler."
+          }
+          "INNO_COMPILER=$innoCompiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build Windows release executable
+        shell: pwsh
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item -LiteralPath target\x86_64-pc-windows-msvc\release\lunapdf.exe -Destination dist\lunapdf-release.exe
+
+      - name: Build distributions
+        shell: pwsh
+        run: |
+          .\packaging\windows\build-distributions.ps1 -ExecutablePath .\dist\lunapdf-release.exe -TargetTriple x86_64-pc-windows-msvc -OutputDirectory .\dist -InnoCompilerPath $env:INNO_COMPILER
+
+      - name: Verify distribution outputs
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath dist -Filter 'LunaPDF-Setup-*-x64.exe' -File)
+          $portableZips = @(Get-ChildItem -LiteralPath dist -Filter 'LunaPDF-Portable-*-x64.zip' -File)
+          if ($installers.Count -ne 1 -or $portableZips.Count -ne 1) {
+            throw 'Expected exactly one installer and one portable ZIP.'
+          }
+          $installers
+          $portableZips
+
+      - name: Upload Windows distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: LunaPDF-Windows-${{ github.sha }}
+          path: |
+            dist/LunaPDF-Setup-*-x64.exe
+            dist/LunaPDF-Portable-*-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
