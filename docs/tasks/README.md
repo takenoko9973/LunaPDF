@@ -45,3 +45,4 @@
 Windows向け実行ファイル、インストーラー、ポータブル版、CI/CDなど、配布に関する指示書と報告を置く。
 
 - [LunaPDF Windows配布対応 指示書](distribution/260802_lunapdf_windows_distribution_instructions.md)
+- [LunaPDF Windows配布対応 作業報告](distribution/260802_lunapdf_windows_distribution_report.md)

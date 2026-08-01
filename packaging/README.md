@@ -1,5 +1,8 @@
 # Distribution packaging
 
+Complete Windows build, installation, and update instructions are available in
+[`docs/windows-distribution.md`](../docs/windows-distribution.md).
+
 LunaPDF exposes PDF association metadata without changing the operating
 system's default PDF application.
 
