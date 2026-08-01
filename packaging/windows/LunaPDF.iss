@@ -80,5 +80,40 @@ Root: HKCU; Subkey: "Software\LunaPDF\Capabilities"; ValueType: string; ValueNam
 Root: HKCU; Subkey: "Software\LunaPDF\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pdf"; ValueData: "LunaPDF.Document.1"
 Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "LunaPDF"; ValueData: "Software\LunaPDF\Capabilities"; Flags: uninsdeletevalue
 
+[UninstallDelete]
+Type: filesandordirs; Name: "{userappdata}\LunaPDF"; Check: ShouldDeleteUserData
+
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+
+var
+  DeleteUserData: Boolean;
+
+function InitializeUninstall: Boolean;
+begin
+  { サイレントアンインストールでは設定を保持する }
+  if UninstallSilent then
+  begin
+    DeleteUserData := False;
+  end
+  else
+  begin
+    DeleteUserData :=
+      MsgBox(
+        'LunaPDF の設定とセッションデータも削除しますか？' + #13#10 + #13#10 +
+        '開いていたタブ、表示状態、注釈色履歴などが削除されます。' + #13#10 +
+        'この操作は元に戻せません。',
+        mbConfirmation,
+        MB_YESNO or MB_DEFBUTTON2
+      ) = IDYES;
+  end;
+
+  Result := True;
+end;
+
+function ShouldDeleteUserData: Boolean;
+begin
+  Result := DeleteUserData;
+end;
