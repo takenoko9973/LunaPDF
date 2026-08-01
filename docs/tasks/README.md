@@ -22,6 +22,8 @@
 - [Codex向け LunaPDF 注釈UI・カーソル・コピー操作 差分修正指示書](ui-improvement/260728_lunapdf_ui_cursor_copy_followup_instructions.md)
 - [Codex向け LunaPDF 閉じた手カーソル資産化・CUR統合 指示書](ui-improvement/260729_lunapdf_closed_hand_cursor_cur_instructions.md)
 - [Codex向け LunaPDF UI文字縦位置・フォントメトリクス追補修正指示書](ui-improvement/260730_lunapdf_codex_font_vertical_alignment_followup_instructions.md)
+- [Codex向け LunaPDF タブ並べ替え・左右分割ビュー実装指示書](ui-improvement/260801_lunapdf_tab_reorder_horizontal_split_view_instructions.md)
+- [LunaPDF タブ並べ替え・左右分割ビュー 作業報告](ui-improvement/260801_lunapdf_tab_reorder_horizontal_split_view_report.md)
 - [LunaPDF UI文字縦位置・フォントメトリクス追補修正 作業報告](ui-improvement/260730_lunapdf_font_vertical_alignment_followup_report.md)
 - [LunaPDF 独自カーソル撤去・標準カーソル化 作業報告](ui-improvement/260729_lunapdf_closed_hand_cursor_cur_report.md)
 - [LunaPDF 注釈UI・カーソル・コピー操作 差分修正 作業報告](ui-improvement/260728_lunapdf_ui_cursor_copy_followup_report.md)

@@ -38,8 +38,11 @@ impl SessionStore {
                     .with_context(|| format!("open session file {}", self.path.display()));
             }
         };
-        let state: SessionState = serde_json::from_reader(BufReader::new(file))
+        let value: serde_json::Value = serde_json::from_reader(BufReader::new(file))
             .with_context(|| format!("parse session file {}", self.path.display()))?;
+        // decodeがschema判別と旧wire移行を一箇所で行うため、storeはJSON値をそのまま委譲する。
+        let state = SessionState::decode(value)
+            .with_context(|| format!("decode session file {}", self.path.display()))?;
         state
             .validate()
             .with_context(|| format!("validate session file {}", self.path.display()))?;
@@ -128,13 +131,14 @@ fn linux_config_path(xdg: Option<&Path>, home: Option<&Path>) -> Result<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::session::{DisplayMode, SessionTab, SessionView, SidebarTab, ZoomMode};
+    use crate::domain::session::{
+        DisplayMode, SessionLayout, SessionPane, SessionTab, SessionView, SidebarTab, ZoomMode,
+    };
 
     fn valid_state(directory: &Path) -> SessionState {
         SessionState {
-            schema_version: 1,
+            schema_version: 2,
             restore_enabled: true,
-            selected_tab: Some(0),
             sidebar_open: true,
             sidebar_tab: SidebarTab::Thumbnails,
             tabs: vec![SessionTab {
@@ -148,6 +152,14 @@ mod tests {
                     zoom: 1.75,
                 },
             }],
+            layout: SessionLayout {
+                panes: vec![SessionPane {
+                    tab_indices: vec![0],
+                    selected_tab: 0,
+                }],
+                focused_pane: Some(0),
+                split: None,
+            },
             recent_annotation_colors: Vec::new(),
         }
     }
@@ -186,6 +198,35 @@ mod tests {
     }
 
     #[test]
+    fn schema_one_session_is_migrated_on_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "restore_enabled": true,
+            "selected_tab": 0,
+            "sidebar_open": false,
+            "sidebar_tab": "Outline",
+            "tabs": [serde_json::json!({
+                "path": directory.path().join("paper.pdf"),
+                "view": {
+                    "page_index": 0,
+                    "page_x": 0.5,
+                    "page_y": 0.5,
+                    "display": "SinglePage",
+                    "zoom_mode": "Fixed",
+                    "zoom": 1.0
+                }
+            })]
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let migrated = SessionStore::new(path).load().unwrap().unwrap();
+        assert_eq!(migrated.schema_version, 2);
+        assert_eq!(migrated.layout.panes[0].tab_indices, vec![0]);
+    }
+
+    #[test]
     fn sessions_with_more_than_fifty_tabs_are_accepted() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = valid_state(directory.path());
@@ -196,7 +237,8 @@ mod tests {
                 tab
             })
             .collect();
-        state.selected_tab = Some(50);
+        state.layout.panes[0].tab_indices = (0..51).collect();
+        state.layout.panes[0].selected_tab = 50;
         assert!(state.validate().is_ok());
     }
 
@@ -211,14 +253,15 @@ mod tests {
                 tab
             })
             .collect();
-        state.selected_tab = Some(12);
+        state.layout.panes[0].tab_indices = (0..51).collect();
+        state.layout.panes[0].selected_tab = 12;
         let store = SessionStore::new(directory.path().join("session.json"));
 
         store.save(&state).unwrap();
         let restored = store.load().unwrap().unwrap();
 
         assert_eq!(restored.tabs, state.tabs);
-        assert_eq!(restored.selected_tab, Some(12));
+        assert_eq!(restored.layout.panes[0].selected_tab, 12);
     }
 
     #[test]

@@ -18,9 +18,7 @@ impl PrototypeApp {
                         let revision = info.revision;
                         let page_count = info.page_bounds.len();
                         let restored_open = self.documents[index].restoring_from_session;
-                        let select_after_restore = self.documents[index].select_after_restore;
                         self.documents[index].restoring_from_session = false;
-                        self.documents[index].select_after_restore = false;
                         self.status = format!("Opened {}", info.path.display());
                         self.documents[index]
                             .view
@@ -48,16 +46,13 @@ impl PrototypeApp {
                             self.begin_search(index);
                         }
                         if restored_open {
-                            if select_after_restore {
-                                self.select_tab(index);
-                            }
                             self.finish_session_restore(true);
                         }
                     }
                     Ok(DocumentEvent::DocumentChanged(info)) => {
-                        if self.active_index() == Some(index) {
+                        if self.is_visible_index(index) {
                             self.documents[index].view.stop_autoscroll();
-                            self.viewport.cancel_primary_interaction();
+                            self.cancel_viewport_for_index(index);
                         }
                         let dirty = info.dirty;
                         let revision = info.revision;
@@ -117,7 +112,7 @@ impl PrototypeApp {
                         }
                     }
                     Ok(DocumentEvent::TileRendered(mut tile)) => {
-                        let is_active = self.active_index() == Some(index);
+                        let is_visible = self.is_visible_index(index);
                         let key = TileCacheKey::from_tile(self.documents[index].document_id, &tile);
                         let tab = &mut self.documents[index];
                         #[cfg(debug_assertions)]
@@ -129,7 +124,7 @@ impl PrototypeApp {
                             .is_some_and(|request| request.priority != RenderPriority::Visible);
                         let current_revision = tab.info.as_ref().map(|info| info.revision);
                         let result_is_current = tile_result_is_current(
-                            is_active,
+                            is_visible,
                             key,
                             tile.generation,
                             tab.view.generation,
@@ -252,13 +247,13 @@ impl PrototypeApp {
                     }
                     Ok(DocumentEvent::TextSnapshotReady(snapshot)) => {
                         let key = TextSnapshotKey::from_snapshot(&snapshot);
-                        let is_active = self.active_index() == Some(index);
+                        let is_visible = self.is_visible_index(index);
                         let tab = &mut self.documents[index];
                         tab.pending_text_snapshots.remove(&key);
                         let current_revision = tab.info.as_ref().map(|info| info.revision);
                         let page_count = tab.info.as_ref().map_or(0, |info| info.page_bounds.len());
                         let is_current = text_snapshot_result_is_current(
-                            is_active,
+                            is_visible,
                             key,
                             current_revision,
                             page_count,
@@ -275,13 +270,13 @@ impl PrototypeApp {
                     }
                     Ok(DocumentEvent::TextSnapshotFailed { request, message }) => {
                         let key = TextSnapshotKey::from_request(&request);
-                        let is_active = self.active_index() == Some(index);
+                        let is_visible = self.is_visible_index(index);
                         let tab = &mut self.documents[index];
                         tab.pending_text_snapshots.remove(&key);
                         let current_revision = tab.info.as_ref().map(|info| info.revision);
                         let page_count = tab.info.as_ref().map_or(0, |info| info.page_bounds.len());
                         let is_current = text_snapshot_result_is_current(
-                            is_active,
+                            is_visible,
                             key,
                             current_revision,
                             page_count,
@@ -299,12 +294,12 @@ impl PrototypeApp {
                             page_index: snapshot.page_index,
                             expected_revision: snapshot.revision,
                         };
-                        let is_active = self.active_index() == Some(index);
+                        let is_visible = self.is_visible_index(index);
                         let tab = &mut self.documents[index];
                         tab.pending_annotation_pages.remove(&request);
                         let current_revision = tab.info.as_ref().map(|info| info.revision);
                         let is_current = annotation_page_result_is_current(
-                            is_active,
+                            is_visible,
                             request,
                             current_revision,
                             &tab.wanted_annotation_pages,
@@ -320,12 +315,12 @@ impl PrototypeApp {
                             .remove(&request);
                     }
                     Ok(DocumentEvent::AnnotationsFailed { request, message }) => {
-                        let is_active = self.active_index() == Some(index);
+                        let is_visible = self.is_visible_index(index);
                         let tab = &mut self.documents[index];
                         tab.pending_annotation_pages.remove(&request);
                         let current_revision = tab.info.as_ref().map(|info| info.revision);
                         let is_current = annotation_page_result_is_current(
-                            is_active,
+                            is_visible,
                             request,
                             current_revision,
                             &tab.wanted_annotation_pages,
@@ -455,9 +450,9 @@ impl PrototypeApp {
                         self.documents[index].error = None;
                     }
                     Ok(DocumentEvent::Failed { operation, message }) => {
-                        if self.active_index() == Some(index) {
+                        if self.is_visible_index(index) {
                             self.documents[index].view.stop_autoscroll();
-                            self.viewport.cancel_primary_interaction();
+                            self.cancel_viewport_for_index(index);
                         }
                         if operation == "open" && self.documents[index].restoring_from_session {
                             // イベントキューを走査中はタブ配列をずらせない。現在の全インデックスを
@@ -530,9 +525,9 @@ impl PrototypeApp {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        if self.active_index() == Some(index) {
+                        if self.is_visible_index(index) {
                             self.documents[index].view.stop_autoscroll();
-                            self.viewport.cancel_primary_interaction();
+                            self.cancel_viewport_for_index(index);
                         }
                         if self.documents[index].restoring_from_session {
                             let path = self.tabs.tabs()[index].path().to_path_buf();

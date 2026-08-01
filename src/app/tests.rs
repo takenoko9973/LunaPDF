@@ -24,6 +24,29 @@ fn saved_tab(path: PathBuf, page_index: usize) -> SessionTab {
     }
 }
 
+fn single_pane_layout(tab_count: usize, selected_tab: usize) -> SessionLayout {
+    SessionLayout {
+        panes: vec![SessionPane {
+            tab_indices: (0..tab_count).collect(),
+            selected_tab,
+        }],
+        focused_pane: Some(0),
+        split: None,
+    }
+}
+
+fn runtime_tab_ids(count: usize) -> (tempfile::TempDir, Vec<TabId>) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut tabs = TabState::new();
+    for index in 0..count {
+        let path = directory.path().join(format!("runtime-{index}.pdf"));
+        std::fs::File::create(path.clone()).unwrap();
+        tabs.open(path).unwrap();
+    }
+    let ids = tabs.tabs().iter().map(|tab| tab.id()).collect();
+    (directory, ids)
+}
+
 fn finish_async_session_restore(app: &mut PrototypeApp) {
     let context = egui::Context::default();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -463,6 +486,8 @@ fn tab_activation_cancels_navigation_owned_by_previous_document() {
     let session_path = directory.path().join("session.json");
     let mut app =
         PrototypeApp::from_startup(vec![first_pdf, second_pdf], SessionStore::new(session_path));
+    app.select_tab(0);
+    let pane_id = app.tabs.focused_pane();
     app.documents[0].view.autoscroll = Some(AutoscrollState {
         anchor: Pos2::ZERO,
         requested_offset: Some(Vec2::ZERO),
@@ -486,17 +511,198 @@ fn tab_activation_cancels_navigation_owned_by_previous_document() {
             ..Default::default()
         };
         let _output = context.run_ui(input, |ui| {
-            app.viewport
+            app.viewports
+                .get_mut(&pane_id)
+                .unwrap()
                 .interact_background(ui, ui.max_rect(), &[], &[], false);
         });
     }
-    assert!(app.viewport.blank_pan_in_progress());
+    assert!(app.viewports[&pane_id].blank_pan_in_progress());
 
-    app.activate_document(1, Some(0));
+    app.select_tab(1);
 
     assert!(app.documents[0].view.autoscroll.is_none());
-    assert!(!app.viewport.primary_interaction_in_progress());
-    assert!(!app.viewport.blank_pan_in_progress());
+    assert!(!app.viewports[&pane_id].primary_interaction_in_progress());
+    assert!(!app.viewports[&pane_id].blank_pan_in_progress());
+}
+
+#[test]
+fn split_keeps_both_selected_documents_visible_while_focus_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = (0..3)
+        .map(|index| {
+            let path = directory.path().join(format!("{index}.pdf"));
+            write_blank_pdf(&path);
+            path
+        })
+        .collect::<Vec<_>>();
+    let session_path = directory.path().join("session.json");
+    let mut app = PrototypeApp::from_startup(paths, SessionStore::new(session_path));
+    let primary = app.tabs.focused_pane();
+    let first_id = app.tabs.tabs()[0].id();
+
+    assert!(
+        app.tabs
+            .split(first_id, crate::domain::tabs::SplitPlacement::After)
+    );
+    app.sync_pane_viewports();
+    let secondary = app.tabs.focused_pane();
+
+    assert_eq!(app.visible_indices(), vec![2, 0]);
+    assert!(app.is_visible_index(0));
+    assert!(!app.is_visible_index(1));
+    assert!(app.is_visible_index(2));
+    assert_eq!(app.active_index(), Some(0));
+    assert_eq!(app.viewports.len(), 2);
+
+    app.focus_pane(primary);
+
+    assert_eq!(app.active_index(), Some(2));
+    assert_eq!(app.visible_indices(), vec![2, 0]);
+    assert_eq!(app.tabs.focused_pane(), primary);
+    assert_ne!(primary, secondary);
+}
+
+#[test]
+fn ctrl_tab_uses_the_focused_pane_display_order_after_reorder() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = (0..3)
+        .map(|index| {
+            let path = directory.path().join(format!("ctrl-tab-{index}.pdf"));
+            write_blank_pdf(&path);
+            path
+        })
+        .collect::<Vec<_>>();
+    let mut app = PrototypeApp::from_startup(
+        paths,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let pane_id = app.tabs.focused_pane();
+    let ids = app
+        .tabs
+        .tabs()
+        .iter()
+        .map(|tab| tab.id())
+        .collect::<Vec<_>>();
+    assert!(app.tabs.reorder(pane_id, ids[2], 0));
+    assert_eq!(app.active_index(), Some(2));
+
+    app.select_next_tab();
+
+    assert_eq!(app.active_index(), Some(0));
+    assert_eq!(app.tabs.focused_pane(), pane_id);
+}
+
+#[test]
+fn split_tabs_share_one_top_row_above_both_pdf_panes() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = (0..2)
+        .map(|index| {
+            let path = directory.path().join(format!("top-tabs-{index}.pdf"));
+            write_blank_pdf(&path);
+            path
+        })
+        .collect::<Vec<_>>();
+    let mut app = PrototypeApp::from_startup(
+        paths,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let first_id = app.tabs.tabs()[0].id();
+    assert!(
+        app.tabs
+            .split(first_id, crate::domain::tabs::SplitPlacement::After)
+    );
+
+    let context = egui::Context::default();
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+        ..Default::default()
+    };
+    let mut tab_rects = Vec::new();
+    let mut pdf_rects = Vec::new();
+    let _output = context.run_ui(input, |ui| {
+        let mut pane_outputs = app.tab_bar(ui);
+        app.toolbar(ui);
+        app.central_panel(ui, &mut pane_outputs);
+        tab_rects = pane_outputs
+            .iter()
+            .map(|output| output.tab_bar.bar_rect)
+            .collect();
+        pdf_rects = pane_outputs.iter().map(|output| output.pdf_rect).collect();
+    });
+
+    assert_eq!(tab_rects.len(), 2);
+    assert_eq!(tab_rects[0].top(), tab_rects[1].top());
+    assert_eq!(tab_rects[0].bottom(), tab_rects[1].bottom());
+    assert!(
+        pdf_rects
+            .iter()
+            .all(|rect| rect.top() > tab_rects[0].bottom())
+    );
+}
+
+#[test]
+fn pointer_zoom_focuses_and_updates_the_pane_under_the_pointer() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = (0..2)
+        .map(|index| {
+            let path = directory.path().join(format!("pointer-zoom-{index}.pdf"));
+            write_blank_pdf(&path);
+            path
+        })
+        .collect::<Vec<_>>();
+    let mut app = PrototypeApp::from_startup(
+        paths,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let primary = app.tabs.focused_pane();
+    let first_id = app.tabs.tabs()[0].id();
+    assert!(
+        app.tabs
+            .split(first_id, crate::domain::tabs::SplitPlacement::After)
+    );
+    let secondary = app.tabs.focused_pane();
+    app.focus_pane(primary);
+    assert_eq!(app.active_index(), Some(1));
+
+    let context = egui::Context::default();
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+        events: vec![
+            Event::PointerMoved(Pos2::new(650.0, 300.0)),
+            Event::Zoom(1.2),
+        ],
+        ..Default::default()
+    };
+    let _output = context.run_ui(input, |ui| {
+        let mut pane_outputs = app.tab_bar(ui);
+        app.central_panel(ui, &mut pane_outputs);
+    });
+
+    assert_eq!(app.tabs.focused_pane(), secondary);
+    assert_eq!(app.active_index(), Some(0));
+    assert_eq!(app.documents[0].view.zoom, 1.2);
+    assert_eq!(app.documents[1].view.zoom, 1.0);
+
+    app.focus_pane(primary);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+        events: vec![
+            Event::PointerMoved(Pos2::new(650.0, 300.0)),
+            wheel_event(
+                MouseWheelUnit::Line,
+                Vec2::new(0.0, -1.0),
+                TouchPhase::Move,
+                false,
+            ),
+        ],
+        ..Default::default()
+    };
+    let _output = context.run_ui(input, |ui| {
+        let mut pane_outputs = app.tab_bar(ui);
+        app.central_panel(ui, &mut pane_outputs);
+    });
+    assert_eq!(app.tabs.focused_pane(), secondary);
 }
 
 fn h_key_input() -> egui::RawInput {
@@ -530,7 +736,7 @@ fn copy_key_release_event(key: Key) -> egui::Event {
 }
 
 #[test]
-fn render_result_requires_active_tab_and_current_document_state() {
+fn render_result_requires_visible_tab_and_current_document_state() {
     let key = TileCacheKey {
         document_id: 1,
         page_index: 3,
@@ -1455,7 +1661,7 @@ fn toolbar_singleline_text_is_centered_inside_its_clip_rect() {
 #[test]
 fn page_navigation_preserves_the_render_generation() {
     let path = PathBuf::from("missing.pdf");
-    let mut tab = DocumentTab::new(1, path.clone(), 0, None, false);
+    let mut tab = DocumentTab::new(1, path.clone(), 0, None);
     let bounds = crate::domain::document::PageRect {
         x0: 0.0,
         y0: 0.0,
@@ -1535,23 +1741,120 @@ fn display_mode_roundtrip_preserves_page_and_normalized_position() {
 }
 
 #[test]
+fn pane_transition_restores_the_mode_specific_center_anchor() {
+    let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None);
+    let continuous_anchor = PageAnchor {
+        page_index: 4,
+        page_x_fraction: 0.3,
+        page_y_fraction: 0.7,
+    };
+    tab.view.center_anchor = Some(continuous_anchor);
+    tab.view.autoscroll = Some(AutoscrollState {
+        anchor: Pos2::ZERO,
+        requested_offset: None,
+    });
+
+    tab.prepare_for_pane_transition();
+
+    assert_eq!(tab.view.restore_anchor, Some(continuous_anchor));
+    assert!(tab.view.autoscroll.is_none());
+
+    let single_anchor = Vec2::new(0.2, 0.8);
+    tab.view.display_mode = DisplayMode::SinglePage;
+    tab.view.single_center_anchor = Some(single_anchor);
+    tab.prepare_for_pane_transition();
+
+    assert_eq!(tab.view.restore_single_anchor, Some(single_anchor));
+}
+
+#[test]
+fn runtime_layout_drops_unavailable_tabs_and_keeps_valid_focus() {
+    let (_directory, ids) = runtime_tab_ids(3);
+    let saved = SessionLayout {
+        panes: vec![
+            SessionPane {
+                tab_indices: vec![0, 1],
+                selected_tab: 1,
+            },
+            SessionPane {
+                tab_indices: vec![2],
+                selected_tab: 2,
+            },
+        ],
+        focused_pane: Some(1),
+        split: Some(SessionSplit {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.4,
+        }),
+    };
+
+    let (panes, focused, ratio) =
+        restored_runtime_layout(&saved, &[Some(ids[0]), None, Some(ids[2])]);
+
+    assert_eq!(panes, vec![(vec![ids[0]], ids[0]), (vec![ids[2]], ids[2])]);
+    assert_eq!(focused, 1);
+    assert_eq!(ratio, 0.4);
+
+    let (panes, focused, _) = restored_runtime_layout(&saved, &[Some(ids[0]), None, None]);
+    assert_eq!(panes, vec![(vec![ids[0]], ids[0])]);
+    assert_eq!(focused, 0);
+}
+
+#[test]
+fn next_tab_follows_the_focused_pane_display_order() {
+    let (_directory, ids) = runtime_tab_ids(3);
+
+    assert_eq!(
+        next_tab_id_in_order(&[ids[2], ids[0], ids[1]], Some(ids[2])),
+        Some(ids[0])
+    );
+    assert_eq!(
+        next_tab_id_in_order(&[ids[2], ids[0], ids[1]], Some(ids[1])),
+        Some(ids[2])
+    );
+    assert_eq!(next_tab_id_in_order(&[], None), None);
+}
+
+#[test]
+fn floating_windows_and_popups_block_pane_input_but_tooltips_do_not() {
+    let id = Id::new("layer-test");
+
+    assert!(!foreground_layer_blocks_pane_input(Some(LayerId::new(
+        egui::Order::Background,
+        id,
+    ))));
+    assert!(foreground_layer_blocks_pane_input(Some(LayerId::new(
+        egui::Order::Middle,
+        id,
+    ))));
+    assert!(foreground_layer_blocks_pane_input(Some(LayerId::new(
+        egui::Order::Foreground,
+        id,
+    ))));
+    assert!(!foreground_layer_blocks_pane_input(Some(LayerId::new(
+        egui::Order::Tooltip,
+        id,
+    ))));
+}
+
+#[test]
 fn suspension_chooses_oldest_inactive_fully_suspendable_document() {
     let candidates = [(true, 2), (false, 1), (true, 3), (false, 0)];
 
-    assert_eq!(oldest_suspendable_index(Some(0), &candidates), Some(2));
-    assert_eq!(oldest_suspendable_index(Some(2), &candidates), Some(0));
+    assert_eq!(oldest_suspendable_index(&[0], &candidates), Some(2));
+    assert_eq!(oldest_suspendable_index(&[2], &candidates), Some(0));
 }
 
 #[test]
 fn suspension_skips_oldest_document_while_it_is_printing() {
     let candidates = [(false, 0), (true, 1), (true, 2)];
 
-    assert_eq!(oldest_suspendable_index(Some(2), &candidates), Some(1));
+    assert_eq!(oldest_suspendable_index(&[2], &candidates), Some(1));
 }
 
 #[test]
 fn worker_disconnect_clears_every_close_blocking_operation() {
-    let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None, false);
+    let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None);
     tab.state = DocumentState::Saving;
     tab.pending_edits = 1;
     tab.pending_annotation_pages.insert(AnnotationPageRequest {
@@ -1705,7 +2008,7 @@ fn thumbnail_failure_blocks_only_the_failed_request() {
 }
 
 #[test]
-fn text_snapshot_result_requires_active_visible_current_page() {
+fn text_snapshot_result_requires_visible_current_page() {
     let key = TextSnapshotKey {
         page_index: 2,
         revision: 4,
@@ -1750,7 +2053,7 @@ fn text_snapshot_result_requires_active_visible_current_page() {
 }
 
 #[test]
-fn annotation_result_requires_active_visible_current_revision() {
+fn annotation_result_requires_visible_current_revision() {
     let request = AnnotationPageRequest {
         page_index: 2,
         expected_revision: 4,
@@ -1868,12 +2171,12 @@ fn startup_restores_fifty_one_tabs_in_order_and_selects_saved_tab() {
         })
         .collect::<Vec<_>>();
     let state = SessionState {
-        selected_tab: Some(12),
         tabs: paths
             .iter()
             .cloned()
             .map(|path| saved_tab(path, 0))
             .collect(),
+        layout: single_pane_layout(51, 12),
         ..SessionState::default()
     };
     let session_path = directory.path().join("session.json");
@@ -1895,14 +2198,64 @@ fn startup_restores_fifty_one_tabs_in_order_and_selects_saved_tab() {
 }
 
 #[test]
+fn startup_restores_split_membership_selection_focus_and_ratio() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = (0..4)
+        .map(|index| {
+            let path = directory.path().join(format!("split-{index}.pdf"));
+            write_blank_pdf(&path);
+            std::fs::canonicalize(path).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let layout = SessionLayout {
+        panes: vec![
+            SessionPane {
+                tab_indices: vec![2, 0],
+                selected_tab: 0,
+            },
+            SessionPane {
+                tab_indices: vec![1, 3],
+                selected_tab: 3,
+            },
+        ],
+        focused_pane: Some(1),
+        split: Some(SessionSplit {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.35,
+        }),
+    };
+    let state = SessionState {
+        tabs: paths
+            .iter()
+            .cloned()
+            .map(|path| saved_tab(path, 0))
+            .collect(),
+        layout: layout.clone(),
+        ..SessionState::default()
+    };
+    let session_path = directory.path().join("session.json");
+    SessionStore::new(session_path.clone())
+        .save(&state)
+        .unwrap();
+
+    let mut app = PrototypeApp::from_startup(Vec::new(), SessionStore::new(session_path));
+    finish_async_session_restore(&mut app);
+
+    assert_eq!(app.tabs.pane_ids().len(), 2);
+    assert_eq!(app.active_index(), Some(3));
+    assert_eq!(app.tabs.split_ratio(), 0.35);
+    assert_eq!(app.current_session().layout, layout);
+}
+
+#[test]
 fn startup_does_not_restore_tabs_when_session_restore_is_disabled() {
     let directory = tempfile::tempdir().unwrap();
     let saved = directory.path().join("saved.pdf");
     write_blank_pdf(&saved);
     let state = SessionState {
         restore_enabled: false,
-        selected_tab: Some(0),
         tabs: vec![saved_tab(std::fs::canonicalize(saved).unwrap(), 0)],
+        layout: single_pane_layout(1, 0),
         ..SessionState::default()
     };
     let session_path = directory.path().join("session.json");
@@ -1928,8 +2281,8 @@ fn failed_initial_restore_is_removed_and_remaining_tab_stays_selected() {
     let inaccessible = std::fs::canonicalize(inaccessible).unwrap();
     let valid = std::fs::canonicalize(valid).unwrap();
     let state = SessionState {
-        selected_tab: Some(0),
         tabs: vec![saved_tab(inaccessible, 0), saved_tab(valid.clone(), 0)],
+        layout: single_pane_layout(2, 0),
         ..SessionState::default()
     };
     let session_path = directory.path().join("session.json");
@@ -1954,11 +2307,11 @@ fn closing_restored_tab_consumes_pending_restore_result() {
     write_blank_pdf(&first);
     write_blank_pdf(&second);
     let state = SessionState {
-        selected_tab: Some(0),
         tabs: vec![
             saved_tab(std::fs::canonicalize(first).unwrap(), 0),
             saved_tab(std::fs::canonicalize(second).unwrap(), 0),
         ],
+        layout: single_pane_layout(2, 0),
         ..SessionState::default()
     };
     let session_path = directory.path().join("session.json");
@@ -1988,8 +2341,8 @@ fn window_close_waits_for_pending_session_restore_before_saving() {
     write_blank_pdf(&path);
     let state = SessionState {
         restore_enabled: true,
-        selected_tab: Some(0),
         tabs: vec![saved_tab(std::fs::canonicalize(path).unwrap(), 0)],
+        layout: single_pane_layout(1, 0),
         ..SessionState::default()
     };
     let session_path = directory.path().join("session.json");
@@ -2020,8 +2373,8 @@ fn explicit_cli_pdf_takes_precedence_over_saved_session() {
     let saved = std::fs::canonicalize(saved).unwrap();
     let explicit = std::fs::canonicalize(explicit).unwrap();
     let state = SessionState {
-        selected_tab: Some(0),
         tabs: vec![saved_tab(saved, 0)],
+        layout: single_pane_layout(1, 0),
         ..SessionState::default()
     };
     let session_path = directory.path().join("session.json");

@@ -4,6 +4,7 @@ mod rendering;
 mod search;
 #[cfg(test)]
 mod tests;
+mod workspace;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use crossbeam_channel::TryRecvError;
 use eframe::egui::{
     self, Color32, Event, Id, Key, LayerId, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect,
     Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, TouchPhase, UiBuilder, Vec2,
-    ViewportCommand,
+    ViewportCommand, pos2,
 };
 
 use crate::domain::annotation::{
@@ -31,10 +32,11 @@ use crate::domain::selection::{
     PagePoint, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
 };
 use crate::domain::session::{
-    DisplayMode as SessionDisplayMode, SessionState, SessionTab, SessionView,
-    SidebarTab as SessionSidebarTab, ZoomMode as SessionZoomMode,
+    DisplayMode as SessionDisplayMode, SessionLayout, SessionPane, SessionSplit, SessionState,
+    SessionTab, SessionView, SidebarTab as SessionSidebarTab, SplitDirection,
+    ZoomMode as SessionZoomMode,
 };
-use crate::domain::tabs::{OpenTabResult, TabState};
+use crate::domain::tabs::{OpenTabResult, PaneId, TabId, TabState};
 use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService};
 use crate::persistence::session_store::SessionStore;
 use crate::render::cache::WeightedLruCache;
@@ -72,6 +74,10 @@ use search::{
     search_result_is_current,
 };
 use search::{SearchState, search_match_ordinal, search_query_id};
+use workspace::{
+    HorizontalSplitRects, horizontal_split_rects, split_drop_highlight, split_drop_placement,
+    tab_insertion_index,
+};
 
 // 詳細確認と全体表示の両方を覆いつつ、誤ったホイール操作で
 // ラスター割り当てが無制限に要求されない範囲に制限する。
@@ -154,7 +160,7 @@ const RESIDENT_MEMORY_SUSPEND_THRESHOLD_BYTES: usize = 512 * 1_024 * 1_024;
 pub(crate) struct PrototypeApp {
     tabs: TabState,
     documents: Vec<DocumentTab>,
-    viewport: PageViewport,
+    viewports: HashMap<PaneId, PageViewport>,
     status: String,
     error: Option<String>,
     close_confirmation: Option<CloseConfirmation>,
@@ -172,6 +178,7 @@ pub(crate) struct PrototypeApp {
     // 表示要求は次のタブバーのフレームで消費する。一度だけにすることで、その後に
     // ユーザーがスクロールして非アクティブなタブを確認できる。
     tab_to_reveal: Option<usize>,
+    tab_drag: Option<TabDragState>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
     gpu_lru: WeightedLruCache<TileCacheKey, ()>,
@@ -225,7 +232,6 @@ struct DocumentTab {
     #[cfg(debug_assertions)]
     render_performance: RenderPerformance,
     restoring_from_session: bool,
-    select_after_restore: bool,
 }
 
 struct HighlightIndexState {
@@ -393,15 +399,12 @@ enum SessionCloseDecision {
 
 enum OpenIntent {
     User,
-    Restored {
-        view: SessionView,
-        select_after_open: bool,
-    },
+    Restored { view: SessionView },
 }
 
 #[derive(Clone, Copy)]
 enum OpenDocumentResult {
-    Pending,
+    Pending(usize),
     Existing(usize),
 }
 
@@ -410,6 +413,72 @@ struct SessionRestoreProgress {
     pending: usize,
     restored: usize,
     skipped: usize,
+}
+
+fn restored_runtime_layout(
+    saved: &SessionLayout,
+    runtime_tab_ids: &[Option<TabId>],
+) -> (Vec<(Vec<TabId>, TabId)>, usize, f32) {
+    let mut seen = HashSet::new();
+    let mut restored_panes = Vec::new();
+    let mut restored_pane_indices = vec![None; saved.panes.len()];
+
+    for (saved_pane_index, pane) in saved.panes.iter().enumerate() {
+        let restored_tabs = pane
+            .tab_indices
+            .iter()
+            .enumerate()
+            .filter_map(|(position, saved_tab_index)| {
+                let tab_id = runtime_tab_ids.get(*saved_tab_index).copied().flatten()?;
+                // 異なる保存パスが同じ実体へ正規化されても、1つのランタイムタブを
+                // 複数ペインへ所属させない。
+                seen.insert(tab_id).then_some((position, tab_id))
+            })
+            .collect::<Vec<_>>();
+        if restored_tabs.is_empty() {
+            continue;
+        }
+
+        let saved_selection_position = pane
+            .tab_indices
+            .iter()
+            .position(|tab_index| *tab_index == pane.selected_tab)
+            .expect("validated session selection must belong to its pane");
+        // 選択タブを開けない場合は、closeと同じく後続を優先し、なければ直前を選ぶ。
+        let selected = restored_tabs
+            .iter()
+            .find(|(position, _)| *position >= saved_selection_position)
+            .or_else(|| restored_tabs.last())
+            .expect("empty restored panes were removed")
+            .1;
+        let tab_ids = restored_tabs
+            .into_iter()
+            .map(|(_, tab_id)| tab_id)
+            .collect();
+        restored_pane_indices[saved_pane_index] = Some(restored_panes.len());
+        restored_panes.push((tab_ids, selected));
+    }
+
+    let focused_pane = saved
+        .focused_pane
+        .and_then(|index| restored_pane_indices.get(index).copied().flatten())
+        .unwrap_or(0);
+    let ratio = saved.split.as_ref().map_or(0.5, |split| split.ratio);
+    (restored_panes, focused_pane, ratio)
+}
+
+fn next_tab_id_in_order(tab_ids: &[TabId], selected: Option<TabId>) -> Option<TabId> {
+    let current = selected.and_then(|selected| tab_ids.iter().position(|id| *id == selected));
+    let next = current.map_or(0, |index| (index + 1) % tab_ids.len());
+    tab_ids.get(next).copied()
+}
+
+fn foreground_layer_blocks_pane_input(layer: Option<LayerId>) -> bool {
+    layer.is_some_and(|layer| {
+        // MiddleはWindow、Foregroundは注釈editorやpopupが使用する。Tooltipは
+        // 操作対象ではないため、タブdrop先の探索を妨げない。
+        matches!(layer.order, egui::Order::Middle | egui::Order::Foreground)
+    })
 }
 
 #[cfg(debug_assertions)]
@@ -446,8 +515,32 @@ struct TabContentRects {
     close: Rect,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TabDragState {
+    tab_id: TabId,
+    source_pane: PaneId,
+}
+
+#[derive(Debug)]
+struct PaneTabBarOutput {
+    bar_rect: Rect,
+    tab_rects: Vec<Rect>,
+    select: Option<TabId>,
+    close: Option<TabId>,
+    drag_started: Option<TabId>,
+    drag_released: bool,
+}
+
+#[derive(Debug)]
+struct PaneUiOutput {
+    pane_id: PaneId,
+    pdf_rect: Rect,
+    tab_bar: PaneTabBarOutput,
+}
+
 struct TabPaintState<'a> {
     selected: bool,
+    focused: bool,
     can_close: bool,
     select_response: &'a egui::Response,
     close_response: &'a egui::Response,
@@ -544,6 +637,13 @@ fn paint_document_tab(
     };
     ui.painter()
         .rect(tab_rect, 4.0, background, outline, StrokeKind::Inside);
+    if state.selected && state.focused {
+        // 両ペインにはそれぞれ選択タブがあるため、共通UIの対象だけを下線で区別する。
+        ui.painter().line_segment(
+            [tab_rect.left_bottom(), tab_rect.right_bottom()],
+            Stroke::new(2.0, ui.visuals().selection.stroke.color),
+        );
+    }
 
     let text_color = if state.selected {
         ui.visuals().strong_text_color()
@@ -631,10 +731,13 @@ impl PrototypeApp {
             .as_ref()
             .map(|session| session.recent_annotation_colors.clone())
             .unwrap_or_default();
+        let tabs = TabState::new();
+        let mut viewports = HashMap::new();
+        viewports.insert(tabs.focused_pane(), PageViewport::default());
         let mut app = Self {
-            tabs: TabState::new(),
+            tabs,
             documents: Vec::new(),
-            viewport: PageViewport::default(),
+            viewports,
             status: "Drop a PDF into the window to open it".to_owned(),
             error: session_load_error,
             close_confirmation: None,
@@ -650,6 +753,7 @@ impl PrototypeApp {
             next_document_id: 1,
             activity_sequence: 0,
             tab_to_reveal: None,
+            tab_drag: None,
             sidebar_open: false,
             sidebar_tab: SidebarTab::Outline,
             gpu_lru: WeightedLruCache::new(GPU_TILE_BUDGET_BYTES),
@@ -680,7 +784,8 @@ impl PrototypeApp {
     fn pick_pdf_and_open(&mut self) {
         // ネイティブピッカーの間は PDF の操作面が一時的に置き換わるため、
         // ダイアログから戻ったときにアンカーを再開してはならない。
-        self.stop_active_autoscroll();
+        self.stop_visible_autoscroll();
+        self.cancel_all_viewport_interactions();
         let selected = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
             .pick_file();
@@ -689,9 +794,22 @@ impl PrototypeApp {
         }
     }
 
-    fn stop_active_autoscroll(&mut self) {
-        if let Some(index) = self.active_index() {
+    fn stop_visible_autoscroll(&mut self) {
+        for index in self.visible_indices() {
             self.documents[index].view.stop_autoscroll();
+        }
+    }
+
+    fn cancel_all_viewport_interactions(&mut self) {
+        for viewport in self.viewports.values_mut() {
+            viewport.cancel_primary_interaction();
+        }
+    }
+
+    fn cancel_active_viewport_interaction(&mut self) {
+        let pane_id = self.tabs.focused_pane();
+        if let Some(viewport) = self.viewports.get_mut(&pane_id) {
+            viewport.cancel_primary_interaction();
         }
     }
 
@@ -704,34 +822,36 @@ impl PrototypeApp {
         };
 
         let saved_tab_count = session.tabs.len();
-        let saved_selection = session.selected_tab;
-        let mut restored_selection = None;
+        let mut runtime_tab_ids = vec![None; saved_tab_count];
         let mut pending_count = 0;
         let mut restored_count = 0;
         let mut skipped_count = 0;
         for (saved_index, tab) in session.tabs.into_iter().enumerate() {
-            let should_select = saved_selection == Some(saved_index);
-            let opened = self.open_document_with_intent(
-                tab.path,
-                OpenIntent::Restored {
-                    view: tab.view,
-                    select_after_open: should_select,
-                },
-            );
+            let opened =
+                self.open_document_with_intent(tab.path, OpenIntent::Restored { view: tab.view });
             match opened {
-                Some(OpenDocumentResult::Pending) => pending_count += 1,
-                Some(OpenDocumentResult::Existing(index)) if should_select => {
-                    restored_selection = Some(index);
+                Some(OpenDocumentResult::Pending(index)) => {
+                    runtime_tab_ids[saved_index] = self.tabs.tabs().get(index).map(|tab| tab.id());
+                    pending_count += 1;
+                }
+                Some(OpenDocumentResult::Existing(index)) => {
+                    runtime_tab_ids[saved_index] = self.tabs.tabs().get(index).map(|tab| tab.id());
                     restored_count += 1;
                 }
-                Some(OpenDocumentResult::Existing(_)) => restored_count += 1,
                 None => skipped_count += 1,
             }
         }
 
-        if let Some(index) = restored_selection {
-            self.select_tab(index);
-        }
+        let (layouts, focused_pane, ratio) =
+            restored_runtime_layout(&session.layout, &runtime_tab_ids);
+        // 保存パスが同じ実体へ正規化される場合や消失した場合も、開けたタブだけで
+        // 一度に配置を確定し、非同期 Opened の到着順にフォーカスを揺らさない。
+        let restored = self.tabs.restore_layout(layouts, focused_pane, ratio);
+        debug_assert!(
+            restored,
+            "validated session must produce a valid runtime layout"
+        );
+        self.sync_pane_viewports();
         let progress = SessionRestoreProgress {
             requested: saved_tab_count,
             pending: pending_count,
@@ -750,12 +870,9 @@ impl PrototypeApp {
         intent: OpenIntent,
     ) -> Option<OpenDocumentResult> {
         let report_to_user = matches!(&intent, OpenIntent::User);
-        let (restored_view, select_after_restore) = match intent {
-            OpenIntent::User => (None, false),
-            OpenIntent::Restored {
-                view,
-                select_after_open,
-            } => (Some(view), select_after_open),
+        let restored_view = match intent {
+            OpenIntent::User => None,
+            OpenIntent::Restored { view } => Some(view),
         };
         if !is_pdf_path(&path) {
             if report_to_user {
@@ -768,6 +885,7 @@ impl PrototypeApp {
         }
 
         let previously_active = self.active_index();
+        let previously_visible = self.visible_indices();
         match self.tabs.open(&path) {
             Ok(OpenTabResult::Opened(index)) => {
                 let canonical_path = self.tabs.tabs()[index].path().to_path_buf();
@@ -782,17 +900,16 @@ impl PrototypeApp {
                     canonical_path,
                     activity_sequence,
                     restored_view,
-                    select_after_restore,
                 ));
-                self.activate_document(index, previously_active);
+                self.activate_document(index, previously_active, &previously_visible);
                 if report_to_user {
                     self.status = format!("Opening {}…", path.display());
                     self.error = None;
                 }
-                Some(OpenDocumentResult::Pending)
+                Some(OpenDocumentResult::Pending(index))
             }
             Ok(OpenTabResult::SelectedExisting(index)) => {
-                self.activate_document(index, previously_active);
+                self.activate_document(index, previously_active, &previously_visible);
                 if report_to_user {
                     self.status = format!("Selected existing tab: {}", path.display());
                     self.error = None;
@@ -918,11 +1035,6 @@ impl PrototypeApp {
             }
         }
 
-        let zoom_delta = context.input(|input| input.zoom_delta());
-        if (zoom_delta - 1.0).abs() > f32::EPSILON {
-            self.zoom_by(zoom_delta);
-        }
-
         let close_flow_active = self.window_close_pending
             || self.close_all_pending
             || self.close_confirmation.is_some();
@@ -1010,40 +1122,105 @@ impl PrototypeApp {
         self.tabs.selected_index()
     }
 
+    fn visible_indices(&self) -> Vec<usize> {
+        self.tabs
+            .visible_selected_tab_ids()
+            .into_iter()
+            .filter_map(|tab_id| self.tabs.tab_registry_index(tab_id))
+            .collect()
+    }
+
+    fn is_visible_index(&self, index: usize) -> bool {
+        self.tabs
+            .tabs()
+            .get(index)
+            .is_some_and(|tab| self.tabs.visible_selected_tab_ids().contains(&tab.id()))
+    }
+
+    fn pane_for_index(&self, index: usize) -> Option<PaneId> {
+        let tab_id = self.tabs.tabs().get(index)?.id();
+        self.tabs.tab_pane(tab_id)
+    }
+
+    fn cancel_viewport_for_index(&mut self, index: usize) {
+        if let Some(pane_id) = self.pane_for_index(index)
+            && let Some(viewport) = self.viewports.get_mut(&pane_id)
+        {
+            viewport.cancel_primary_interaction();
+        }
+    }
+
+    fn sync_pane_viewports(&mut self) {
+        let pane_ids = self.tabs.pane_ids();
+        self.viewports.retain(|pane_id, viewport| {
+            let retained = pane_ids.contains(pane_id);
+            if !retained {
+                viewport.cancel_primary_interaction();
+            }
+            retained
+        });
+        for pane_id in pane_ids {
+            self.viewports.entry(pane_id).or_default();
+        }
+    }
+
     fn next_activity_sequence(&mut self) -> u64 {
         self.activity_sequence = self.activity_sequence.wrapping_add(1);
         self.activity_sequence
     }
 
-    fn activate_document(&mut self, index: usize, previous: Option<usize>) {
+    fn activate_document(
+        &mut self,
+        index: usize,
+        previous: Option<usize>,
+        previously_visible: &[usize],
+    ) {
         if let Some(tab_to_reveal) = tab_reveal_for_selection_change(previous, index) {
             self.tab_to_reveal = Some(tab_to_reveal);
         }
         if let Some(previous) = previous.filter(|previous| *previous != index) {
             self.documents[previous].view.stop_autoscroll();
-            // PageViewport はタブ間で共有されるため、主ジェスチャーを新しく
-            // アクティブになった文書に対して解釈してはならない。
-            self.viewport.cancel_primary_interaction();
-            // タブ切り替えで変わるのは要求の所有者であり、タイルの同一性ではない。
-            // generation や再利用可能なテクスチャを破棄せず、キュー済み処理だけを取り消す。
-            self.documents[previous].cancel_rendering_requests();
-            self.documents[previous].invalidate_text_snapshots();
-            self.documents[previous].invalidate_annotation_pages();
-            self.documents[previous].search.generation =
-                self.documents[previous].search.generation.wrapping_add(1);
-            let generation = self.documents[previous].search.generation;
-            let _queued =
-                self.documents[previous].send(DocumentCommand::SetSearchGeneration(generation));
-            self.documents[previous].search.in_progress = false;
+            if let Some(pane_id) = self.pane_for_index(previous)
+                && let Some(viewport) = self.viewports.get_mut(&pane_id)
+            {
+                // フォーカスを外したペインの未完了ジェスチャーを、次の共通UI操作へ
+                // 持ち越さない。文書描画要求は可視である限り維持する。
+                viewport.cancel_primary_interaction();
+            }
         }
 
+        let currently_visible = self.visible_indices();
+        for previous_visible in previously_visible
+            .iter()
+            .copied()
+            .filter(|previous| !currently_visible.contains(previous))
+        {
+            // ペイン内選択が変わって画面から外れた文書だけを取り消す。フォーカスだけが
+            // 変わった反対側ペインの可視要求は残す。
+            self.documents[previous_visible].cancel_rendering_requests();
+            self.documents[previous_visible].invalidate_text_snapshots();
+            self.documents[previous_visible].invalidate_annotation_pages();
+            self.documents[previous_visible].search.generation = self.documents[previous_visible]
+                .search
+                .generation
+                .wrapping_add(1);
+            let generation = self.documents[previous_visible].search.generation;
+            let _queued = self.documents[previous_visible]
+                .send(DocumentCommand::SetSearchGeneration(generation));
+            self.documents[previous_visible].search.in_progress = false;
+        }
+
+        self.sync_pane_viewports();
+        for visible_index in currently_visible {
+            if self.documents[visible_index].state == DocumentState::Suspended {
+                let path = self.tabs.tabs()[visible_index].path().to_path_buf();
+                self.documents[visible_index].resume(path);
+                self.status = "Reopening suspended PDF after external-change check…".to_owned();
+            }
+        }
         let sequence = self.next_activity_sequence();
         self.documents[index].last_selected_sequence = sequence;
-        if self.documents[index].state == DocumentState::Suspended {
-            let path = self.tabs.tabs()[index].path().to_path_buf();
-            self.documents[index].resume(path);
-            self.status = "Reopening suspended PDF after external-change check…".to_owned();
-        } else if !self.documents[index].search.query.trim().is_empty()
+        if !self.documents[index].search.query.trim().is_empty()
             && !self.documents[index].search.in_progress
         {
             self.begin_search(index);
@@ -1052,10 +1229,22 @@ impl PrototypeApp {
 
     fn select_tab(&mut self, index: usize) {
         let previous = self.active_index();
+        let previously_visible = self.visible_indices();
         if !self.tabs.select(index) {
             return;
         }
-        self.activate_document(index, previous);
+        self.activate_document(index, previous, &previously_visible);
+    }
+
+    fn focus_pane(&mut self, pane_id: PaneId) {
+        let previous = self.active_index();
+        let previously_visible = self.visible_indices();
+        if !self.tabs.focus_pane(pane_id) {
+            return;
+        }
+        if let Some(index) = self.active_index() {
+            self.activate_document(index, previous, &previously_visible);
+        }
     }
 
     fn maybe_suspend_inactive_document(&mut self) {
@@ -1080,7 +1269,8 @@ impl PrototypeApp {
                 )
             })
             .collect::<Vec<_>>();
-        let Some(index) = oldest_suspendable_index(self.active_index(), &candidates) else {
+        let visible_indices = self.visible_indices();
+        let Some(index) = oldest_suspendable_index(&visible_indices, &candidates) else {
             return;
         };
 
@@ -1108,14 +1298,15 @@ impl PrototypeApp {
     }
 
     fn select_next_tab(&mut self) {
-        if self.documents.is_empty() {
-            return;
+        let pane_id = self.tabs.focused_pane();
+        let next_tab = self
+            .tabs
+            .pane_tab_ids(pane_id)
+            .and_then(|tab_ids| next_tab_id_in_order(tab_ids, self.tabs.pane_selected(pane_id)))
+            .and_then(|tab_id| self.tabs.tab_registry_index(tab_id));
+        if let Some(index) = next_tab {
+            self.select_tab(index);
         }
-        let next = self
-            .active_index()
-            .map(|index| (index + 1) % self.documents.len())
-            .unwrap_or(0);
-        self.select_tab(next);
     }
 
     fn focus_blocking_annotation_editor(&mut self, only_index: Option<usize>) -> bool {
@@ -1154,8 +1345,11 @@ impl PrototypeApp {
         if let Some(document) = self.documents.get_mut(index) {
             document.view.stop_autoscroll();
         }
-        if self.active_index() == Some(index) {
-            self.viewport.cancel_primary_interaction();
+        if self.is_visible_index(index)
+            && let Some(pane_id) = self.pane_for_index(index)
+            && let Some(viewport) = self.viewports.get_mut(&pane_id)
+        {
+            viewport.cancel_primary_interaction();
         }
         let Some(document) = self.documents.get(index) else {
             return;
@@ -1242,8 +1436,11 @@ impl PrototypeApp {
 
     fn remove_tab_now(&mut self, index: usize) -> bool {
         let previous_selection = self.active_index();
-        if previous_selection == Some(index) {
-            self.viewport.cancel_primary_interaction();
+        let closing_pane = self.pane_for_index(index);
+        if self.is_visible_index(index)
+            && let Some(viewport) = closing_pane.and_then(|pane| self.viewports.get_mut(&pane))
+        {
+            viewport.cancel_primary_interaction();
         }
         let document_id = self
             .documents
@@ -1260,6 +1457,7 @@ impl PrototypeApp {
             self.thumbnail_lru.remove(key);
         }
         self.documents.remove(index);
+        self.sync_pane_viewports();
         if document_id.is_some_and(|document_id| {
             self.annotation_editor
                 .as_ref()
@@ -1275,6 +1473,21 @@ impl PrototypeApp {
             self.annotation_picker = None;
         }
         self.tab_to_reveal = tab_reveal_after_close(previous_selection, index, self.active_index());
+        for visible_index in self.visible_indices() {
+            if self.documents[visible_index].state == DocumentState::Suspended {
+                let path = self.tabs.tabs()[visible_index].path().to_path_buf();
+                self.documents[visible_index].resume(path);
+            }
+        }
+        if let Some(active_index) = self.active_index() {
+            let sequence = self.next_activity_sequence();
+            self.documents[active_index].last_selected_sequence = sequence;
+            if !self.documents[active_index].search.query.trim().is_empty()
+                && !self.documents[active_index].search.in_progress
+            {
+                self.begin_search(active_index);
+            }
+        }
         if was_restoring {
             // 開く途中の復元タブを閉じると保留結果を消費する。ワーカーもタブとともに
             // 破棄されるため、後からイベントが完了させることはない。
@@ -1317,8 +1530,8 @@ impl PrototypeApp {
     fn handle_window_close(&mut self, context: &egui::Context) {
         let close_requested = context.input(|input| input.viewport().close_requested());
         if close_requested {
-            self.stop_active_autoscroll();
-            self.viewport.cancel_primary_interaction();
+            self.stop_visible_autoscroll();
+            self.cancel_all_viewport_interactions();
         }
         if !close_requested || self.allow_window_close {
             return;
@@ -1410,7 +1623,6 @@ impl PrototypeApp {
     fn current_session(&self) -> SessionState {
         let mut session = SessionState {
             restore_enabled: self.restore_enabled,
-            selected_tab: self.active_index(),
             sidebar_open: self.sidebar_open,
             sidebar_tab: match self.sidebar_tab {
                 SidebarTab::Outline => SessionSidebarTab::Outline,
@@ -1430,6 +1642,36 @@ impl PrototypeApp {
                 view: document.view.to_session(),
             })
             .collect();
+        let pane_ids = self.tabs.pane_ids();
+        session.layout.panes = pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                let tab_indices = self
+                    .tabs
+                    .pane_tab_ids(*pane_id)?
+                    .iter()
+                    .filter_map(|tab_id| self.tabs.tab_registry_index(*tab_id))
+                    .collect::<Vec<_>>();
+                let selected_tab = self
+                    .tabs
+                    .pane_selected(*pane_id)
+                    .and_then(|tab_id| self.tabs.tab_registry_index(tab_id))?;
+                Some(SessionPane {
+                    tab_indices,
+                    selected_tab,
+                })
+            })
+            .collect();
+        session.layout.focused_pane = (!session.layout.panes.is_empty()).then(|| {
+            pane_ids
+                .iter()
+                .position(|pane_id| *pane_id == self.tabs.focused_pane())
+                .expect("focused pane must be part of the saved layout")
+        });
+        session.layout.split = (session.layout.panes.len() == 2).then(|| SessionSplit {
+            direction: SplitDirection::Horizontal,
+            ratio: self.tabs.split_ratio(),
+        });
         session
     }
 
@@ -1995,9 +2237,59 @@ impl PrototypeApp {
         self.documents.get_mut(index)
     }
 
-    fn tab_bar(&mut self, root_ui: &mut egui::Ui) {
-        let selected_index = self.active_index();
+    fn tab_bar(&mut self, root_ui: &mut egui::Ui) -> Vec<PaneUiOutput> {
+        if self.documents.is_empty() {
+            return Vec::new();
+        }
+
+        let pane_ids = self.tabs.pane_ids();
         let tab_to_reveal = self.tab_to_reveal.take();
+        let mut outputs = Vec::with_capacity(pane_ids.len());
+        egui::Panel::top("tabs").show(root_ui, |ui| {
+            let bar_size = Vec2::new(ui.available_width(), TAB_HEIGHT);
+            let (bar_rect, _) = ui.allocate_exact_size(bar_size, Sense::hover());
+            let (pane_rects, separator) = if pane_ids.len() == 2 {
+                let split = horizontal_split_rects(bar_rect, self.tabs.split_ratio());
+                (split.panes.to_vec(), Some(split.separator))
+            } else {
+                (vec![bar_rect], None)
+            };
+
+            for (pane_id, pane_rect) in pane_ids.iter().copied().zip(pane_rects) {
+                let tab_bar = ui
+                    .scope_builder(
+                        UiBuilder::new()
+                            .id_salt(("top-pane-tabs", pane_id))
+                            .max_rect(pane_rect),
+                        |pane_ui| self.pane_tab_bar(pane_ui, pane_id, tab_to_reveal),
+                    )
+                    .inner;
+                outputs.push(PaneUiOutput {
+                    pane_id,
+                    pdf_rect: Rect::NOTHING,
+                    tab_bar,
+                });
+            }
+            if let Some(separator) = separator {
+                ui.painter()
+                    .rect_filled(separator, 0.0, ui.visuals().widgets.inactive.bg_fill);
+            }
+
+            self.apply_pane_tab_actions(&outputs);
+            self.paint_tab_insertion_feedback(ui, &outputs);
+        });
+        outputs
+    }
+
+    fn pane_tab_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane_id: PaneId,
+        tab_to_reveal: Option<usize>,
+    ) -> PaneTabBarOutput {
+        let tab_ids = self.tabs.pane_tab_ids(pane_id).unwrap_or_default().to_vec();
+        let selected_id = self.tabs.pane_selected(pane_id);
+        let pane_focused = self.tabs.focused_pane() == pane_id;
         let editor_dirty_document = self
             .annotation_editor
             .as_ref()
@@ -2005,86 +2297,124 @@ impl PrototypeApp {
             .map(|editor| editor.document_id);
         let mut select_request = None;
         let mut close_request = None;
-        egui::Panel::top("tabs").show(root_ui, |ui| {
-            let tab_count = self.tabs.tabs().len();
-            let tab_width = tab_width_for_count(
-                ui.available_width(),
-                tab_count,
-                TAB_ITEM_SPACING,
-                TAB_MIN_WIDTH,
-                TAB_MAX_WIDTH,
-            );
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = TAB_ITEM_SPACING;
-                    for (index, tab) in self.tabs.tabs().iter().enumerate() {
-                        let dirty = self.documents[index].has_unsaved_changes()
-                            || editor_dirty_document == Some(self.documents[index].document_id);
-                        let marker = if dirty { "● " } else { "" };
-                        let title = tab
-                            .path()
-                            .file_name()
-                            .map(|name| name.to_string_lossy())
-                            .unwrap_or_else(|| tab.path().as_os_str().to_string_lossy());
-                        let full_title = format!("{marker}{title}");
-                        let (tab_rect, tab_response) = ui
-                            .allocate_exact_size(Vec2::new(tab_width, TAB_HEIGHT), Sense::hover());
-                        let content = tab_content_rects(
-                            tab_rect,
-                            TAB_HORIZONTAL_PADDING,
-                            TAB_CLOSE_WIDTH,
-                            TAB_CONTENT_GAP,
-                        );
-                        let tab_id = ui.id().with(("document-tab", index));
-                        let select_response = ui
-                            .interact(content.selection, tab_id.with("select"), Sense::click())
-                            .on_hover_text(tab.path().display().to_string());
-                        let can_close = !self.documents[index].is_printing();
-                        let close_sense = if can_close {
-                            Sense::click()
-                        } else {
-                            Sense::hover()
-                        };
-                        let close_response =
-                            ui.interact(content.close, tab_id.with("close"), close_sense);
-                        let selected = selected_index == Some(index);
-                        paint_document_tab(
-                            ui,
-                            tab_rect,
-                            content,
-                            &full_title,
-                            TabPaintState {
-                                selected,
-                                can_close,
-                                select_response: &select_response,
-                                close_response: &close_response,
-                            },
-                        );
-                        if selected && tab_to_reveal == Some(index) {
-                            tab_response.scroll_to_me(None);
-                        }
-                        match tab_pointer_action(
-                            select_response.clicked(),
-                            select_response.clicked_by(PointerButton::Middle),
-                        ) {
-                            Some(TabPointerAction::Select) => select_request = Some(index),
-                            Some(TabPointerAction::Close) if can_close => {
-                                close_request = Some(index)
+        let mut drag_started = None;
+        let mut drag_released = false;
+        let mut tab_rects = Vec::with_capacity(tab_ids.len());
+        let bar_size = Vec2::new(ui.available_width(), TAB_HEIGHT);
+        let (bar_rect, _) = ui.allocate_exact_size(bar_size, Sense::hover());
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt(("pane-tab-bar", pane_id))
+                .max_rect(bar_rect),
+            |ui| {
+                let tab_count = tab_ids.len();
+                let tab_width = tab_width_for_count(
+                    ui.available_width(),
+                    tab_count,
+                    TAB_ITEM_SPACING,
+                    TAB_MIN_WIDTH,
+                    TAB_MAX_WIDTH,
+                );
+                egui::ScrollArea::horizontal()
+                    .id_salt(("pane-tabs-scroll", pane_id))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = TAB_ITEM_SPACING;
+                            for tab_id in &tab_ids {
+                                let index = self
+                                    .tabs
+                                    .tab_registry_index(*tab_id)
+                                    .expect("pane tab must exist in document registry");
+                                let tab = &self.tabs.tabs()[index];
+                                let dirty = self.documents[index].has_unsaved_changes()
+                                    || editor_dirty_document
+                                        == Some(self.documents[index].document_id);
+                                let marker = if dirty { "● " } else { "" };
+                                let title = tab
+                                    .path()
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy())
+                                    .unwrap_or_else(|| tab.path().as_os_str().to_string_lossy());
+                                let full_title = format!("{marker}{title}");
+                                let (tab_rect, tab_response) = ui.allocate_exact_size(
+                                    Vec2::new(tab_width, TAB_HEIGHT),
+                                    Sense::hover(),
+                                );
+                                tab_rects.push(tab_rect);
+                                let content = tab_content_rects(
+                                    tab_rect,
+                                    TAB_HORIZONTAL_PADDING,
+                                    TAB_CLOSE_WIDTH,
+                                    TAB_CONTENT_GAP,
+                                );
+                                let widget_id = ui.id().with(("document-tab", pane_id, tab_id));
+                                let select_response = ui
+                                    .interact(
+                                        content.selection,
+                                        widget_id.with("select"),
+                                        Sense::click_and_drag(),
+                                    )
+                                    .on_hover_text(tab.path().display().to_string());
+                                let can_close = !self.documents[index].is_printing();
+                                let close_sense = if can_close {
+                                    Sense::click()
+                                } else {
+                                    Sense::hover()
+                                };
+                                let close_response = ui.interact(
+                                    content.close,
+                                    widget_id.with("close"),
+                                    close_sense,
+                                );
+                                let selected = selected_id == Some(*tab_id);
+                                paint_document_tab(
+                                    ui,
+                                    tab_rect,
+                                    content,
+                                    &full_title,
+                                    TabPaintState {
+                                        selected,
+                                        focused: pane_focused,
+                                        can_close,
+                                        select_response: &select_response,
+                                        close_response: &close_response,
+                                    },
+                                );
+                                if selected && tab_to_reveal == Some(index) {
+                                    tab_response.scroll_to_me(None);
+                                }
+                                if select_response.drag_started_by(PointerButton::Primary) {
+                                    drag_started = Some(*tab_id);
+                                }
+                                drag_released |=
+                                    select_response.drag_stopped_by(PointerButton::Primary);
+                                match tab_pointer_action(
+                                    select_response.clicked(),
+                                    select_response.clicked_by(PointerButton::Middle),
+                                ) {
+                                    Some(TabPointerAction::Select) => {
+                                        select_request = Some(*tab_id)
+                                    }
+                                    Some(TabPointerAction::Close) if can_close => {
+                                        close_request = Some(*tab_id)
+                                    }
+                                    Some(TabPointerAction::Close) | None => {}
+                                }
+                                if can_close && close_response.clicked() {
+                                    close_request = Some(*tab_id);
+                                }
                             }
-                            Some(TabPointerAction::Close) | None => {}
-                        }
-                        if can_close && close_response.clicked() {
-                            close_request = Some(index);
-                        }
-                    }
-                });
-            });
-        });
-        if let Some(index) = select_request {
-            self.select_tab(index);
-        }
-        if let Some(index) = close_request {
-            self.close_tab(index);
+                        });
+                    });
+            },
+        );
+        PaneTabBarOutput {
+            bar_rect,
+            tab_rects,
+            select: select_request,
+            close: close_request,
+            drag_started,
+            drag_released,
         }
     }
 
@@ -2210,12 +2540,12 @@ impl PrototypeApp {
                         }
                         ui.separator();
                         if ui.button("連続表示").clicked() {
-                            self.viewport.cancel_primary_interaction();
+                            self.cancel_active_viewport_interaction();
                             self.documents[index].set_display_mode(DisplayMode::Continuous);
                             ui.close();
                         }
                         if ui.button("単一ページ表示").clicked() {
-                            self.viewport.cancel_primary_interaction();
+                            self.cancel_active_viewport_interaction();
                             self.documents[index].set_display_mode(DisplayMode::SinglePage);
                             ui.close();
                         }
@@ -2399,7 +2729,7 @@ impl PrototypeApp {
                         if icon_button(ui, ToolbarIcon::Continuous, true, continuous, "連続表示")
                             .clicked()
                         {
-                            self.viewport.cancel_primary_interaction();
+                            self.cancel_active_viewport_interaction();
                             self.documents[index].set_display_mode(DisplayMode::Continuous);
                         }
                         if icon_button(
@@ -2411,7 +2741,7 @@ impl PrototypeApp {
                         )
                         .clicked()
                         {
-                            self.viewport.cancel_primary_interaction();
+                            self.cancel_active_viewport_interaction();
                             self.documents[index].set_display_mode(DisplayMode::SinglePage);
                         }
                         let highlight_tooltip = self.documents[index]
@@ -2876,48 +3206,307 @@ impl PrototypeApp {
         selected_page
     }
 
-    fn central_panel(&mut self, root_ui: &mut egui::Ui) -> Rect {
-        let response = egui::CentralPanel::default().show(root_ui, |ui| {
-            let Some(index) = self.active_index() else {
+    fn central_panel(&mut self, root_ui: &mut egui::Ui, outputs: &mut [PaneUiOutput]) -> Rect {
+        let mut focused_pdf_rect = Rect::NOTHING;
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            if self.documents.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.label("PDFをこのウィンドウへドロップしてください");
                 });
                 return;
-            };
-            if self.documents[index].state == DocumentState::Opening {
-                ui.centered_and_justified(|ui| ui.spinner());
-                return;
-            }
-            if self.documents[index].state == DocumentState::Error {
-                ui.centered_and_justified(|ui| {
-                    ui.colored_label(
-                        Color32::LIGHT_RED,
-                        self.documents[index]
-                            .error
-                            .as_deref()
-                            .unwrap_or("PDF文書ワーカーが停止しました"),
-                    );
-                });
-                return;
-            }
-            if self.documents[index].info.is_none() {
-                return;
             }
 
-            let pixels_per_point = ui.ctx().pixels_per_point();
-            let density_changed = self.documents[index]
-                .view
-                .update_render_density(pixels_per_point);
-            if density_changed {
-                self.documents[index].invalidate_rendering();
+            let available = ui.available_rect_before_wrap();
+            let pane_ids = self.tabs.pane_ids();
+            let (pane_rects, split_rects) = if pane_ids.len() == 2 {
+                let split = horizontal_split_rects(available, self.tabs.split_ratio());
+                (split.panes.to_vec(), Some(split))
+            } else {
+                (vec![available], None)
+            };
+
+            let (press_origin, hover_position, pointer_navigation, zoom_delta) =
+                ui.input(|input| {
+                    let wheel_input = input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::MouseWheel { .. }));
+                    let zoom_delta = input.zoom_delta();
+                    (
+                        input.pointer.press_origin(),
+                        input.pointer.hover_pos(),
+                        wheel_input || (zoom_delta - 1.0).abs() > f32::EPSILON,
+                        zoom_delta,
+                    )
+                });
+            let pointer =
+                press_origin.or_else(|| pointer_navigation.then_some(hover_position).flatten());
+            let foreground_owns_pointer = pointer.is_some_and(|pointer| {
+                foreground_layer_blocks_pane_input(ui.ctx().layer_id_at(pointer))
+            });
+            let pointer_pane = (!foreground_owns_pointer)
+                .then(|| {
+                    pointer.and_then(|pointer| {
+                        pane_rects.iter().position(|rect| rect.contains(pointer))
+                    })
+                })
+                .flatten();
+            if let Some(pane_index) = pointer_pane {
+                self.focus_pane(pane_ids[pane_index]);
             }
-            self.update_fit_zoom(index, ui.available_size());
-            match self.documents[index].view.display_mode {
-                DisplayMode::Continuous => self.continuous_view(ui, index),
-                DisplayMode::SinglePage => self.single_page_view(ui, index),
+            if (zoom_delta - 1.0).abs() > f32::EPSILON && !foreground_owns_pointer {
+                self.zoom_by(zoom_delta);
             }
+
+            if let Some(split) = split_rects {
+                self.separator(ui, available, split);
+            }
+
+            for (pane_id, pane_rect) in pane_ids.into_iter().zip(pane_rects) {
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .id_salt(("document-pane", pane_id))
+                        .max_rect(pane_rect),
+                    |pane_ui| self.document_view(pane_ui, pane_id),
+                );
+                if let Some(output) = outputs.iter_mut().find(|output| output.pane_id == pane_id) {
+                    output.pdf_rect = pane_rect;
+                }
+                if pane_id == self.tabs.focused_pane() {
+                    focused_pdf_rect = pane_rect;
+                }
+            }
+
+            self.paint_pdf_drop_feedback(ui, outputs);
+            self.finish_tab_drag(ui, outputs);
+            ui.allocate_rect(available, Sense::hover());
         });
-        response.response.rect
+        focused_pdf_rect
+    }
+
+    fn separator(&mut self, ui: &mut egui::Ui, available: Rect, split: HorizontalSplitRects) {
+        let response = ui
+            .interact(
+                split.separator,
+                ui.id().with("document-pane-separator"),
+                Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        let color = if response.dragged() || response.hovered() {
+            ui.visuals().widgets.hovered.bg_fill
+        } else {
+            ui.visuals().widgets.inactive.bg_fill
+        };
+        ui.painter().rect_filled(split.separator, 0.0, color);
+        if response.dragged_by(PointerButton::Primary)
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let content_width = (available.width() - split.separator.width()).max(1.0);
+            let ratio = (pointer.x - available.left()) / content_width;
+            let _applied = self.tabs.set_split_ratio(ratio.clamp(0.1, 0.9));
+        } else if split.ratio != self.tabs.split_ratio() {
+            // ウィンドウ縮小でpoint最小幅へclampした比率を保存し、拡大時に操作不能な幅へ戻さない。
+            let _applied = self.tabs.set_split_ratio(split.ratio);
+        }
+    }
+
+    fn document_view(&mut self, ui: &mut egui::Ui, pane_id: PaneId) {
+        let Some(tab_id) = self.tabs.pane_selected(pane_id) else {
+            return;
+        };
+        let index = self
+            .tabs
+            .tab_registry_index(tab_id)
+            .expect("selected pane tab must exist in document registry");
+        if self.documents[index].state == DocumentState::Opening {
+            ui.centered_and_justified(|ui| ui.spinner());
+            return;
+        }
+        if self.documents[index].state == DocumentState::Error {
+            ui.centered_and_justified(|ui| {
+                ui.colored_label(
+                    Color32::LIGHT_RED,
+                    self.documents[index]
+                        .error
+                        .as_deref()
+                        .unwrap_or("PDF文書ワーカーが停止しました"),
+                );
+            });
+            return;
+        }
+        if self.documents[index].info.is_none() {
+            return;
+        }
+
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        if self.documents[index]
+            .view
+            .update_render_density(pixels_per_point)
+        {
+            self.documents[index].invalidate_rendering();
+        }
+        self.update_fit_zoom(index, ui.available_size());
+        match self.documents[index].view.display_mode {
+            DisplayMode::Continuous => self.continuous_view(ui, pane_id, index),
+            DisplayMode::SinglePage => self.single_page_view(ui, pane_id, index),
+        }
+    }
+
+    fn apply_pane_tab_actions(&mut self, outputs: &[PaneUiOutput]) {
+        for output in outputs {
+            if let Some(tab_id) = output.tab_bar.drag_started {
+                self.focus_pane(output.pane_id);
+                self.tab_drag = Some(TabDragState {
+                    tab_id,
+                    source_pane: output.pane_id,
+                });
+            }
+            if let Some(tab_id) = output.tab_bar.select
+                && let Some(index) = self.tabs.tab_registry_index(tab_id)
+            {
+                self.select_tab(index);
+            }
+            if let Some(tab_id) = output.tab_bar.close
+                && let Some(index) = self.tabs.tab_registry_index(tab_id)
+            {
+                self.focus_pane(output.pane_id);
+                self.close_tab(index);
+            }
+        }
+    }
+
+    fn paint_tab_insertion_feedback(&self, ui: &egui::Ui, outputs: &[PaneUiOutput]) {
+        if self.tab_drag.is_none() {
+            return;
+        }
+        let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        if foreground_layer_blocks_pane_input(ui.ctx().layer_id_at(pointer)) {
+            return;
+        }
+        if let Some(target) = outputs
+            .iter()
+            .find(|output| output.tab_bar.bar_rect.contains(pointer))
+        {
+            let insertion = tab_insertion_index(&target.tab_bar.tab_rects, pointer.x);
+            let line_x = match insertion {
+                0 => target
+                    .tab_bar
+                    .tab_rects
+                    .first()
+                    .map_or(target.tab_bar.bar_rect.left(), Rect::left),
+                index if index == target.tab_bar.tab_rects.len() => target
+                    .tab_bar
+                    .tab_rects
+                    .last()
+                    .map_or(target.tab_bar.bar_rect.left(), Rect::right),
+                index => {
+                    let previous = target.tab_bar.tab_rects[index - 1].right();
+                    let next = target.tab_bar.tab_rects[index].left();
+                    (previous + next) / 2.0
+                }
+            };
+            ui.painter().line_segment(
+                [
+                    pos2(line_x, target.tab_bar.bar_rect.top()),
+                    pos2(line_x, target.tab_bar.bar_rect.bottom()),
+                ],
+                Stroke::new(2.0, ui.visuals().selection.stroke.color),
+            );
+        }
+    }
+
+    fn paint_pdf_drop_feedback(&self, ui: &egui::Ui, outputs: &[PaneUiOutput]) {
+        let Some(drag) = self.tab_drag else {
+            return;
+        };
+        let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        if foreground_layer_blocks_pane_input(ui.ctx().layer_id_at(pointer))
+            || outputs
+                .iter()
+                .any(|output| output.tab_bar.bar_rect.contains(pointer))
+        {
+            return;
+        }
+        if outputs.len() == 1
+            && self
+                .tabs
+                .pane_tab_ids(drag.source_pane)
+                .is_some_and(|tabs| tabs.len() > 1)
+            && let Some(placement) = split_drop_placement(outputs[0].pdf_rect, pointer)
+        {
+            let highlight = split_drop_highlight(outputs[0].pdf_rect, placement);
+            ui.painter().rect_filled(
+                highlight,
+                4.0,
+                ui.visuals().selection.bg_fill.gamma_multiply(0.35),
+            );
+        } else if outputs.len() == 2
+            && let Some(target) = outputs.iter().find(|output| {
+                output.pane_id != drag.source_pane && output.pdf_rect.contains(pointer)
+            })
+        {
+            ui.painter().rect_filled(
+                target.pdf_rect,
+                4.0,
+                ui.visuals().selection.bg_fill.gamma_multiply(0.25),
+            );
+        }
+    }
+
+    fn finish_tab_drag(&mut self, ui: &egui::Ui, outputs: &[PaneUiOutput]) {
+        if !outputs.iter().any(|output| output.tab_bar.drag_released) {
+            return;
+        }
+        let Some(drag) = self.tab_drag.take() else {
+            return;
+        };
+        let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        if foreground_layer_blocks_pane_input(ui.ctx().layer_id_at(pointer)) {
+            return;
+        }
+        let previous = self.active_index();
+        let previously_visible = self.visible_indices();
+        let mut changed = false;
+        if let Some(target) = outputs
+            .iter()
+            .find(|output| output.tab_bar.bar_rect.contains(pointer))
+        {
+            let insertion = tab_insertion_index(&target.tab_bar.tab_rects, pointer.x);
+            changed = self.tabs.move_tab(drag.tab_id, target.pane_id, insertion);
+        } else if outputs.len() == 1 {
+            if let Some(placement) = split_drop_placement(outputs[0].pdf_rect, pointer) {
+                changed = self.tabs.split(drag.tab_id, placement);
+            }
+        } else if let Some(target) = outputs
+            .iter()
+            .find(|output| output.pane_id != drag.source_pane && output.pdf_rect.contains(pointer))
+        {
+            let insertion = self
+                .tabs
+                .pane_tab_ids(target.pane_id)
+                .map_or(0, <[TabId]>::len);
+            changed = self.tabs.move_tab(drag.tab_id, target.pane_id, insertion);
+        }
+        if !changed {
+            return;
+        }
+
+        if let Some(index) = self.tabs.tab_registry_index(drag.tab_id) {
+            self.documents[index].prepare_for_pane_transition();
+        }
+        if let Some(viewport) = self.viewports.get_mut(&drag.source_pane) {
+            viewport.cancel_primary_interaction();
+        }
+        self.sync_pane_viewports();
+        if let Some(index) = self.active_index() {
+            self.activate_document(index, previous, &previously_visible);
+        }
     }
 
     fn annotation_candidate_picker(&mut self, context: &egui::Context) {
@@ -3042,12 +3631,15 @@ impl PrototypeApp {
         Some(desired)
     }
 
-    fn continuous_view(&mut self, ui: &mut egui::Ui, index: usize) {
+    fn continuous_view(&mut self, ui: &mut egui::Ui, pane_id: PaneId, index: usize) {
         let document_id = self.documents[index].document_id;
         if self.documents[index].view.autoscroll.is_some() {
             // 停止入力を受けるまで autoscroll がナビゲーションを所有するため、古い主ジェスチャーを
             // アンカーと同時に残してはならない。
-            self.viewport.cancel_primary_interaction();
+            self.viewports
+                .entry(pane_id)
+                .or_default()
+                .cancel_primary_interaction();
         }
         let editor_input_rect = self
             .annotation_editor
@@ -3065,7 +3657,7 @@ impl PrototypeApp {
                 .is_some_and(|picker| picker.document_id == document_id);
         let pixels_per_point = ui.ctx().pixels_per_point();
         let viewport_size = ui.available_size();
-        let viewport = &mut self.viewport;
+        let viewport = self.viewports.entry(pane_id).or_default();
         let gpu_lru = &mut self.gpu_lru;
         let tab = &mut self.documents[index];
         let info = tab.info.as_ref().expect("checked before drawing");
@@ -3271,7 +3863,7 @@ impl PrototypeApp {
         }
     }
 
-    fn single_page_view(&mut self, ui: &mut egui::Ui, index: usize) {
+    fn single_page_view(&mut self, ui: &mut egui::Ui, pane_id: PaneId, index: usize) {
         let document_id = self.documents[index].document_id;
         let suppress_annotation_hover = self.documents[index].view.autoscroll.is_some()
             || self
@@ -3288,7 +3880,7 @@ impl PrototypeApp {
             .filter(|editor| editor.document_id == document_id)
             .map(|_| annotation_overlay_rect(ui.max_rect()));
         let pixels_per_point = ui.ctx().pixels_per_point();
-        let viewport = &mut self.viewport;
+        let viewport = self.viewports.entry(pane_id).or_default();
         let gpu_lru = &mut self.gpu_lru;
         let tab = &mut self.documents[index];
         let info = tab.info.as_ref().expect("checked before drawing");
@@ -3498,7 +4090,6 @@ impl DocumentTab {
         path: PathBuf,
         last_selected_sequence: u64,
         restored_view: Option<SessionView>,
-        select_after_restore: bool,
     ) -> Self {
         let restoring_from_session = restored_view.is_some();
         Self {
@@ -3542,7 +4133,6 @@ impl DocumentTab {
             #[cfg(debug_assertions)]
             render_performance: RenderPerformance::default(),
             restoring_from_session,
-            select_after_restore,
         }
     }
 
@@ -3661,6 +4251,18 @@ impl DocumentTab {
             // 安全に再開できない。
             self.view.stop_autoscroll();
             self.invalidate_rendering();
+        }
+    }
+
+    fn prepare_for_pane_transition(&mut self) {
+        self.view.stop_autoscroll();
+        // ScrollArea の永続IDはペイン階層を含む。所属変更後の新しいIDへ、文書が
+        // 最後に描画した中央アンカーを明示的に引き継ぐ。
+        match self.view.display_mode {
+            DisplayMode::Continuous => self.view.restore_anchor = self.view.center_anchor,
+            DisplayMode::SinglePage => {
+                self.view.restore_single_anchor = self.view.single_center_anchor
+            }
         }
     }
 
@@ -4161,15 +4763,16 @@ impl eframe::App for PrototypeApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         if !context.input(|input| input.focused) {
             // ネイティブのフォーカス喪失では対応するボタン解放イベントが省略されることがある。
-            self.stop_active_autoscroll();
-            self.viewport.cancel_primary_interaction();
+            self.stop_visible_autoscroll();
+            self.cancel_all_viewport_interactions();
             self.copy_shortcut_active = false;
         }
         let modal_open = self.close_confirmation.is_some() || self.session_close_failure.is_some();
         if modal_open {
             // モーダルが閉じるまでポインターの意図を所有する。背景の autoscroll アンカーを
             // 保持するとダイアログの下で文書が動いてしまう。
-            self.stop_active_autoscroll();
+            self.stop_visible_autoscroll();
+            self.cancel_all_viewport_interactions();
         }
         self.receive_document_events(context);
         self.maybe_suspend_inactive_document();
@@ -4181,12 +4784,12 @@ impl eframe::App for PrototypeApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.menu_bar(ui);
-        self.tab_bar(ui);
+        let mut pane_outputs = self.tab_bar(ui);
         self.toolbar(ui);
         self.error_banner(ui);
         self.status_panel(ui);
         self.sidebar_panel(ui);
-        let central_rect = self.central_panel(ui);
+        let central_rect = self.central_panel(ui, &mut pane_outputs);
         self.annotation_candidate_picker(ui.ctx());
         self.annotation_editor_overlay(ui.ctx(), central_rect);
         self.close_confirmation_dialog(ui.ctx());
@@ -4194,15 +4797,15 @@ impl eframe::App for PrototypeApp {
     }
 }
 
-/// 最も長く未使用で完全にサスペンド可能な文書を選び、アクティブタブは除外する。
+/// 最も長く未使用で完全にサスペンド可能な文書を選び、表示中タブはすべて除外する。
 fn oldest_suspendable_index(
-    active_index: Option<usize>,
+    visible_indices: &[usize],
     candidates: &[(bool, u64)],
 ) -> Option<usize> {
     candidates
         .iter()
         .enumerate()
-        .filter(|(index, (is_suspendable, _))| Some(*index) != active_index && *is_suspendable)
+        .filter(|(index, (is_suspendable, _))| !visible_indices.contains(index) && *is_suspendable)
         .min_by_key(|(_, (_, last_selected))| *last_selected)
         .map(|(index, _)| index)
 }
@@ -4255,7 +4858,7 @@ fn state_after_document_info(current: DocumentState, dirty: bool) -> DocumentSta
 }
 
 fn text_snapshot_result_is_current(
-    is_active: bool,
+    is_visible: bool,
     key: TextSnapshotKey,
     current_revision: Option<u64>,
     page_count: usize,
@@ -4263,21 +4866,21 @@ fn text_snapshot_result_is_current(
 ) -> bool {
     // スクロール、タブ切り替え、注釈変更の後に抽出が完了することがある。UI やエラーに
     // 影響できるのは完全に一致する表示中の文書状態だけである。
-    is_active
+    is_visible
         && current_revision == Some(key.revision)
         && key.page_index < page_count
         && wanted.contains(&key)
 }
 
 fn annotation_page_result_is_current(
-    is_active: bool,
+    is_visible: bool,
     request: AnnotationPageRequest,
     current_revision: Option<u64>,
     wanted: &HashSet<AnnotationPageRequest>,
 ) -> bool {
-    // 注釈 xref は文書内で可変な同一性である。非アクティブタブ、古い revision、表示外の
+    // 注釈 xref は文書内で可変な同一性である。非表示タブ、古い revision、表示外の
     // ページからの結果を現在の UI の編集対象にしてはならない。
-    is_active && current_revision == Some(request.expected_revision) && wanted.contains(&request)
+    is_visible && current_revision == Some(request.expected_revision) && wanted.contains(&request)
 }
 
 fn retain_visible_text_failures(
@@ -4312,14 +4915,14 @@ fn mark_thumbnail_failed(
 /// ワーカーは進行中の MuPDF 描画をキャンセルできないため、結果が GPU テクスチャを
 /// 割り当てる前に 4 つの同一性要素をすべて確認する。
 fn tile_result_is_current(
-    is_active: bool,
+    is_visible: bool,
     key: TileCacheKey,
     result_generation: u64,
     current_generation: u64,
     current_revision: Option<u64>,
     wanted_tiles: &HashSet<TileCacheKey>,
 ) -> bool {
-    is_active
+    is_visible
         && result_generation == current_generation
         && current_revision == Some(key.revision)
         && wanted_tiles.contains(&key)
