@@ -32,11 +32,14 @@ use crate::domain::selection::{
     PagePoint, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
 };
 use crate::domain::session::{
-    DisplayMode as SessionDisplayMode, SessionLayout, SessionPane, SessionSplit, SessionState,
-    SessionTab, SessionView, SidebarTab as SessionSidebarTab, SplitDirection,
+    DisplayMode as SessionDisplayMode, SessionEntry, SessionLayout, SessionState, SessionTab,
+    SessionView, SidebarTab as SessionSidebarTab, SplitDirection as SessionSplitDirection,
     ZoomMode as SessionZoomMode,
 };
-use crate::domain::tabs::{OpenTabResult, PaneId, TabId, TabState};
+use crate::domain::tabs::{
+    OpenTabResult, RestoredTabEntry, SplitDirection, SplitGroupId, SplitSide, TabEntry, TabId,
+    TabState,
+};
 use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService};
 use crate::persistence::session_store::SessionStore;
 use crate::render::cache::WeightedLruCache;
@@ -75,8 +78,7 @@ use search::{
 };
 use search::{SearchState, search_match_ordinal, search_query_id};
 use workspace::{
-    HorizontalSplitRects, horizontal_split_rects, split_drop_highlight, split_drop_placement,
-    tab_insertion_index,
+    SplitRects, split_drop_highlight, split_drop_placement, split_rects, tab_insertion_index,
 };
 
 // 詳細確認と全体表示の両方を覆いつつ、誤ったホイール操作で
@@ -103,6 +105,11 @@ const TAB_ITEM_SPACING: f32 = 1.0;
 // 最小タブ高さでも周囲に十分なホバー時の塗りを残せる。
 const TAB_CLOSE_ICON_HALF_SIZE: f32 = 4.0;
 const TAB_CLOSE_ICON_STROKE_WIDTH: f32 = 1.5;
+
+// ドラッグ中のタブ影がポインターとdrop境界を隠さず、通常タブと同程度の
+// 情報量を保つための論理ポイント値。
+const TAB_DRAG_PREVIEW_OFFSET: f32 = 12.0;
+const TAB_DRAG_PREVIEW_PADDING: f32 = 8.0;
 
 // 最初の 3 桁分を確保してツールバーの列幅を安定させる。長い文書では必要な
 // 桁数をすべて測定し、ページ入力を切り詰めたり拒否したりしない。
@@ -160,7 +167,7 @@ const RESIDENT_MEMORY_SUSPEND_THRESHOLD_BYTES: usize = 512 * 1_024 * 1_024;
 pub(crate) struct PrototypeApp {
     tabs: TabState,
     documents: Vec<DocumentTab>,
-    viewports: HashMap<PaneId, PageViewport>,
+    viewports: HashMap<SplitSide, PageViewport>,
     status: String,
     error: Option<String>,
     close_confirmation: Option<CloseConfirmation>,
@@ -418,59 +425,84 @@ struct SessionRestoreProgress {
 fn restored_runtime_layout(
     saved: &SessionLayout,
     runtime_tab_ids: &[Option<TabId>],
-) -> (Vec<(Vec<TabId>, TabId)>, usize, f32) {
+) -> (Vec<RestoredTabEntry>, Option<TabId>) {
     let mut seen = HashSet::new();
-    let mut restored_panes = Vec::new();
-    let mut restored_pane_indices = vec![None; saved.panes.len()];
-
-    for (saved_pane_index, pane) in saved.panes.iter().enumerate() {
-        let restored_tabs = pane
-            .tab_indices
-            .iter()
-            .enumerate()
-            .filter_map(|(position, saved_tab_index)| {
-                let tab_id = runtime_tab_ids.get(*saved_tab_index).copied().flatten()?;
-                // 異なる保存パスが同じ実体へ正規化されても、1つのランタイムタブを
-                // 複数ペインへ所属させない。
-                seen.insert(tab_id).then_some((position, tab_id))
-            })
-            .collect::<Vec<_>>();
-        if restored_tabs.is_empty() {
-            continue;
+    let saved_active_entry = saved.active_tab.and_then(|active_tab| {
+        saved.entries.iter().position(|entry| match entry {
+            SessionEntry::Single { tab_index } => *tab_index == active_tab,
+            SessionEntry::Split { tab_indices, .. } => tab_indices.contains(&active_tab),
+        })
+    });
+    let mut restored = Vec::new();
+    let mut source_positions = Vec::new();
+    for (source_position, entry) in saved.entries.iter().enumerate() {
+        let restored_entry = match entry {
+            SessionEntry::Single { tab_index } => runtime_tab_ids
+                .get(*tab_index)
+                .copied()
+                .flatten()
+                .filter(|tab_id| seen.insert(*tab_id))
+                .map(RestoredTabEntry::Single),
+            SessionEntry::Split {
+                tab_indices,
+                direction,
+                ratio,
+                focused_tab,
+            } => {
+                let members = tab_indices.map(|tab_index| {
+                    runtime_tab_ids
+                        .get(tab_index)
+                        .copied()
+                        .flatten()
+                        .filter(|tab_id| seen.insert(*tab_id))
+                });
+                match members {
+                    [Some(first), Some(second)] => Some(RestoredTabEntry::Split {
+                        tabs: [first, second],
+                        direction: match direction {
+                            SessionSplitDirection::Horizontal => SplitDirection::Horizontal,
+                            SessionSplitDirection::Vertical => SplitDirection::Vertical,
+                        },
+                        ratio: *ratio,
+                        focused: if *focused_tab == tab_indices[0] {
+                            SplitSide::First
+                        } else {
+                            SplitSide::Second
+                        },
+                    }),
+                    [Some(tab_id), None] | [None, Some(tab_id)] => {
+                        Some(RestoredTabEntry::Single(tab_id))
+                    }
+                    [None, None] => None,
+                }
+            }
+        };
+        if let Some(entry) = restored_entry {
+            restored.push(entry);
+            source_positions.push(source_position);
         }
-
-        let saved_selection_position = pane
-            .tab_indices
-            .iter()
-            .position(|tab_index| *tab_index == pane.selected_tab)
-            .expect("validated session selection must belong to its pane");
-        // 選択タブを開けない場合は、closeと同じく後続を優先し、なければ直前を選ぶ。
-        let selected = restored_tabs
-            .iter()
-            .find(|(position, _)| *position >= saved_selection_position)
-            .or_else(|| restored_tabs.last())
-            .expect("empty restored panes were removed")
-            .1;
-        let tab_ids = restored_tabs
-            .into_iter()
-            .map(|(_, tab_id)| tab_id)
-            .collect();
-        restored_pane_indices[saved_pane_index] = Some(restored_panes.len());
-        restored_panes.push((tab_ids, selected));
     }
 
-    let focused_pane = saved
-        .focused_pane
-        .and_then(|index| restored_pane_indices.get(index).copied().flatten())
-        .unwrap_or(0);
-    let ratio = saved.split.as_ref().map_or(0.5, |split| split.ratio);
-    (restored_panes, focused_pane, ratio)
+    let saved_active = saved
+        .active_tab
+        .and_then(|index| runtime_tab_ids.get(index).copied().flatten())
+        .filter(|tab_id| seen.contains(tab_id));
+    let active = saved_active.or_else(|| {
+        let target_position = saved_active_entry.unwrap_or(0);
+        let restored_index = source_positions
+            .iter()
+            .position(|position| *position >= target_position)
+            .or_else(|| source_positions.len().checked_sub(1))?;
+        restored_entry_focus(&restored[restored_index])
+    });
+    (restored, active)
 }
 
-fn next_tab_id_in_order(tab_ids: &[TabId], selected: Option<TabId>) -> Option<TabId> {
-    let current = selected.and_then(|selected| tab_ids.iter().position(|id| *id == selected));
-    let next = current.map_or(0, |index| (index + 1) % tab_ids.len());
-    tab_ids.get(next).copied()
+fn restored_entry_focus(entry: &RestoredTabEntry) -> Option<TabId> {
+    match entry {
+        RestoredTabEntry::Single(tab_id) => Some(*tab_id),
+        RestoredTabEntry::Split { tabs, focused, .. } => Some(tabs[focused.index()]),
+    }
 }
 
 fn foreground_layer_blocks_pane_input(layer: Option<LayerId>) -> bool {
@@ -517,25 +549,41 @@ struct TabContentRects {
 
 #[derive(Clone, Copy, Debug)]
 struct TabDragState {
-    tab_id: TabId,
-    source_pane: PaneId,
+    source: TabDragSource,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TabDragSource {
+    Tab(TabId),
+    Group(SplitGroupId),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SplitMenuAction {
+    SetDirection(SplitGroupId, SplitDirection),
+    Swap(SplitGroupId),
+    Unsplit(SplitGroupId),
 }
 
 #[derive(Debug)]
-struct PaneTabBarOutput {
+struct TabBarOutput {
     bar_rect: Rect,
+    entry_rects: Vec<Rect>,
     tab_rects: Vec<Rect>,
+    tab_ids: Vec<TabId>,
+    group_rects: Vec<(SplitGroupId, Rect)>,
     select: Option<TabId>,
     close: Option<TabId>,
-    drag_started: Option<TabId>,
+    drag_started: Option<TabDragSource>,
     drag_released: bool,
+    menu_action: Option<SplitMenuAction>,
 }
 
 #[derive(Debug)]
 struct PaneUiOutput {
-    pane_id: PaneId,
+    side: SplitSide,
+    tab_id: TabId,
     pdf_rect: Rect,
-    tab_bar: PaneTabBarOutput,
 }
 
 struct TabPaintState<'a> {
@@ -733,7 +781,7 @@ impl PrototypeApp {
             .unwrap_or_default();
         let tabs = TabState::new();
         let mut viewports = HashMap::new();
-        viewports.insert(tabs.focused_pane(), PageViewport::default());
+        viewports.insert(SplitSide::First, PageViewport::default());
         let mut app = Self {
             tabs,
             documents: Vec::new(),
@@ -807,8 +855,8 @@ impl PrototypeApp {
     }
 
     fn cancel_active_viewport_interaction(&mut self) {
-        let pane_id = self.tabs.focused_pane();
-        if let Some(viewport) = self.viewports.get_mut(&pane_id) {
+        let side = self.focused_side();
+        if let Some(viewport) = self.viewports.get_mut(&side) {
             viewport.cancel_primary_interaction();
         }
     }
@@ -842,11 +890,10 @@ impl PrototypeApp {
             }
         }
 
-        let (layouts, focused_pane, ratio) =
-            restored_runtime_layout(&session.layout, &runtime_tab_ids);
+        let (entries, active) = restored_runtime_layout(&session.layout, &runtime_tab_ids);
         // 保存パスが同じ実体へ正規化される場合や消失した場合も、開けたタブだけで
         // 一度に配置を確定し、非同期 Opened の到着順にフォーカスを揺らさない。
-        let restored = self.tabs.restore_layout(layouts, focused_pane, ratio);
+        let restored = self.tabs.restore_layout(entries, active);
         debug_assert!(
             restored,
             "validated session must produce a valid runtime layout"
@@ -1124,7 +1171,7 @@ impl PrototypeApp {
 
     fn visible_indices(&self) -> Vec<usize> {
         self.tabs
-            .visible_selected_tab_ids()
+            .visible_tab_ids()
             .into_iter()
             .filter_map(|tab_id| self.tabs.tab_registry_index(tab_id))
             .collect()
@@ -1134,33 +1181,57 @@ impl PrototypeApp {
         self.tabs
             .tabs()
             .get(index)
-            .is_some_and(|tab| self.tabs.visible_selected_tab_ids().contains(&tab.id()))
+            .is_some_and(|tab| self.tabs.visible_tab_ids().contains(&tab.id()))
     }
 
-    fn pane_for_index(&self, index: usize) -> Option<PaneId> {
+    fn side_for_index(&self, index: usize) -> Option<SplitSide> {
         let tab_id = self.tabs.tabs().get(index)?.id();
-        self.tabs.tab_pane(tab_id)
+        match self
+            .tabs
+            .visible_tab_ids()
+            .iter()
+            .position(|id| *id == tab_id)?
+        {
+            0 => Some(SplitSide::First),
+            1 => Some(SplitSide::Second),
+            _ => None,
+        }
+    }
+
+    fn focused_side(&self) -> SplitSide {
+        let Some(active) = self.tabs.active_tab_id() else {
+            return SplitSide::First;
+        };
+        let Some(group) = self.tabs.active_split() else {
+            return SplitSide::First;
+        };
+        if group.tab(SplitSide::First) == active {
+            SplitSide::First
+        } else {
+            SplitSide::Second
+        }
     }
 
     fn cancel_viewport_for_index(&mut self, index: usize) {
-        if let Some(pane_id) = self.pane_for_index(index)
-            && let Some(viewport) = self.viewports.get_mut(&pane_id)
+        if let Some(side) = self.side_for_index(index)
+            && let Some(viewport) = self.viewports.get_mut(&side)
         {
             viewport.cancel_primary_interaction();
         }
     }
 
     fn sync_pane_viewports(&mut self) {
-        let pane_ids = self.tabs.pane_ids();
-        self.viewports.retain(|pane_id, viewport| {
-            let retained = pane_ids.contains(pane_id);
+        let split_visible = self.tabs.active_split().is_some();
+        self.viewports.retain(|side, viewport| {
+            let retained = *side == SplitSide::First || split_visible;
             if !retained {
                 viewport.cancel_primary_interaction();
             }
             retained
         });
-        for pane_id in pane_ids {
-            self.viewports.entry(pane_id).or_default();
+        self.viewports.entry(SplitSide::First).or_default();
+        if split_visible {
+            self.viewports.entry(SplitSide::Second).or_default();
         }
     }
 
@@ -1180,13 +1251,9 @@ impl PrototypeApp {
         }
         if let Some(previous) = previous.filter(|previous| *previous != index) {
             self.documents[previous].view.stop_autoscroll();
-            if let Some(pane_id) = self.pane_for_index(previous)
-                && let Some(viewport) = self.viewports.get_mut(&pane_id)
-            {
-                // フォーカスを外したペインの未完了ジェスチャーを、次の共通UI操作へ
-                // 持ち越さない。文書描画要求は可視である限り維持する。
-                viewport.cancel_primary_interaction();
-            }
+            // 表示セットの切替では同じスロットへ別文書が入るため、古い文書の未完了操作を
+            // どちらの新しいPDF面にも引き継がない。
+            self.cancel_all_viewport_interactions();
         }
 
         let currently_visible = self.visible_indices();
@@ -1236,10 +1303,13 @@ impl PrototypeApp {
         self.activate_document(index, previous, &previously_visible);
     }
 
-    fn focus_pane(&mut self, pane_id: PaneId) {
+    fn focus_side(&mut self, side: SplitSide) {
         let previous = self.active_index();
         let previously_visible = self.visible_indices();
-        if !self.tabs.focus_pane(pane_id) {
+        let Some(tab_id) = self.tabs.visible_tab_ids().get(side.index()).copied() else {
+            return;
+        };
+        if !self.tabs.select_tab(tab_id) {
             return;
         }
         if let Some(index) = self.active_index() {
@@ -1298,11 +1368,9 @@ impl PrototypeApp {
     }
 
     fn select_next_tab(&mut self) {
-        let pane_id = self.tabs.focused_pane();
         let next_tab = self
             .tabs
-            .pane_tab_ids(pane_id)
-            .and_then(|tab_ids| next_tab_id_in_order(tab_ids, self.tabs.pane_selected(pane_id)))
+            .next_entry_tab()
             .and_then(|tab_id| self.tabs.tab_registry_index(tab_id));
         if let Some(index) = next_tab {
             self.select_tab(index);
@@ -1346,8 +1414,8 @@ impl PrototypeApp {
             document.view.stop_autoscroll();
         }
         if self.is_visible_index(index)
-            && let Some(pane_id) = self.pane_for_index(index)
-            && let Some(viewport) = self.viewports.get_mut(&pane_id)
+            && let Some(side) = self.side_for_index(index)
+            && let Some(viewport) = self.viewports.get_mut(&side)
         {
             viewport.cancel_primary_interaction();
         }
@@ -1436,9 +1504,15 @@ impl PrototypeApp {
 
     fn remove_tab_now(&mut self, index: usize) -> bool {
         let previous_selection = self.active_index();
-        let closing_pane = self.pane_for_index(index);
+        let closing_side = self.side_for_index(index);
+        let split_sibling_transition = self.tabs.tabs().get(index).and_then(|tab| {
+            let group = self.tabs.split_for_tab(tab.id())?;
+            // 第1面を閉じたときだけ、残る第2面のScrollArea IDが単独表示の
+            // 第1面へ変わる。非表示セットでも次回選択に備えてアンカーを残す。
+            (group.tab(SplitSide::First) == tab.id()).then_some(group.tab(SplitSide::Second))
+        });
         if self.is_visible_index(index)
-            && let Some(viewport) = closing_pane.and_then(|pane| self.viewports.get_mut(&pane))
+            && let Some(viewport) = closing_side.and_then(|side| self.viewports.get_mut(&side))
         {
             viewport.cancel_primary_interaction();
         }
@@ -1458,6 +1532,11 @@ impl PrototypeApp {
         }
         self.documents.remove(index);
         self.sync_pane_viewports();
+        if let Some(sibling) = split_sibling_transition
+            && let Some(sibling_index) = self.tabs.tab_registry_index(sibling)
+        {
+            self.documents[sibling_index].prepare_for_pane_transition();
+        }
         if document_id.is_some_and(|document_id| {
             self.annotation_editor
                 .as_ref()
@@ -1642,36 +1721,39 @@ impl PrototypeApp {
                 view: document.view.to_session(),
             })
             .collect();
-        let pane_ids = self.tabs.pane_ids();
-        session.layout.panes = pane_ids
+        session.layout.entries = self
+            .tabs
+            .entries()
             .iter()
-            .filter_map(|pane_id| {
-                let tab_indices = self
-                    .tabs
-                    .pane_tab_ids(*pane_id)?
-                    .iter()
-                    .filter_map(|tab_id| self.tabs.tab_registry_index(*tab_id))
-                    .collect::<Vec<_>>();
-                let selected_tab = self
-                    .tabs
-                    .pane_selected(*pane_id)
-                    .and_then(|tab_id| self.tabs.tab_registry_index(tab_id))?;
-                Some(SessionPane {
-                    tab_indices,
-                    selected_tab,
-                })
+            .map(|entry| match entry {
+                TabEntry::Single(tab_id) => SessionEntry::Single {
+                    tab_index: self
+                        .tabs
+                        .tab_registry_index(*tab_id)
+                        .expect("displayed tab must exist in registry"),
+                },
+                TabEntry::Split(group) => {
+                    let tab_indices = group.tabs().map(|tab_id| {
+                        self.tabs
+                            .tab_registry_index(tab_id)
+                            .expect("split member must exist in registry")
+                    });
+                    SessionEntry::Split {
+                        tab_indices,
+                        direction: match group.direction() {
+                            SplitDirection::Horizontal => SessionSplitDirection::Horizontal,
+                            SplitDirection::Vertical => SessionSplitDirection::Vertical,
+                        },
+                        ratio: group.ratio(),
+                        focused_tab: tab_indices[group.focused().index()],
+                    }
+                }
             })
             .collect();
-        session.layout.focused_pane = (!session.layout.panes.is_empty()).then(|| {
-            pane_ids
-                .iter()
-                .position(|pane_id| *pane_id == self.tabs.focused_pane())
-                .expect("focused pane must be part of the saved layout")
-        });
-        session.layout.split = (session.layout.panes.len() == 2).then(|| SessionSplit {
-            direction: SplitDirection::Horizontal,
-            ratio: self.tabs.split_ratio(),
-        });
+        session.layout.active_tab = self
+            .tabs
+            .active_tab_id()
+            .and_then(|tab_id| self.tabs.tab_registry_index(tab_id));
         session
     }
 
@@ -2237,185 +2319,304 @@ impl PrototypeApp {
         self.documents.get_mut(index)
     }
 
-    fn tab_bar(&mut self, root_ui: &mut egui::Ui) -> Vec<PaneUiOutput> {
+    fn tab_bar(&mut self, root_ui: &mut egui::Ui) -> Option<TabBarOutput> {
         if self.documents.is_empty() {
-            return Vec::new();
+            return None;
         }
 
-        let pane_ids = self.tabs.pane_ids();
+        let entries = self.tabs.entries().to_vec();
+        let active_tab = self.tabs.active_tab_id();
         let tab_to_reveal = self.tab_to_reveal.take();
-        let mut outputs = Vec::with_capacity(pane_ids.len());
+        let mut output = None;
         egui::Panel::top("tabs").show(root_ui, |ui| {
             let bar_size = Vec2::new(ui.available_width(), TAB_HEIGHT);
             let (bar_rect, _) = ui.allocate_exact_size(bar_size, Sense::hover());
-            let (pane_rects, separator) = if pane_ids.len() == 2 {
-                let split = horizontal_split_rects(bar_rect, self.tabs.split_ratio());
-                (split.panes.to_vec(), Some(split.separator))
-            } else {
-                (vec![bar_rect], None)
+            let member_count = entries.iter().map(|entry| entry.tab_ids().len()).sum();
+            let tab_width = tab_width_for_count(
+                ui.available_width(),
+                entries.len(),
+                TAB_ITEM_SPACING,
+                TAB_MIN_WIDTH,
+                TAB_MAX_WIDTH,
+            );
+            let mut result = TabBarOutput {
+                bar_rect,
+                entry_rects: Vec::with_capacity(entries.len()),
+                tab_rects: Vec::with_capacity(member_count),
+                tab_ids: Vec::with_capacity(member_count),
+                group_rects: Vec::new(),
+                select: None,
+                close: None,
+                drag_started: None,
+                drag_released: false,
+                menu_action: None,
             };
-
-            for (pane_id, pane_rect) in pane_ids.iter().copied().zip(pane_rects) {
-                let tab_bar = ui
-                    .scope_builder(
-                        UiBuilder::new()
-                            .id_salt(("top-pane-tabs", pane_id))
-                            .max_rect(pane_rect),
-                        |pane_ui| self.pane_tab_bar(pane_ui, pane_id, tab_to_reveal),
-                    )
-                    .inner;
-                outputs.push(PaneUiOutput {
-                    pane_id,
-                    pdf_rect: Rect::NOTHING,
-                    tab_bar,
-                });
-            }
-            if let Some(separator) = separator {
-                ui.painter()
-                    .rect_filled(separator, 0.0, ui.visuals().widgets.inactive.bg_fill);
-            }
-
-            self.apply_pane_tab_actions(&outputs);
-            self.paint_tab_insertion_feedback(ui, &outputs);
+            ui.scope_builder(
+                UiBuilder::new()
+                    .id_salt("shared-tab-bar")
+                    .max_rect(bar_rect),
+                |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("shared-tabs-scroll")
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = TAB_ITEM_SPACING;
+                                for entry in &entries {
+                                    match entry {
+                                        TabEntry::Single(tab_id) => {
+                                            let (rect, response) = ui.allocate_exact_size(
+                                                Vec2::new(tab_width, TAB_HEIGHT),
+                                                Sense::hover(),
+                                            );
+                                            result.entry_rects.push(rect);
+                                            result.tab_rects.push(rect);
+                                            result.tab_ids.push(*tab_id);
+                                            let selected = active_tab == Some(*tab_id);
+                                            let (select, close, can_close) = self.paint_tab_member(
+                                                ui, *tab_id, rect, selected, selected,
+                                            );
+                                            if selected
+                                                && tab_to_reveal
+                                                    == self.tabs.tab_registry_index(*tab_id)
+                                            {
+                                                response.scroll_to_me(None);
+                                            }
+                                            Self::collect_tab_pointer_actions(
+                                                *tab_id,
+                                                &select,
+                                                &close,
+                                                can_close,
+                                                &mut result,
+                                            );
+                                        }
+                                        TabEntry::Split(group) => {
+                                            const GROUP_HANDLE_HIT_WIDTH: f32 = 18.0;
+                                            // 分割セットは通常タブと同じ外幅を二等分する。中央の見た目は
+                                            // 境界線だけにしつつ、セット移動用の当たり判定は広く保つ。
+                                            let member_width = tab_width / 2.0;
+                                            let (group_rect, response) = ui.allocate_exact_size(
+                                                Vec2::new(tab_width, TAB_HEIGHT),
+                                                Sense::hover(),
+                                            );
+                                            let first_rect = Rect::from_min_max(
+                                                group_rect.min,
+                                                pos2(
+                                                    group_rect.left() + member_width,
+                                                    group_rect.bottom(),
+                                                ),
+                                            );
+                                            let handle_rect = Rect::from_center_size(
+                                                group_rect.center(),
+                                                Vec2::new(GROUP_HANDLE_HIT_WIDTH, TAB_HEIGHT),
+                                            );
+                                            let second_rect = Rect::from_min_max(
+                                                pos2(first_rect.right(), group_rect.top()),
+                                                group_rect.max,
+                                            );
+                                            result.entry_rects.push(group_rect);
+                                            result.group_rects.push((group.id(), group_rect));
+                                            let active_group = group
+                                                .tabs()
+                                                .contains(&active_tab.unwrap_or(group.tabs()[0]));
+                                            for (side, tab_rect) in [
+                                                (SplitSide::First, first_rect),
+                                                (SplitSide::Second, second_rect),
+                                            ] {
+                                                let tab_id = group.tab(side);
+                                                result.tab_rects.push(tab_rect);
+                                                result.tab_ids.push(tab_id);
+                                                let focused = active_tab == Some(tab_id);
+                                                let (select, close, can_close) = self
+                                                    .paint_tab_member(
+                                                        ui, tab_id, tab_rect, focused, focused,
+                                                    );
+                                                Self::split_context_menu(
+                                                    &select,
+                                                    group.id(),
+                                                    &mut result.menu_action,
+                                                );
+                                                Self::collect_tab_pointer_actions(
+                                                    tab_id,
+                                                    &select,
+                                                    &close,
+                                                    can_close,
+                                                    &mut result,
+                                                );
+                                            }
+                                            let group_stroke = if active_group {
+                                                ui.visuals().selection.stroke
+                                            } else {
+                                                ui.visuals().widgets.inactive.bg_stroke
+                                            };
+                                            ui.painter().rect_stroke(
+                                                group_rect,
+                                                4.0,
+                                                group_stroke,
+                                                StrokeKind::Inside,
+                                            );
+                                            ui.painter().line_segment(
+                                                [
+                                                    pos2(group_rect.center().x, group_rect.top()),
+                                                    pos2(
+                                                        group_rect.center().x,
+                                                        group_rect.bottom(),
+                                                    ),
+                                                ],
+                                                group_stroke,
+                                            );
+                                            let handle = ui
+                                                .interact(
+                                                    handle_rect,
+                                                    ui.id()
+                                                        .with(("split-group-handle", group.id())),
+                                                    Sense::click_and_drag(),
+                                                )
+                                                .on_hover_text("分割セットを移動");
+                                            Self::split_context_menu(
+                                                &handle,
+                                                group.id(),
+                                                &mut result.menu_action,
+                                            );
+                                            if handle.drag_started_by(PointerButton::Primary) {
+                                                result.drag_started =
+                                                    Some(TabDragSource::Group(group.id()));
+                                            }
+                                            result.drag_released |=
+                                                handle.drag_stopped_by(PointerButton::Primary);
+                                            if active_group && tab_to_reveal.is_some() {
+                                                response.scroll_to_me(None);
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                },
+            );
+            self.apply_tab_bar_actions(&result);
+            self.paint_tab_insertion_feedback(ui, &result);
+            output = Some(result);
         });
-        outputs
+        output
     }
 
-    fn pane_tab_bar(
-        &mut self,
+    fn paint_tab_member(
+        &self,
         ui: &mut egui::Ui,
-        pane_id: PaneId,
-        tab_to_reveal: Option<usize>,
-    ) -> PaneTabBarOutput {
-        let tab_ids = self.tabs.pane_tab_ids(pane_id).unwrap_or_default().to_vec();
-        let selected_id = self.tabs.pane_selected(pane_id);
-        let pane_focused = self.tabs.focused_pane() == pane_id;
+        tab_id: TabId,
+        tab_rect: Rect,
+        selected: bool,
+        focused: bool,
+    ) -> (egui::Response, egui::Response, bool) {
+        let index = self
+            .tabs
+            .tab_registry_index(tab_id)
+            .expect("displayed tab must exist in document registry");
+        let tab = &self.tabs.tabs()[index];
         let editor_dirty_document = self
             .annotation_editor
             .as_ref()
             .filter(|editor| editor.is_dirty() || editor.mutation_in_flight)
             .map(|editor| editor.document_id);
-        let mut select_request = None;
-        let mut close_request = None;
-        let mut drag_started = None;
-        let mut drag_released = false;
-        let mut tab_rects = Vec::with_capacity(tab_ids.len());
-        let bar_size = Vec2::new(ui.available_width(), TAB_HEIGHT);
-        let (bar_rect, _) = ui.allocate_exact_size(bar_size, Sense::hover());
-        ui.scope_builder(
-            UiBuilder::new()
-                .id_salt(("pane-tab-bar", pane_id))
-                .max_rect(bar_rect),
-            |ui| {
-                let tab_count = tab_ids.len();
-                let tab_width = tab_width_for_count(
-                    ui.available_width(),
-                    tab_count,
-                    TAB_ITEM_SPACING,
-                    TAB_MIN_WIDTH,
-                    TAB_MAX_WIDTH,
-                );
-                egui::ScrollArea::horizontal()
-                    .id_salt(("pane-tabs-scroll", pane_id))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = TAB_ITEM_SPACING;
-                            for tab_id in &tab_ids {
-                                let index = self
-                                    .tabs
-                                    .tab_registry_index(*tab_id)
-                                    .expect("pane tab must exist in document registry");
-                                let tab = &self.tabs.tabs()[index];
-                                let dirty = self.documents[index].has_unsaved_changes()
-                                    || editor_dirty_document
-                                        == Some(self.documents[index].document_id);
-                                let marker = if dirty { "● " } else { "" };
-                                let title = tab
-                                    .path()
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy())
-                                    .unwrap_or_else(|| tab.path().as_os_str().to_string_lossy());
-                                let full_title = format!("{marker}{title}");
-                                let (tab_rect, tab_response) = ui.allocate_exact_size(
-                                    Vec2::new(tab_width, TAB_HEIGHT),
-                                    Sense::hover(),
-                                );
-                                tab_rects.push(tab_rect);
-                                let content = tab_content_rects(
-                                    tab_rect,
-                                    TAB_HORIZONTAL_PADDING,
-                                    TAB_CLOSE_WIDTH,
-                                    TAB_CONTENT_GAP,
-                                );
-                                let widget_id = ui.id().with(("document-tab", pane_id, tab_id));
-                                let select_response = ui
-                                    .interact(
-                                        content.selection,
-                                        widget_id.with("select"),
-                                        Sense::click_and_drag(),
-                                    )
-                                    .on_hover_text(tab.path().display().to_string());
-                                let can_close = !self.documents[index].is_printing();
-                                let close_sense = if can_close {
-                                    Sense::click()
-                                } else {
-                                    Sense::hover()
-                                };
-                                let close_response = ui.interact(
-                                    content.close,
-                                    widget_id.with("close"),
-                                    close_sense,
-                                );
-                                let selected = selected_id == Some(*tab_id);
-                                paint_document_tab(
-                                    ui,
-                                    tab_rect,
-                                    content,
-                                    &full_title,
-                                    TabPaintState {
-                                        selected,
-                                        focused: pane_focused,
-                                        can_close,
-                                        select_response: &select_response,
-                                        close_response: &close_response,
-                                    },
-                                );
-                                if selected && tab_to_reveal == Some(index) {
-                                    tab_response.scroll_to_me(None);
-                                }
-                                if select_response.drag_started_by(PointerButton::Primary) {
-                                    drag_started = Some(*tab_id);
-                                }
-                                drag_released |=
-                                    select_response.drag_stopped_by(PointerButton::Primary);
-                                match tab_pointer_action(
-                                    select_response.clicked(),
-                                    select_response.clicked_by(PointerButton::Middle),
-                                ) {
-                                    Some(TabPointerAction::Select) => {
-                                        select_request = Some(*tab_id)
-                                    }
-                                    Some(TabPointerAction::Close) if can_close => {
-                                        close_request = Some(*tab_id)
-                                    }
-                                    Some(TabPointerAction::Close) | None => {}
-                                }
-                                if can_close && close_response.clicked() {
-                                    close_request = Some(*tab_id);
-                                }
-                            }
-                        });
-                    });
+        let dirty = self.documents[index].has_unsaved_changes()
+            || editor_dirty_document == Some(self.documents[index].document_id);
+        let marker = if dirty { "● " } else { "" };
+        let title = tab
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| tab.path().as_os_str().to_string_lossy());
+        let content = tab_content_rects(
+            tab_rect,
+            TAB_HORIZONTAL_PADDING,
+            TAB_CLOSE_WIDTH,
+            TAB_CONTENT_GAP,
+        );
+        let widget_id = ui.id().with(("document-tab", tab_id));
+        let select_response = ui
+            .interact(
+                content.selection,
+                widget_id.with("select"),
+                Sense::click_and_drag(),
+            )
+            .on_hover_text(tab.path().display().to_string());
+        let can_close = !self.documents[index].is_printing();
+        let close_response = ui.interact(
+            content.close,
+            widget_id.with("close"),
+            if can_close {
+                Sense::click()
+            } else {
+                Sense::hover()
             },
         );
-        PaneTabBarOutput {
-            bar_rect,
-            tab_rects,
-            select: select_request,
-            close: close_request,
-            drag_started,
-            drag_released,
+        paint_document_tab(
+            ui,
+            tab_rect,
+            content,
+            &format!("{marker}{title}"),
+            TabPaintState {
+                selected,
+                focused,
+                can_close,
+                select_response: &select_response,
+                close_response: &close_response,
+            },
+        );
+        (select_response, close_response, can_close)
+    }
+
+    fn collect_tab_pointer_actions(
+        tab_id: TabId,
+        select: &egui::Response,
+        close: &egui::Response,
+        can_close: bool,
+        output: &mut TabBarOutput,
+    ) {
+        if select.drag_started_by(PointerButton::Primary) {
+            output.drag_started = Some(TabDragSource::Tab(tab_id));
         }
+        output.drag_released |= select.drag_stopped_by(PointerButton::Primary);
+        match tab_pointer_action(select.clicked(), select.clicked_by(PointerButton::Middle)) {
+            Some(TabPointerAction::Select) => output.select = Some(tab_id),
+            Some(TabPointerAction::Close) if can_close => output.close = Some(tab_id),
+            Some(TabPointerAction::Close) | None => {}
+        }
+        if can_close && close.clicked() {
+            output.close = Some(tab_id);
+        }
+    }
+
+    fn split_context_menu(
+        response: &egui::Response,
+        group_id: SplitGroupId,
+        action: &mut Option<SplitMenuAction>,
+    ) {
+        response.context_menu(|ui| {
+            if ui.button("左右に並べる").clicked() {
+                *action = Some(SplitMenuAction::SetDirection(
+                    group_id,
+                    SplitDirection::Horizontal,
+                ));
+                ui.close();
+            }
+            if ui.button("上下に並べる").clicked() {
+                *action = Some(SplitMenuAction::SetDirection(
+                    group_id,
+                    SplitDirection::Vertical,
+                ));
+                ui.close();
+            }
+            if ui.button("配置を入れ替える").clicked() {
+                *action = Some(SplitMenuAction::Swap(group_id));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("分割を解除").clicked() {
+                *action = Some(SplitMenuAction::Unsplit(group_id));
+                ui.close();
+            }
+        });
     }
 
     fn menu_bar(&mut self, root_ui: &mut egui::Ui) {
@@ -3206,7 +3407,7 @@ impl PrototypeApp {
         selected_page
     }
 
-    fn central_panel(&mut self, root_ui: &mut egui::Ui, outputs: &mut [PaneUiOutput]) -> Rect {
+    fn central_panel(&mut self, root_ui: &mut egui::Ui, tab_bar: Option<&TabBarOutput>) -> Rect {
         let mut focused_pdf_rect = Rect::NOTHING;
         egui::CentralPanel::default().show(root_ui, |ui| {
             if self.documents.is_empty() {
@@ -3217,10 +3418,14 @@ impl PrototypeApp {
             }
 
             let available = ui.available_rect_before_wrap();
-            let pane_ids = self.tabs.pane_ids();
-            let (pane_rects, split_rects) = if pane_ids.len() == 2 {
-                let split = horizontal_split_rects(available, self.tabs.split_ratio());
-                (split.panes.to_vec(), Some(split))
+            let visible_tabs = self.tabs.visible_tab_ids();
+            let active_split = self.tabs.active_split().cloned();
+            let (pane_rects, split_layout) = if let Some(group) = &active_split {
+                let split = split_rects(available, group.ratio(), group.direction());
+                (
+                    split.panes.to_vec(),
+                    Some((group.id(), group.direction(), split)),
+                )
             } else {
                 (vec![available], None)
             };
@@ -3244,54 +3449,79 @@ impl PrototypeApp {
             let foreground_owns_pointer = pointer.is_some_and(|pointer| {
                 foreground_layer_blocks_pane_input(ui.ctx().layer_id_at(pointer))
             });
-            let pointer_pane = (!foreground_owns_pointer)
+            let pointer_side = (!foreground_owns_pointer)
                 .then(|| {
                     pointer.and_then(|pointer| {
                         pane_rects.iter().position(|rect| rect.contains(pointer))
                     })
                 })
-                .flatten();
-            if let Some(pane_index) = pointer_pane {
-                self.focus_pane(pane_ids[pane_index]);
+                .flatten()
+                .and_then(|index| match index {
+                    0 => Some(SplitSide::First),
+                    1 => Some(SplitSide::Second),
+                    _ => None,
+                });
+            if let Some(side) = pointer_side {
+                self.focus_side(side);
             }
             if (zoom_delta - 1.0).abs() > f32::EPSILON && !foreground_owns_pointer {
                 self.zoom_by(zoom_delta);
             }
 
-            if let Some(split) = split_rects {
-                self.separator(ui, available, split);
+            if let Some((group_id, direction, split)) = split_layout {
+                self.separator(ui, available, group_id, direction, split);
             }
 
-            for (pane_id, pane_rect) in pane_ids.into_iter().zip(pane_rects) {
+            let mut outputs = Vec::with_capacity(visible_tabs.len());
+            for (index, (tab_id, pane_rect)) in visible_tabs.into_iter().zip(pane_rects).enumerate()
+            {
+                let side = if index == 0 {
+                    SplitSide::First
+                } else {
+                    SplitSide::Second
+                };
                 ui.scope_builder(
                     UiBuilder::new()
-                        .id_salt(("document-pane", pane_id))
+                        .id_salt(("document-pane", side))
                         .max_rect(pane_rect),
-                    |pane_ui| self.document_view(pane_ui, pane_id),
+                    |pane_ui| self.document_view(pane_ui, side, tab_id),
                 );
-                if let Some(output) = outputs.iter_mut().find(|output| output.pane_id == pane_id) {
-                    output.pdf_rect = pane_rect;
-                }
-                if pane_id == self.tabs.focused_pane() {
+                outputs.push(PaneUiOutput {
+                    side,
+                    tab_id,
+                    pdf_rect: pane_rect,
+                });
+                if self.tabs.active_tab_id() == Some(tab_id) {
                     focused_pdf_rect = pane_rect;
                 }
             }
 
-            self.paint_pdf_drop_feedback(ui, outputs);
-            self.finish_tab_drag(ui, outputs);
+            self.paint_pdf_drop_feedback(ui, tab_bar, &outputs);
+            self.paint_tab_drag_preview(ui);
+            self.finish_tab_drag(ui, tab_bar, &outputs);
             ui.allocate_rect(available, Sense::hover());
         });
         focused_pdf_rect
     }
 
-    fn separator(&mut self, ui: &mut egui::Ui, available: Rect, split: HorizontalSplitRects) {
+    fn separator(
+        &mut self,
+        ui: &mut egui::Ui,
+        available: Rect,
+        group_id: SplitGroupId,
+        direction: SplitDirection,
+        split: SplitRects,
+    ) {
         let response = ui
             .interact(
                 split.separator,
                 ui.id().with("document-pane-separator"),
                 Sense::drag(),
             )
-            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+            .on_hover_cursor(match direction {
+                SplitDirection::Horizontal => egui::CursorIcon::ResizeHorizontal,
+                SplitDirection::Vertical => egui::CursorIcon::ResizeVertical,
+            });
         let color = if response.dragged() || response.hovered() {
             ui.visuals().widgets.hovered.bg_fill
         } else {
@@ -3301,19 +3531,28 @@ impl PrototypeApp {
         if response.dragged_by(PointerButton::Primary)
             && let Some(pointer) = response.interact_pointer_pos()
         {
-            let content_width = (available.width() - split.separator.width()).max(1.0);
-            let ratio = (pointer.x - available.left()) / content_width;
-            let _applied = self.tabs.set_split_ratio(ratio.clamp(0.1, 0.9));
-        } else if split.ratio != self.tabs.split_ratio() {
-            // ウィンドウ縮小でpoint最小幅へclampした比率を保存し、拡大時に操作不能な幅へ戻さない。
-            let _applied = self.tabs.set_split_ratio(split.ratio);
+            let ratio = match direction {
+                SplitDirection::Horizontal => {
+                    let extent = (available.width() - split.separator.width()).max(1.0);
+                    (pointer.x - available.left()) / extent
+                }
+                SplitDirection::Vertical => {
+                    let extent = (available.height() - split.separator.height()).max(1.0);
+                    (pointer.y - available.top()) / extent
+                }
+            };
+            let _applied = self.tabs.set_split_ratio(group_id, ratio.clamp(0.1, 0.9));
+        } else if self
+            .tabs
+            .split_group(group_id)
+            .is_some_and(|group| group.ratio() != split.ratio)
+        {
+            // ウィンドウ縮小でpoint最小寸法へclampした比率を保存し、拡大時に操作不能な寸法へ戻さない。
+            let _applied = self.tabs.set_split_ratio(group_id, split.ratio);
         }
     }
 
-    fn document_view(&mut self, ui: &mut egui::Ui, pane_id: PaneId) {
-        let Some(tab_id) = self.tabs.pane_selected(pane_id) else {
-            return;
-        };
+    fn document_view(&mut self, ui: &mut egui::Ui, side: SplitSide, tab_id: TabId) {
         let index = self
             .tabs
             .tab_registry_index(tab_id)
@@ -3347,35 +3586,65 @@ impl PrototypeApp {
         }
         self.update_fit_zoom(index, ui.available_size());
         match self.documents[index].view.display_mode {
-            DisplayMode::Continuous => self.continuous_view(ui, pane_id, index),
-            DisplayMode::SinglePage => self.single_page_view(ui, pane_id, index),
+            DisplayMode::Continuous => self.continuous_view(ui, side, index),
+            DisplayMode::SinglePage => self.single_page_view(ui, side, index),
         }
     }
 
-    fn apply_pane_tab_actions(&mut self, outputs: &[PaneUiOutput]) {
-        for output in outputs {
-            if let Some(tab_id) = output.tab_bar.drag_started {
-                self.focus_pane(output.pane_id);
-                self.tab_drag = Some(TabDragState {
-                    tab_id,
-                    source_pane: output.pane_id,
-                });
+    fn apply_tab_bar_actions(&mut self, output: &TabBarOutput) {
+        if let Some(source) = output.drag_started {
+            self.tab_drag = Some(TabDragState { source });
+        }
+        if let Some(tab_id) = output.select
+            && let Some(index) = self.tabs.tab_registry_index(tab_id)
+        {
+            self.select_tab(index);
+        }
+        if let Some(tab_id) = output.close
+            && let Some(index) = self.tabs.tab_registry_index(tab_id)
+        {
+            self.close_tab(index);
+        }
+        let Some(action) = output.menu_action else {
+            return;
+        };
+        let previous = self.active_index();
+        let previously_visible = self.visible_indices();
+        let transition_tabs = match action {
+            SplitMenuAction::Swap(group_id) => self
+                .tabs
+                .split_group(group_id)
+                .map(|group| group.tabs().to_vec())
+                .unwrap_or_default(),
+            SplitMenuAction::Unsplit(group_id) => self
+                .tabs
+                .split_group(group_id)
+                .map(|group| vec![group.tab(SplitSide::Second)])
+                .unwrap_or_default(),
+            SplitMenuAction::SetDirection(_, _) => Vec::new(),
+        };
+        let changed = match action {
+            SplitMenuAction::SetDirection(group_id, direction) => {
+                self.tabs.set_split_direction(group_id, direction)
             }
-            if let Some(tab_id) = output.tab_bar.select
-                && let Some(index) = self.tabs.tab_registry_index(tab_id)
-            {
-                self.select_tab(index);
+            SplitMenuAction::Swap(group_id) => self.tabs.swap_split_members(group_id),
+            SplitMenuAction::Unsplit(group_id) => self.tabs.unsplit(group_id),
+        };
+        if changed {
+            for tab_id in transition_tabs {
+                if let Some(index) = self.tabs.tab_registry_index(tab_id) {
+                    self.documents[index].prepare_for_pane_transition();
+                }
             }
-            if let Some(tab_id) = output.tab_bar.close
-                && let Some(index) = self.tabs.tab_registry_index(tab_id)
-            {
-                self.focus_pane(output.pane_id);
-                self.close_tab(index);
+            self.cancel_all_viewport_interactions();
+            self.sync_pane_viewports();
+            if let Some(index) = self.active_index() {
+                self.activate_document(index, previous, &previously_visible);
             }
         }
     }
 
-    fn paint_tab_insertion_feedback(&self, ui: &egui::Ui, outputs: &[PaneUiOutput]) {
+    fn paint_tab_insertion_feedback(&self, ui: &egui::Ui, output: &TabBarOutput) {
         if self.tab_drag.is_none() {
             return;
         }
@@ -3385,57 +3654,55 @@ impl PrototypeApp {
         if foreground_layer_blocks_pane_input(ui.ctx().layer_id_at(pointer)) {
             return;
         }
-        if let Some(target) = outputs
-            .iter()
-            .find(|output| output.tab_bar.bar_rect.contains(pointer))
-        {
-            let insertion = tab_insertion_index(&target.tab_bar.tab_rects, pointer.x);
+        if output.bar_rect.contains(pointer) {
+            let insertion = tab_insertion_index(&output.entry_rects, pointer.x);
             let line_x = match insertion {
-                0 => target
-                    .tab_bar
-                    .tab_rects
+                0 => output
+                    .entry_rects
                     .first()
-                    .map_or(target.tab_bar.bar_rect.left(), Rect::left),
-                index if index == target.tab_bar.tab_rects.len() => target
-                    .tab_bar
-                    .tab_rects
+                    .map_or(output.bar_rect.left(), Rect::left),
+                index if index == output.entry_rects.len() => output
+                    .entry_rects
                     .last()
-                    .map_or(target.tab_bar.bar_rect.left(), Rect::right),
+                    .map_or(output.bar_rect.left(), Rect::right),
                 index => {
-                    let previous = target.tab_bar.tab_rects[index - 1].right();
-                    let next = target.tab_bar.tab_rects[index].left();
+                    let previous = output.entry_rects[index - 1].right();
+                    let next = output.entry_rects[index].left();
                     (previous + next) / 2.0
                 }
             };
             ui.painter().line_segment(
                 [
-                    pos2(line_x, target.tab_bar.bar_rect.top()),
-                    pos2(line_x, target.tab_bar.bar_rect.bottom()),
+                    pos2(line_x, output.bar_rect.top()),
+                    pos2(line_x, output.bar_rect.bottom()),
                 ],
                 Stroke::new(2.0, ui.visuals().selection.stroke.color),
             );
         }
     }
 
-    fn paint_pdf_drop_feedback(&self, ui: &egui::Ui, outputs: &[PaneUiOutput]) {
+    fn paint_pdf_drop_feedback(
+        &self,
+        ui: &egui::Ui,
+        tab_bar: Option<&TabBarOutput>,
+        outputs: &[PaneUiOutput],
+    ) {
         let Some(drag) = self.tab_drag else {
+            return;
+        };
+        let TabDragSource::Tab(dragged_tab) = drag.source else {
             return;
         };
         let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
             return;
         };
         if foreground_layer_blocks_pane_input(ui.ctx().layer_id_at(pointer))
-            || outputs
-                .iter()
-                .any(|output| output.tab_bar.bar_rect.contains(pointer))
+            || tab_bar.is_some_and(|bar| bar.bar_rect.contains(pointer))
         {
             return;
         }
         if outputs.len() == 1
-            && self
-                .tabs
-                .pane_tab_ids(drag.source_pane)
-                .is_some_and(|tabs| tabs.len() > 1)
+            && outputs[0].tab_id != dragged_tab
             && let Some(placement) = split_drop_placement(outputs[0].pdf_rect, pointer)
         {
             let highlight = split_drop_highlight(outputs[0].pdf_rect, placement);
@@ -3445,9 +3712,9 @@ impl PrototypeApp {
                 ui.visuals().selection.bg_fill.gamma_multiply(0.35),
             );
         } else if outputs.len() == 2
-            && let Some(target) = outputs.iter().find(|output| {
-                output.pane_id != drag.source_pane && output.pdf_rect.contains(pointer)
-            })
+            && let Some(target) = outputs
+                .iter()
+                .find(|output| output.tab_id != dragged_tab && output.pdf_rect.contains(pointer))
         {
             ui.painter().rect_filled(
                 target.pdf_rect,
@@ -3457,8 +3724,101 @@ impl PrototypeApp {
         }
     }
 
-    fn finish_tab_drag(&mut self, ui: &egui::Ui, outputs: &[PaneUiOutput]) {
-        if !outputs.iter().any(|output| output.tab_bar.drag_released) {
+    fn tab_drag_preview_label(&self, source: TabDragSource) -> Option<String> {
+        let title = |tab_id| {
+            let index = self.tabs.tab_registry_index(tab_id)?;
+            let path = self.tabs.tabs()[index].path();
+            Some(
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.as_os_str().to_string_lossy().into_owned()),
+            )
+        };
+        match source {
+            TabDragSource::Tab(tab_id) => title(tab_id),
+            TabDragSource::Group(group_id) => {
+                let group = self.tabs.split_group(group_id)?;
+                Some(format!(
+                    "{} ｜ {}",
+                    title(group.tab(SplitSide::First))?,
+                    title(group.tab(SplitSide::Second))?
+                ))
+            }
+        }
+    }
+
+    fn paint_tab_drag_preview(&self, ui: &egui::Ui) {
+        let Some(drag) = self.tab_drag else {
+            return;
+        };
+        let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        let Some(label) = self.tab_drag_preview_label(drag.source) else {
+            return;
+        };
+
+        let font_id = egui::TextStyle::Button.resolve(ui.style());
+        let text_color = ui.visuals().strong_text_color();
+        let mut title_job = egui::text::LayoutJob::single_section(
+            label,
+            egui::TextFormat {
+                font_id,
+                color: text_color,
+                ..Default::default()
+            },
+        );
+        title_job.wrap = egui::epaint::text::TextWrapping::truncate_at_width(
+            TAB_MAX_WIDTH - TAB_DRAG_PREVIEW_PADDING * 2.0,
+        );
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(title_job));
+        let preview_size = Vec2::new(galley.size().x + TAB_DRAG_PREVIEW_PADDING * 2.0, TAB_HEIGHT);
+        let bounds = ui.ctx().content_rect();
+        let desired = pointer + Vec2::splat(TAB_DRAG_PREVIEW_OFFSET);
+        // 画面端でも保持中のタイトルが見えるように、ポインターからずらした矩形だけを
+        // content rect内へ制限する。drop判定に使うポインター座標は変更しない。
+        let preview_min = pos2(
+            desired.x.clamp(
+                bounds.left(),
+                (bounds.right() - preview_size.x).max(bounds.left()),
+            ),
+            desired.y.clamp(
+                bounds.top(),
+                (bounds.bottom() - preview_size.y).max(bounds.top()),
+            ),
+        );
+        let preview_rect = Rect::from_min_size(preview_min, preview_size);
+        let painter = ui.ctx().layer_painter(LayerId::new(
+            egui::Order::Tooltip,
+            Id::new("tab-drag-preview"),
+        ));
+        painter.rect(
+            preview_rect,
+            4.0,
+            ui.visuals().selection.bg_fill.gamma_multiply(0.92),
+            ui.visuals().selection.stroke,
+            StrokeKind::Inside,
+        );
+        painter.galley(
+            pos2(
+                preview_rect.left() + TAB_DRAG_PREVIEW_PADDING,
+                preview_rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            text_color,
+        );
+    }
+
+    fn finish_tab_drag(
+        &mut self,
+        ui: &egui::Ui,
+        tab_bar: Option<&TabBarOutput>,
+        outputs: &[PaneUiOutput],
+    ) {
+        let Some(tab_bar) = tab_bar else {
+            return;
+        };
+        if !tab_bar.drag_released {
             return;
         }
         let Some(drag) = self.tab_drag.take() else {
@@ -3473,36 +3833,97 @@ impl PrototypeApp {
         let previous = self.active_index();
         let previously_visible = self.visible_indices();
         let mut changed = false;
-        if let Some(target) = outputs
-            .iter()
-            .find(|output| output.tab_bar.bar_rect.contains(pointer))
-        {
-            let insertion = tab_insertion_index(&target.tab_bar.tab_rects, pointer.x);
-            changed = self.tabs.move_tab(drag.tab_id, target.pane_id, insertion);
-        } else if outputs.len() == 1 {
-            if let Some(placement) = split_drop_placement(outputs[0].pdf_rect, pointer) {
-                changed = self.tabs.split(drag.tab_id, placement);
+        let mut transitioned_tabs = Vec::new();
+        if tab_bar.bar_rect.contains(pointer) {
+            let insertion = tab_insertion_index(&tab_bar.entry_rects, pointer.x);
+            changed = match drag.source {
+                TabDragSource::Group(group_id) => self.tabs.reorder_split(group_id, insertion),
+                TabDragSource::Tab(tab_id) => {
+                    let same_group = self.tabs.split_for_tab(tab_id).map(|group| group.id());
+                    let pointer_member =
+                        tab_bar.tab_ids.iter().zip(&tab_bar.tab_rects).find_map(
+                            |(candidate, rect)| rect.contains(pointer).then_some(*candidate),
+                        );
+                    let pointer_group = tab_bar
+                        .group_rects
+                        .iter()
+                        .find_map(|(group_id, rect)| rect.contains(pointer).then_some(*group_id));
+                    match same_group {
+                        Some(group_id) if pointer_group == Some(group_id) => {
+                            let swap_requested = pointer_member.is_some_and(|candidate| {
+                                candidate != tab_id
+                                    && self.tabs.split_for_tab(candidate).map(|group| group.id())
+                                        == Some(group_id)
+                            });
+                            if swap_requested {
+                                if let Some(group) = self.tabs.split_group(group_id) {
+                                    transitioned_tabs.extend(group.tabs());
+                                }
+                                self.tabs.swap_split_members(group_id)
+                            } else {
+                                false
+                            }
+                        }
+                        Some(_) => {
+                            let second_tab = self
+                                .tabs
+                                .split_for_tab(tab_id)
+                                .map(|group| group.tab(SplitSide::Second));
+                            let extracted = self.tabs.extract_split_member(tab_id, insertion);
+                            if extracted {
+                                // 解除後は両方とも単独表示の第1面になるため、元の第2面だけ
+                                // 新しいScrollArea IDへ中央アンカーを引き継ぐ。
+                                transitioned_tabs.extend(second_tab);
+                            }
+                            extracted
+                        }
+                        None => self.tabs.reorder_single(tab_id, insertion),
+                    }
+                }
+            };
+        } else if let TabDragSource::Tab(tab_id) = drag.source {
+            if outputs.len() == 1 {
+                if let Some(placement) = split_drop_placement(outputs[0].pdf_rect, pointer) {
+                    let collapsed_second_tab = self
+                        .tabs
+                        .split_for_tab(tab_id)
+                        .map(|group| group.tab(SplitSide::Second));
+                    changed = self.tabs.create_split(tab_id, outputs[0].tab_id, placement);
+                    if changed {
+                        // 別セットから第1面を持ち出す場合、残る第2面も単独表示の
+                        // 第1面へ移るためアンカー引継ぎが必要になる。
+                        transitioned_tabs.extend(collapsed_second_tab);
+                        transitioned_tabs.extend([tab_id, outputs[0].tab_id]);
+                    }
+                }
+            } else if let Some(target) = outputs
+                .iter()
+                .find(|output| output.pdf_rect.contains(pointer))
+            {
+                let group_id = self
+                    .tabs
+                    .active_split()
+                    .expect("two visible tabs require an active split")
+                    .id();
+                if let Some(displaced) =
+                    self.tabs
+                        .replace_split_member(group_id, target.side, tab_id)
+                {
+                    changed = true;
+                    transitioned_tabs.extend([tab_id, displaced]);
+                }
             }
-        } else if let Some(target) = outputs
-            .iter()
-            .find(|output| output.pane_id != drag.source_pane && output.pdf_rect.contains(pointer))
-        {
-            let insertion = self
-                .tabs
-                .pane_tab_ids(target.pane_id)
-                .map_or(0, <[TabId]>::len);
-            changed = self.tabs.move_tab(drag.tab_id, target.pane_id, insertion);
         }
         if !changed {
             return;
         }
 
-        if let Some(index) = self.tabs.tab_registry_index(drag.tab_id) {
-            self.documents[index].prepare_for_pane_transition();
+        for tab_id in transitioned_tabs {
+            if let Some(index) = self.tabs.tab_registry_index(tab_id) {
+                self.documents[index].prepare_for_pane_transition();
+            }
         }
-        if let Some(viewport) = self.viewports.get_mut(&drag.source_pane) {
-            viewport.cancel_primary_interaction();
-        }
+        self.cancel_all_viewport_interactions();
         self.sync_pane_viewports();
         if let Some(index) = self.active_index() {
             self.activate_document(index, previous, &previously_visible);
@@ -3631,13 +4052,13 @@ impl PrototypeApp {
         Some(desired)
     }
 
-    fn continuous_view(&mut self, ui: &mut egui::Ui, pane_id: PaneId, index: usize) {
+    fn continuous_view(&mut self, ui: &mut egui::Ui, side: SplitSide, index: usize) {
         let document_id = self.documents[index].document_id;
         if self.documents[index].view.autoscroll.is_some() {
             // 停止入力を受けるまで autoscroll がナビゲーションを所有するため、古い主ジェスチャーを
             // アンカーと同時に残してはならない。
             self.viewports
-                .entry(pane_id)
+                .entry(side)
                 .or_default()
                 .cancel_primary_interaction();
         }
@@ -3657,7 +4078,7 @@ impl PrototypeApp {
                 .is_some_and(|picker| picker.document_id == document_id);
         let pixels_per_point = ui.ctx().pixels_per_point();
         let viewport_size = ui.available_size();
-        let viewport = self.viewports.entry(pane_id).or_default();
+        let viewport = self.viewports.entry(side).or_default();
         let gpu_lru = &mut self.gpu_lru;
         let tab = &mut self.documents[index];
         let info = tab.info.as_ref().expect("checked before drawing");
@@ -3863,7 +4284,7 @@ impl PrototypeApp {
         }
     }
 
-    fn single_page_view(&mut self, ui: &mut egui::Ui, pane_id: PaneId, index: usize) {
+    fn single_page_view(&mut self, ui: &mut egui::Ui, side: SplitSide, index: usize) {
         let document_id = self.documents[index].document_id;
         let suppress_annotation_hover = self.documents[index].view.autoscroll.is_some()
             || self
@@ -3880,7 +4301,7 @@ impl PrototypeApp {
             .filter(|editor| editor.document_id == document_id)
             .map(|_| annotation_overlay_rect(ui.max_rect()));
         let pixels_per_point = ui.ctx().pixels_per_point();
-        let viewport = self.viewports.entry(pane_id).or_default();
+        let viewport = self.viewports.entry(side).or_default();
         let gpu_lru = &mut self.gpu_lru;
         let tab = &mut self.documents[index];
         let info = tab.info.as_ref().expect("checked before drawing");
@@ -4784,12 +5205,12 @@ impl eframe::App for PrototypeApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.menu_bar(ui);
-        let mut pane_outputs = self.tab_bar(ui);
+        let tab_bar = self.tab_bar(ui);
         self.toolbar(ui);
         self.error_banner(ui);
         self.status_panel(ui);
         self.sidebar_panel(ui);
-        let central_rect = self.central_panel(ui, &mut pane_outputs);
+        let central_rect = self.central_panel(ui, tab_bar.as_ref());
         self.annotation_candidate_picker(ui.ctx());
         self.annotation_editor_overlay(ui.ctx(), central_rect);
         self.close_confirmation_dialog(ui.ctx());

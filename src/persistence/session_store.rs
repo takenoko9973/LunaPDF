@@ -132,12 +132,12 @@ fn linux_config_path(xdg: Option<&Path>, home: Option<&Path>) -> Result<PathBuf>
 mod tests {
     use super::*;
     use crate::domain::session::{
-        DisplayMode, SessionLayout, SessionPane, SessionTab, SessionView, SidebarTab, ZoomMode,
+        DisplayMode, SessionEntry, SessionLayout, SessionTab, SessionView, SidebarTab, ZoomMode,
     };
 
     fn valid_state(directory: &Path) -> SessionState {
         SessionState {
-            schema_version: 2,
+            schema_version: 3,
             restore_enabled: true,
             sidebar_open: true,
             sidebar_tab: SidebarTab::Thumbnails,
@@ -153,12 +153,8 @@ mod tests {
                 },
             }],
             layout: SessionLayout {
-                panes: vec![SessionPane {
-                    tab_indices: vec![0],
-                    selected_tab: 0,
-                }],
-                focused_pane: Some(0),
-                split: None,
+                entries: vec![SessionEntry::Single { tab_index: 0 }],
+                active_tab: Some(0),
             },
             recent_annotation_colors: Vec::new(),
         }
@@ -222,8 +218,11 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
         let migrated = SessionStore::new(path).load().unwrap().unwrap();
-        assert_eq!(migrated.schema_version, 2);
-        assert_eq!(migrated.layout.panes[0].tab_indices, vec![0]);
+        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(
+            migrated.layout.entries,
+            vec![SessionEntry::Single { tab_index: 0 }]
+        );
     }
 
     #[test]
@@ -237,8 +236,10 @@ mod tests {
                 tab
             })
             .collect();
-        state.layout.panes[0].tab_indices = (0..51).collect();
-        state.layout.panes[0].selected_tab = 50;
+        state.layout.entries = (0..51)
+            .map(|tab_index| SessionEntry::Single { tab_index })
+            .collect();
+        state.layout.active_tab = Some(50);
         assert!(state.validate().is_ok());
     }
 
@@ -253,15 +254,17 @@ mod tests {
                 tab
             })
             .collect();
-        state.layout.panes[0].tab_indices = (0..51).collect();
-        state.layout.panes[0].selected_tab = 12;
+        state.layout.entries = (0..51)
+            .map(|tab_index| SessionEntry::Single { tab_index })
+            .collect();
+        state.layout.active_tab = Some(12);
         let store = SessionStore::new(directory.path().join("session.json"));
 
         store.save(&state).unwrap();
         let restored = store.load().unwrap().unwrap();
 
         assert_eq!(restored.tabs, state.tabs);
-        assert_eq!(restored.layout.panes[0].selected_tab, 12);
+        assert_eq!(restored.layout.active_tab, Some(12));
     }
 
     #[test]

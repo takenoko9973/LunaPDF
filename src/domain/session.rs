@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 4.0;
 // 5エントリでコンパクトなエディタ履歴に収まり、保存容量も上限内に保てる。
@@ -12,7 +12,7 @@ pub(crate) const MAX_RECENT_ANNOTATION_COLORS: usize = 5;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 保存対象となるUIセッション状態(schema 2)。
+/// 保存対象となるUIセッション状態(schema 3)。
 pub(crate) struct SessionState {
     pub(crate) schema_version: u32,
     pub(crate) restore_enabled: bool,
@@ -26,33 +26,31 @@ pub(crate) struct SessionState {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// タブを1つまたは2つのペインへ割り当てるレイアウト。
+/// 共有タブ列の表示順と、現在操作対象となるタブ。
 pub(crate) struct SessionLayout {
-    pub(crate) panes: Vec<SessionPane>,
-    pub(crate) focused_pane: Option<usize>,
-    pub(crate) split: Option<SessionSplit>,
+    pub(crate) entries: Vec<SessionEntry>,
+    pub(crate) active_tab: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-/// グローバルなタブ番号と、そのペインで選択されたタブ。
-pub(crate) struct SessionPane {
-    pub(crate) tab_indices: Vec<usize>,
-    pub(crate) selected_tab: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-/// 2ペイン時の分割方向と比率。
-pub(crate) struct SessionSplit {
-    pub(crate) direction: SplitDirection,
-    pub(crate) ratio: f32,
+#[serde(tag = "kind", deny_unknown_fields)]
+pub(crate) enum SessionEntry {
+    Single {
+        tab_index: usize,
+    },
+    Split {
+        tab_indices: [usize; 2],
+        direction: SplitDirection,
+        ratio: f32,
+        focused_tab: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-/// ペイン分割の方向。schema 2では水平分割のみを受け付ける。
+/// 分割セット内の2文書を並べる方向。
 pub(crate) enum SplitDirection {
     Horizontal,
+    Vertical,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -107,9 +105,8 @@ impl Default for SessionState {
             sidebar_tab: SidebarTab::Outline,
             tabs: Vec::new(),
             layout: SessionLayout {
-                panes: Vec::new(),
-                focused_pane: None,
-                split: None,
+                entries: Vec::new(),
+                active_tab: None,
             },
             recent_annotation_colors: Vec::new(),
         }
@@ -117,7 +114,7 @@ impl Default for SessionState {
 }
 
 impl SessionState {
-    /// JSON値をschemaに応じて検証し、schema 1はschema 2のメモリ表現へ移行する。
+    /// JSON値をschemaに応じて検証し、schema 1/2はschema 3のメモリ表現へ移行する。
     pub(crate) fn decode(value: serde_json::Value) -> Result<Self> {
         let schema_version = value
             .get("schema_version")
@@ -128,27 +125,29 @@ impl SessionState {
                 let old: SessionStateSchema1 = serde_json::from_value(value)
                     .map_err(|error| anyhow::anyhow!("decode schema 1 session: {error}"))?;
                 old.validate()?;
-                let old_selected_tab = old.selected_tab;
-                // schema 1 had one global selected tab; retaining that as the sole pane preserves
-                // its selection while making pane membership explicit in schema 2.
-                let layout = if old.tabs.is_empty() {
-                    SessionLayout {
-                        panes: Vec::new(),
-                        focused_pane: None,
-                        split: None,
-                    }
-                } else {
-                    SessionLayout {
-                        panes: vec![SessionPane {
-                            tab_indices: (0..old.tabs.len()).collect(),
-                            selected_tab: old_selected_tab.ok_or_else(|| {
-                                anyhow::anyhow!("validated schema 1 lost selection")
-                            })?,
-                        }],
-                        focused_pane: Some(0),
-                        split: None,
-                    }
+                let layout = SessionLayout {
+                    entries: (0..old.tabs.len())
+                        .map(|tab_index| SessionEntry::Single { tab_index })
+                        .collect(),
+                    active_tab: old.selected_tab,
                 };
+                let state = Self {
+                    schema_version: SCHEMA_VERSION,
+                    restore_enabled: old.restore_enabled,
+                    sidebar_open: old.sidebar_open,
+                    sidebar_tab: old.sidebar_tab,
+                    tabs: old.tabs,
+                    layout,
+                    recent_annotation_colors: old.recent_annotation_colors,
+                };
+                state.validate()?;
+                Ok(state)
+            }
+            2 => {
+                let old: SessionStateSchema2 = serde_json::from_value(value)
+                    .map_err(|error| anyhow::anyhow!("decode schema 2 session: {error}"))?;
+                old.validate()?;
+                let layout = migrate_schema2_layout(&old.layout, old.tabs.len())?;
                 let state = Self {
                     schema_version: SCHEMA_VERSION,
                     restore_enabled: old.restore_enabled,
@@ -163,7 +162,7 @@ impl SessionState {
             }
             version if version == SCHEMA_VERSION as u64 => {
                 let state: Self = serde_json::from_value(value)
-                    .map_err(|error| anyhow::anyhow!("decode schema 2 session: {error}"))?;
+                    .map_err(|error| anyhow::anyhow!("decode schema 3 session: {error}"))?;
                 state.validate()?;
                 Ok(state)
             }
@@ -221,6 +220,118 @@ impl SessionStateSchema1 {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionStateSchema2 {
+    schema_version: u32,
+    restore_enabled: bool,
+    sidebar_open: bool,
+    sidebar_tab: SidebarTab,
+    tabs: Vec<SessionTab>,
+    layout: SessionLayoutSchema2,
+    #[serde(default)]
+    recent_annotation_colors: Vec<[u8; 3]>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionLayoutSchema2 {
+    panes: Vec<SessionPaneSchema2>,
+    focused_pane: Option<usize>,
+    split: Option<SessionSplitSchema2>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionPaneSchema2 {
+    tab_indices: Vec<usize>,
+    selected_tab: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionSplitSchema2 {
+    direction: SplitDirectionSchema2,
+    ratio: f32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+enum SplitDirectionSchema2 {
+    Horizontal,
+}
+
+impl SessionStateSchema2 {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != 2 {
+            bail!("invalid schema 2 session version {}", self.schema_version);
+        }
+        validate_tabs(&self.tabs)?;
+        validate_schema2_layout(&self.layout, self.tabs.len())?;
+        validate_recent_colors(&self.recent_annotation_colors)
+    }
+}
+
+fn migrate_schema2_layout(
+    layout: &SessionLayoutSchema2,
+    tab_count: usize,
+) -> Result<SessionLayout> {
+    if tab_count == 0 {
+        return Ok(SessionLayout {
+            entries: Vec::new(),
+            active_tab: None,
+        });
+    }
+    if layout.panes.len() == 1 {
+        let pane = &layout.panes[0];
+        return Ok(SessionLayout {
+            entries: pane
+                .tab_indices
+                .iter()
+                .copied()
+                .map(|tab_index| SessionEntry::Single { tab_index })
+                .collect(),
+            active_tab: Some(pane.selected_tab),
+        });
+    }
+
+    let selected = [layout.panes[0].selected_tab, layout.panes[1].selected_tab];
+    let flattened = layout
+        .panes
+        .iter()
+        .flat_map(|pane| pane.tab_indices.iter().copied())
+        .collect::<Vec<_>>();
+    let insertion = flattened
+        .iter()
+        .position(|tab_index| selected.contains(tab_index))
+        .expect("validated schema 2 selections must be present");
+    let split = layout
+        .split
+        .as_ref()
+        .expect("validated schema 2 two-pane layout must contain a split");
+    let focused_pane = layout
+        .focused_pane
+        .expect("validated schema 2 layout must contain focus");
+    let mut entries = Vec::with_capacity(tab_count - 1);
+    for (position, tab_index) in flattened.into_iter().enumerate() {
+        if position == insertion {
+            // 旧UIで同時表示されていた二つだけを一組にし、非選択タブの見た目の順序は維持する。
+            entries.push(SessionEntry::Split {
+                tab_indices: selected,
+                direction: SplitDirection::Horizontal,
+                ratio: split.ratio,
+                focused_tab: selected[focused_pane],
+            });
+        }
+        if !selected.contains(&tab_index) {
+            entries.push(SessionEntry::Single { tab_index });
+        }
+    }
+    Ok(SessionLayout {
+        entries,
+        active_tab: Some(selected[focused_pane]),
+    })
+}
+
 fn validate_tabs(tabs: &[SessionTab]) -> Result<()> {
     let mut paths = HashSet::with_capacity(tabs.len());
     for tab in tabs {
@@ -238,58 +349,108 @@ fn validate_tabs(tabs: &[SessionTab]) -> Result<()> {
 
 fn validate_layout(layout: &SessionLayout, tab_count: usize) -> Result<()> {
     if tab_count == 0 {
+        if !layout.entries.is_empty() || layout.active_tab.is_some() {
+            bail!("an empty session must have no entries or active tab");
+        }
+        return Ok(());
+    }
+    let active = layout
+        .active_tab
+        .ok_or_else(|| anyhow::anyhow!("a nonempty session must have an active tab"))?;
+    if active >= tab_count {
+        bail!("active tab index {active} is out of range");
+    }
+    let mut membership = vec![0usize; tab_count];
+    for entry in &layout.entries {
+        match entry {
+            SessionEntry::Single { tab_index } => {
+                increment_membership(&mut membership, *tab_index)?
+            }
+            SessionEntry::Split {
+                tab_indices,
+                ratio,
+                focused_tab,
+                ..
+            } => {
+                if tab_indices[0] == tab_indices[1] {
+                    bail!("a split entry must contain two different tabs");
+                }
+                if !tab_indices.contains(focused_tab) {
+                    bail!("focused split tab must be a member of its entry");
+                }
+                if tab_indices.contains(&active) && *focused_tab != active {
+                    bail!("the active split tab must match its focused member");
+                }
+                // 極端な比率は一方のPDF面を実質的に不可視にするため、復元時点で拒否する。
+                if !ratio.is_finite() || !(0.1..=0.9).contains(ratio) {
+                    bail!("split ratio must be finite and within 0.1..=0.9");
+                }
+                for tab_index in tab_indices {
+                    increment_membership(&mut membership, *tab_index)?;
+                }
+            }
+        }
+    }
+    if membership.iter().any(|count| *count != 1) {
+        bail!("each tab must belong to exactly one tab entry");
+    }
+    Ok(())
+}
+
+fn increment_membership(membership: &mut [usize], tab_index: usize) -> Result<()> {
+    let Some(count) = membership.get_mut(tab_index) else {
+        bail!("tab index {tab_index} is out of range");
+    };
+    *count += 1;
+    Ok(())
+}
+
+fn validate_schema2_layout(layout: &SessionLayoutSchema2, tab_count: usize) -> Result<()> {
+    if tab_count == 0 {
         if !layout.panes.is_empty() || layout.focused_pane.is_some() || layout.split.is_some() {
-            bail!("an empty session must have no panes, focus, or split");
+            bail!("an empty schema 2 session must have no panes, focus, or split");
         }
         return Ok(());
     }
     if !(1..=2).contains(&layout.panes.len()) {
-        bail!("a nonempty session must contain one or two panes");
+        bail!("a schema 2 session must contain one or two panes");
     }
     let focus = layout
         .focused_pane
-        .ok_or_else(|| anyhow::anyhow!("a nonempty session must focus a pane"))?;
+        .ok_or_else(|| anyhow::anyhow!("a schema 2 session must focus a pane"))?;
     if focus >= layout.panes.len() {
-        bail!("focused pane index {focus} is out of range");
+        bail!("schema 2 focused pane is out of range");
     }
-    if layout.panes.len() == 1 {
-        if layout.split.is_some() {
-            bail!("a single-pane session cannot contain a split");
-        }
-    } else if !matches!(
-        layout.split,
-        Some(SessionSplit {
-            direction: SplitDirection::Horizontal,
-            ..
-        })
-    ) {
-        bail!("a two-pane session requires a horizontal split");
+    if layout.panes.len() == 1 && layout.split.is_some() {
+        bail!("a single schema 2 pane cannot contain a split");
     }
-    if let Some(split) = &layout.split {
-        // 極端な比率は一方のペインを実質的に不可視にするため、復元時点で拒否する。
-        if !split.ratio.is_finite() || !(0.1..=0.9).contains(&split.ratio) {
-            bail!("split ratio must be finite and within 0.1..=0.9");
-        }
+    if layout.panes.len() == 2
+        && !matches!(
+            layout.split,
+            Some(SessionSplitSchema2 {
+                direction: SplitDirectionSchema2::Horizontal,
+                ..
+            })
+        )
+    {
+        bail!("two schema 2 panes require a horizontal split");
     }
-
-    // registryのタブ順を保ったまま復元するため、各グローバル番号は必ず一つのペインだけに属させる。
+    if let Some(split) = &layout.split
+        && (!split.ratio.is_finite() || !(0.1..=0.9).contains(&split.ratio))
+    {
+        bail!("schema 2 split ratio must be finite and within 0.1..=0.9");
+    }
     let mut membership = vec![0usize; tab_count];
-    for (pane_index, pane) in layout.panes.iter().enumerate() {
-        if pane.tab_indices.is_empty() {
-            bail!("pane {pane_index} cannot be empty");
+    for pane in &layout.panes {
+        if pane.tab_indices.is_empty() || !pane.tab_indices.contains(&pane.selected_tab) {
+            bail!("schema 2 panes must be nonempty and contain their selection");
         }
-        if !pane.tab_indices.contains(&pane.selected_tab) {
-            bail!("selected tab is not a member of pane {pane_index}");
-        }
-        for &tab_index in &pane.tab_indices {
-            if tab_index >= tab_count {
-                bail!("tab index {tab_index} is out of range");
-            }
-            membership[tab_index] += 1;
+        for tab_index in &pane.tab_indices {
+            increment_membership(&mut membership, *tab_index)?;
         }
     }
     if membership.iter().any(|count| *count != 1) {
-        bail!("each tab must belong to exactly one pane");
+        bail!("each schema 2 tab must belong to exactly one pane");
     }
     Ok(())
 }
@@ -371,49 +532,47 @@ mod tests {
         SessionState {
             tabs: vec![tab(directory.join("paper.pdf"))],
             layout: SessionLayout {
-                panes: vec![SessionPane {
-                    tab_indices: vec![0],
-                    selected_tab: 0,
-                }],
-                focused_pane: Some(0),
-                split: None,
+                entries: vec![SessionEntry::Single { tab_index: 0 }],
+                active_tab: Some(0),
             },
             ..SessionState::default()
         }
     }
 
     #[test]
-    fn default_and_empty_layout_are_schema_two() {
+    fn default_and_empty_layout_are_schema_three() {
         let state = SessionState::default();
-        assert_eq!(state.schema_version, 2);
+        assert_eq!(state.schema_version, 3);
         assert!(state.validate().is_ok());
-        assert!(state.layout.panes.is_empty());
+        assert!(state.layout.entries.is_empty());
     }
 
     #[test]
-    fn one_and_two_pane_layouts_round_trip() {
+    fn multiple_horizontal_and_vertical_split_entries_round_trip() {
         let directory = tempfile::tempdir().unwrap();
-        let mut state = one_tab_state(directory.path());
-        let json = serde_json::to_value(&state).unwrap();
-        assert_eq!(SessionState::decode(json).unwrap(), state);
-
-        state.tabs.push(tab(directory.path().join("second.pdf")));
-        state.layout = SessionLayout {
-            panes: vec![
-                SessionPane {
-                    tab_indices: vec![0],
-                    selected_tab: 0,
-                },
-                SessionPane {
-                    tab_indices: vec![1],
-                    selected_tab: 1,
-                },
-            ],
-            focused_pane: Some(1),
-            split: Some(SessionSplit {
-                direction: SplitDirection::Horizontal,
-                ratio: 0.5,
-            }),
+        let state = SessionState {
+            tabs: (0..5)
+                .map(|index| tab(directory.path().join(format!("{index}.pdf"))))
+                .collect(),
+            layout: SessionLayout {
+                entries: vec![
+                    SessionEntry::Split {
+                        tab_indices: [0, 1],
+                        direction: SplitDirection::Horizontal,
+                        ratio: 0.4,
+                        focused_tab: 1,
+                    },
+                    SessionEntry::Single { tab_index: 2 },
+                    SessionEntry::Split {
+                        tab_indices: [3, 4],
+                        direction: SplitDirection::Vertical,
+                        ratio: 0.6,
+                        focused_tab: 4,
+                    },
+                ],
+                active_tab: Some(4),
+            },
+            ..SessionState::default()
         };
         assert_eq!(
             SessionState::decode(serde_json::to_value(&state).unwrap()).unwrap(),
@@ -422,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_one_migrates_to_single_pane_and_defaults_colors() {
+    fn schema_one_migrates_to_single_entries_and_defaults_colors() {
         let directory = tempfile::tempdir().unwrap();
         let json = serde_json::json!({
             "schema_version": 1,
@@ -433,28 +592,86 @@ mod tests {
             "tabs": [serde_json::to_value(tab(directory.path().join("paper.pdf"))).unwrap()]
         });
         let state = SessionState::decode(json).unwrap();
-        assert_eq!(state.schema_version, 2);
-        assert_eq!(state.layout.panes[0].tab_indices, vec![0]);
-        assert_eq!(state.layout.panes[0].selected_tab, 0);
+        assert_eq!(state.schema_version, 3);
+        assert_eq!(
+            state.layout.entries,
+            vec![SessionEntry::Single { tab_index: 0 }]
+        );
+        assert_eq!(state.layout.active_tab, Some(0));
         assert!(state.recent_annotation_colors.is_empty());
     }
 
     #[test]
-    fn malformed_layout_membership_and_split_values_are_rejected() {
+    fn schema_two_migrates_visible_pair_and_preserves_old_bar_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let tabs = (0..4)
+            .map(|index| {
+                serde_json::to_value(tab(directory.path().join(format!("{index}.pdf")))).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let json = serde_json::json!({
+            "schema_version": 2,
+            "restore_enabled": true,
+            "sidebar_open": false,
+            "sidebar_tab": "Outline",
+            "tabs": tabs,
+            "layout": {
+                "panes": [
+                    {"tab_indices": [0, 2], "selected_tab": 2},
+                    {"tab_indices": [1, 3], "selected_tab": 1}
+                ],
+                "focused_pane": 1,
+                "split": {"direction": "Horizontal", "ratio": 0.35}
+            }
+        });
+        let state = SessionState::decode(json).unwrap();
+        assert_eq!(state.schema_version, 3);
+        assert_eq!(
+            state.layout.entries,
+            vec![
+                SessionEntry::Single { tab_index: 0 },
+                SessionEntry::Split {
+                    tab_indices: [2, 1],
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.35,
+                    focused_tab: 1,
+                },
+                SessionEntry::Single { tab_index: 3 },
+            ]
+        );
+        assert_eq!(state.layout.active_tab, Some(1));
+    }
+
+    #[test]
+    fn malformed_membership_focus_and_split_values_are_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = one_tab_state(directory.path());
-        state.layout.panes[0].tab_indices.clear();
+        state.layout.entries.clear();
         assert!(state.validate().is_err());
-        state.layout.panes[0].tab_indices = vec![1];
+        state.layout.entries = vec![SessionEntry::Single { tab_index: 1 }];
         assert!(state.validate().is_err());
-        state.layout.panes[0].tab_indices = vec![0];
-        state.layout.panes[0].selected_tab = 1;
+        state.layout.entries = vec![SessionEntry::Split {
+            tab_indices: [0, 0],
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            focused_tab: 0,
+        }];
         assert!(state.validate().is_err());
-        state.layout.panes[0].selected_tab = 0;
-        state.layout.split = Some(SessionSplit {
-            direction: SplitDirection::Horizontal,
+        state.tabs.push(tab(directory.path().join("second.pdf")));
+        state.layout.entries = vec![SessionEntry::Split {
+            tab_indices: [0, 1],
+            direction: SplitDirection::Vertical,
             ratio: 0.09,
-        });
+            focused_tab: 0,
+        }];
+        assert!(state.validate().is_err());
+        state.layout.entries = vec![SessionEntry::Split {
+            tab_indices: [0, 1],
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            focused_tab: 0,
+        }];
+        state.layout.active_tab = Some(1);
         assert!(state.validate().is_err());
     }
 

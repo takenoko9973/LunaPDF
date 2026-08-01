@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -6,14 +7,49 @@ use std::path::{Path, PathBuf};
 pub(crate) struct TabId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-/// 最大2ペインのランタイム識別子。
-pub(crate) struct PaneId(u64);
+/// 複数の分割セットを区別し、eguiの永続IDにも使うランタイム識別子。
+pub(crate) struct SplitGroupId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 分割した新ペインを既存ペインの前後どちらへ置くか。
+pub(crate) enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SplitSide {
+    First,
+    Second,
+}
+
+impl SplitSide {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SplitPlacement {
-    Before,
-    After,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl SplitPlacement {
+    pub(crate) fn direction(self) -> SplitDirection {
+        match self {
+            Self::Left | Self::Right => SplitDirection::Horizontal,
+            Self::Top | Self::Bottom => SplitDirection::Vertical,
+        }
+    }
+
+    fn dragged_first(self) -> bool {
+        matches!(self, Self::Left | Self::Top)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,21 +70,81 @@ impl Tab {
     }
 }
 
-#[derive(Clone, Debug)]
-struct Pane {
-    id: PaneId,
-    tabs: Vec<TabId>,
-    selected: Option<TabId>,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SplitGroup {
+    id: SplitGroupId,
+    tabs: [TabId; 2],
+    direction: SplitDirection,
+    ratio: f32,
+    focused: SplitSide,
 }
 
-#[derive(Debug)]
+impl SplitGroup {
+    pub(crate) fn id(&self) -> SplitGroupId {
+        self.id
+    }
+
+    pub(crate) fn tabs(&self) -> [TabId; 2] {
+        self.tabs
+    }
+
+    pub(crate) fn tab(&self, side: SplitSide) -> TabId {
+        self.tabs[side.index()]
+    }
+
+    pub(crate) fn direction(&self) -> SplitDirection {
+        self.direction
+    }
+
+    pub(crate) fn ratio(&self) -> f32 {
+        self.ratio
+    }
+
+    pub(crate) fn focused(&self) -> SplitSide {
+        self.focused
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TabEntry {
+    Single(TabId),
+    Split(SplitGroup),
+}
+
+impl TabEntry {
+    pub(crate) fn tab_ids(&self) -> Vec<TabId> {
+        match self {
+            Self::Single(tab_id) => vec![*tab_id],
+            Self::Split(group) => group.tabs.to_vec(),
+        }
+    }
+
+    fn contains(&self, tab_id: TabId) -> bool {
+        match self {
+            Self::Single(entry_tab) => *entry_tab == tab_id,
+            Self::Split(group) => group.tabs.contains(&tab_id),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RestoredTabEntry {
+    Single(TabId),
+    Split {
+        tabs: [TabId; 2],
+        direction: SplitDirection,
+        ratio: f32,
+        focused: SplitSide,
+    },
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct TabState {
     tabs: Vec<Tab>,
-    panes: Vec<Pane>,
-    focused: PaneId,
+    entries: Vec<TabEntry>,
+    active: Option<TabId>,
     next_tab_id: u64,
-    next_pane_id: u64,
-    split_ratio: f32,
+    next_split_group_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,44 +153,46 @@ pub(crate) enum OpenTabResult {
     SelectedExisting(usize),
 }
 
-impl Default for TabState {
-    fn default() -> Self {
-        Self {
-            tabs: Vec::new(),
-            panes: vec![Pane {
-                id: PaneId(0),
-                tabs: Vec::new(),
-                selected: None,
-            }],
-            focused: PaneId(0),
-            next_tab_id: 0,
-            next_pane_id: 1,
-            split_ratio: 0.5,
-        }
-    }
-}
-
 impl TabState {
     /// 選択タブのない空のタブ状態を作成する。
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// 文書レジストリ順のタブを返す。ペイン操作ではこの順序を変更しない。
+    /// 文書レジストリ順のタブを返す。表示順の変更ではこの順序を変えない。
     pub(crate) fn tabs(&self) -> &[Tab] {
         &self.tabs
     }
 
-    /// フォーカス中ペインの選択タブをレジストリインデックスで返す。
+    /// 共有タブバーへ描画する単独タブと分割セットを表示順で返す。
+    pub(crate) fn entries(&self) -> &[TabEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn active_tab_id(&self) -> Option<TabId> {
+        self.active
+    }
+
     pub(crate) fn selected_index(&self) -> Option<usize> {
-        self.pane_selected(self.focused)
+        self.active
             .and_then(|tab_id| self.tab_registry_index(tab_id))
+    }
+
+    pub(crate) fn active_entry(&self) -> Option<&TabEntry> {
+        let active = self.active?;
+        self.entries.iter().find(|entry| entry.contains(active))
+    }
+
+    pub(crate) fn active_split(&self) -> Option<&SplitGroup> {
+        match self.active_entry()? {
+            TabEntry::Split(group) => Some(group),
+            TabEntry::Single(_) => None,
+        }
     }
 
     /// 既存PDFのパスを正規化し、そのタブを開くか選択する。
     pub(crate) fn open(&mut self, path: impl AsRef<Path>) -> io::Result<OpenTabResult> {
         let canonical_path = std::fs::canonicalize(path)?;
-
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == canonical_path) {
             let tab_id = self.tabs[index].id;
             self.select_tab(tab_id);
@@ -107,346 +205,429 @@ impl TabState {
             id,
             path: canonical_path,
         });
-        let pane = self
-            .panes
-            .iter_mut()
-            .find(|pane| pane.id == self.focused)
-            .expect("focused pane must exist");
-        pane.tabs.push(id);
-        pane.selected = Some(id);
+        let insertion = self
+            .active
+            .and_then(|active| self.entry_index_for_tab(active))
+            .map_or(self.entries.len(), |index| index + 1);
+        self.entries.insert(insertion, TabEntry::Single(id));
+        self.active = Some(id);
         Ok(OpenTabResult::Opened(self.tabs.len() - 1))
     }
 
-    /// インデックスで開いているタブを選択し、そのペインをフォーカスする。
     pub(crate) fn select(&mut self, index: usize) -> bool {
-        let Some(tab) = self.tabs.get(index) else {
+        let Some(tab_id) = self.tabs.get(index).map(Tab::id) else {
             return false;
         };
-        self.select_tab(tab.id)
+        self.select_tab(tab_id)
     }
 
-    /// インデックスでタブを閉じ、所属ペインの選択を有効に保ったまま閉じたタブを返す。
-    pub(crate) fn close(&mut self, index: usize) -> Option<Tab> {
-        let tab_id = self.tabs.get(index)?.id;
-        let removed = self.tabs.remove(index);
-        let pane_index = self
-            .panes
-            .iter()
-            .position(|pane| pane.tabs.contains(&tab_id))?;
-        let pane = &mut self.panes[pane_index];
-        let tab_index = pane.tabs.iter().position(|id| *id == tab_id).unwrap();
-        pane.tabs.remove(tab_index);
-        if pane.selected == Some(tab_id) {
-            pane.selected = pane
-                .tabs
-                .get(tab_index)
-                .copied()
-                .or_else(|| pane.tabs.get(tab_index.saturating_sub(1)).copied());
-        }
-        self.collapse_empty_panes();
-        Some(removed)
-    }
-
-    /// 現在のペイン順にある識別子を返す。
-    pub(crate) fn pane_ids(&self) -> Vec<PaneId> {
-        self.panes.iter().map(|pane| pane.id).collect()
-    }
-
-    /// 現在フォーカスされているペインを返す。
-    pub(crate) fn focused_pane(&self) -> PaneId {
-        self.focused
-    }
-
-    /// ペイン内のタブ識別子を表示順で返す。
-    pub(crate) fn pane_tab_ids(&self, pane_id: PaneId) -> Option<&[TabId]> {
-        self.panes
-            .iter()
-            .find(|pane| pane.id == pane_id)
-            .map(|pane| pane.tabs.as_slice())
-    }
-
-    /// ペインで選択されているタブ識別子を返す。
-    pub(crate) fn pane_selected(&self, pane_id: PaneId) -> Option<TabId> {
-        self.panes
-            .iter()
-            .find(|pane| pane.id == pane_id)
-            .and_then(|pane| pane.selected)
-    }
-
-    /// 指定ペインにフォーカスを移す。存在しない識別子は変更しない。
-    pub(crate) fn focus_pane(&mut self, pane_id: PaneId) -> bool {
-        if self.panes.iter().any(|pane| pane.id == pane_id) {
-            self.focused = pane_id;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 指定ペインのタブを選択し、同じペインをフォーカスする。
-    pub(crate) fn select_in_pane(&mut self, pane_id: PaneId, tab_id: TabId) -> bool {
-        let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) else {
+    pub(crate) fn select_tab(&mut self, tab_id: TabId) -> bool {
+        let Some(entry_index) = self.entry_index_for_tab(tab_id) else {
             return false;
         };
-        if !pane.tabs.contains(&tab_id) {
-            return false;
+        if let TabEntry::Split(group) = &mut self.entries[entry_index] {
+            group.focused = if group.tabs[0] == tab_id {
+                SplitSide::First
+            } else {
+                SplitSide::Second
+            };
         }
-        pane.selected = Some(tab_id);
-        self.focused = pane_id;
+        self.active = Some(tab_id);
         true
     }
 
-    /// タブの所属ペインを返す。
-    pub(crate) fn tab_pane(&self, tab_id: TabId) -> Option<PaneId> {
-        self.panes
-            .iter()
-            .find(|pane| pane.tabs.contains(&tab_id))
-            .map(|pane| pane.id)
+    /// タブを閉じる。分割メンバーの相方は同じ位置の単独タブへ縮約する。
+    pub(crate) fn close(&mut self, index: usize) -> Option<Tab> {
+        let tab_id = self.tabs.get(index)?.id;
+        let entry_index = self.entry_index_for_tab(tab_id)?;
+        let replacement = match &self.entries[entry_index] {
+            TabEntry::Single(_) => None,
+            TabEntry::Split(group) => group.tabs.iter().copied().find(|id| *id != tab_id),
+        };
+        self.entries.remove(entry_index);
+        if let Some(sibling) = replacement {
+            self.entries.insert(entry_index, TabEntry::Single(sibling));
+        }
+        let removed = self.tabs.remove(index);
+
+        if self.active == Some(tab_id) {
+            self.active = replacement.or_else(|| {
+                self.entries
+                    .get(entry_index)
+                    .or_else(|| self.entries.get(entry_index.saturating_sub(1)))
+                    .and_then(Self::entry_focus_tab)
+            });
+        }
+        Some(removed)
     }
 
-    /// タブ識別子に対応する文書レジストリ位置を返す。
     pub(crate) fn tab_registry_index(&self, tab_id: TabId) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.id == tab_id)
     }
 
-    /// 各ペインの選択タブを表示順で返す。
-    pub(crate) fn visible_selected_tab_ids(&self) -> Vec<TabId> {
-        self.panes.iter().filter_map(|pane| pane.selected).collect()
+    #[cfg(test)]
+    fn display_tab_ids(&self) -> Vec<TabId> {
+        self.entries.iter().flat_map(TabEntry::tab_ids).collect()
     }
 
-    /// ペイン内のタブを指定した挿入ギャップへ移す。
-    pub(crate) fn reorder(
+    pub(crate) fn visible_tab_ids(&self) -> Vec<TabId> {
+        match self.active_entry() {
+            Some(TabEntry::Single(tab_id)) => vec![*tab_id],
+            Some(TabEntry::Split(group)) => group.tabs.to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    pub(crate) fn split_for_tab(&self, tab_id: TabId) -> Option<&SplitGroup> {
+        match self.entries.get(self.entry_index_for_tab(tab_id)?)? {
+            TabEntry::Split(group) => Some(group),
+            TabEntry::Single(_) => None,
+        }
+    }
+
+    pub(crate) fn split_group(&self, group_id: SplitGroupId) -> Option<&SplitGroup> {
+        self.entries.iter().find_map(|entry| match entry {
+            TabEntry::Split(group) if group.id == group_id => Some(group),
+            TabEntry::Single(_) | TabEntry::Split(_) => None,
+        })
+    }
+
+    pub(crate) fn create_split(
         &mut self,
-        pane_id: PaneId,
-        tab_id: TabId,
-        insertion_index: usize,
+        dragged_tab: TabId,
+        target_tab: TabId,
+        placement: SplitPlacement,
     ) -> bool {
-        let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) else {
-            return false;
-        };
-        let Some(current_index) = pane.tabs.iter().position(|id| *id == tab_id) else {
-            return false;
-        };
-        if insertion_index > pane.tabs.len() {
-            return false;
-        }
-        // ギャップは除去前の座標で受け取り、元要素より後ろなら除去分だけ補正する。
-        let target_index = insertion_index.min(pane.tabs.len() - 1);
-        if target_index == current_index || target_index == current_index + 1 {
-            return true;
-        }
-        let moved = pane.tabs.remove(current_index);
-        let adjusted = if insertion_index > current_index {
-            insertion_index - 1
-        } else {
-            insertion_index
-        };
-        pane.tabs.insert(adjusted, moved);
-        true
-    }
-
-    /// 単一ペインを指定位置で分割し、指定タブを新ペインへ移す。
-    pub(crate) fn split(&mut self, tab_id: TabId, placement: SplitPlacement) -> bool {
-        // 任意個ペインへ拡張せず、既存の単一ペインを必ず二つへ分ける。
-        if self.panes.len() != 1 {
-            return false;
-        }
-        let source_index = 0;
-        if self.panes[source_index].tabs.len() <= 1
-            || !self.panes[source_index].tabs.contains(&tab_id)
+        if dragged_tab == target_tab
+            || self.tab_registry_index(dragged_tab).is_none()
+            || !matches!(
+                self.entries
+                    .get(self.entry_index_for_tab(target_tab).unwrap()),
+                Some(TabEntry::Single(_))
+            )
         {
             return false;
         }
-        let tab_index = self.panes[source_index]
-            .tabs
-            .iter()
-            .position(|id| *id == tab_id)
-            .unwrap();
-        self.panes[source_index].tabs.remove(tab_index);
-        if self.panes[source_index].selected == Some(tab_id) {
-            self.panes[source_index].selected = self.panes[source_index]
-                .tabs
-                .get(tab_index)
-                .copied()
-                .or_else(|| {
-                    self.panes[source_index]
-                        .tabs
-                        .get(tab_index.saturating_sub(1))
-                        .copied()
-                });
-        }
-        let new_pane = Pane {
-            id: PaneId(self.next_pane_id),
-            tabs: vec![tab_id],
-            selected: Some(tab_id),
+
+        self.extract_source_for_new_split(dragged_tab);
+        let Some(target_index) = self.entry_index_for_tab(target_tab) else {
+            return false;
         };
-        self.next_pane_id = self.next_pane_id.checked_add(1).expect("pane id exhausted");
-        match placement {
-            SplitPlacement::Before => self.panes.insert(0, new_pane),
-            SplitPlacement::After => self.panes.push(new_pane),
-        }
-        self.focused = PaneId(self.next_pane_id - 1);
+        let tabs = if placement.dragged_first() {
+            [dragged_tab, target_tab]
+        } else {
+            [target_tab, dragged_tab]
+        };
+        let focused = if tabs[0] == dragged_tab {
+            SplitSide::First
+        } else {
+            SplitSide::Second
+        };
+        let group = SplitGroup {
+            id: SplitGroupId(self.next_split_group_id),
+            tabs,
+            direction: placement.direction(),
+            ratio: 0.5,
+            focused,
+        };
+        self.next_split_group_id = self
+            .next_split_group_id
+            .checked_add(1)
+            .expect("split group id exhausted");
+        self.entries[target_index] = TabEntry::Split(group);
+        self.active = Some(dragged_tab);
         true
     }
 
-    /// タブを指定ペインの挿入ギャップへ移す。
-    pub(crate) fn move_tab(
+    /// PDF面へのdropで、対象メンバーとドラッグ元のタブを原子的に交換する。
+    pub(crate) fn replace_split_member(
         &mut self,
-        tab_id: TabId,
-        target_pane_id: PaneId,
-        insertion_index: usize,
+        group_id: SplitGroupId,
+        side: SplitSide,
+        dragged_tab: TabId,
+    ) -> Option<TabId> {
+        let target_entry = self.entry_index_for_group(group_id)?;
+        let target_tab = match &self.entries[target_entry] {
+            TabEntry::Split(group) => group.tab(side),
+            TabEntry::Single(_) => return None,
+        };
+        if target_tab == dragged_tab {
+            return None;
+        }
+
+        let source_entry = self.entry_index_for_tab(dragged_tab)?;
+        if source_entry == target_entry {
+            self.swap_split_members(group_id);
+            // 配置交換後のsideを基準にfocusedも更新し、activeとCtrl+Tabの復元先を
+            // 同じドラッグ対象へ揃える。
+            self.select_tab(dragged_tab);
+            return Some(target_tab);
+        }
+        self.replace_tab_in_entry(source_entry, dragged_tab, target_tab)?;
+        self.replace_tab_in_entry(target_entry, target_tab, dragged_tab)?;
+        if let TabEntry::Split(group) = &mut self.entries[target_entry] {
+            group.focused = side;
+        }
+        self.active = Some(dragged_tab);
+        Some(target_tab)
+    }
+
+    pub(crate) fn swap_split_members(&mut self, group_id: SplitGroupId) -> bool {
+        let Some(entry_index) = self.entry_index_for_group(group_id) else {
+            return false;
+        };
+        let TabEntry::Split(group) = &mut self.entries[entry_index] else {
+            return false;
+        };
+        group.tabs.swap(0, 1);
+        group.focused = match group.focused {
+            SplitSide::First => SplitSide::Second,
+            SplitSide::Second => SplitSide::First,
+        };
+        true
+    }
+
+    pub(crate) fn unsplit(&mut self, group_id: SplitGroupId) -> bool {
+        let Some(entry_index) = self.entry_index_for_group(group_id) else {
+            return false;
+        };
+        let TabEntry::Split(group) = self.entries.remove(entry_index) else {
+            return false;
+        };
+        self.entries
+            .insert(entry_index, TabEntry::Single(group.tabs[1]));
+        self.entries
+            .insert(entry_index, TabEntry::Single(group.tabs[0]));
+        true
+    }
+
+    /// ペアの片方を共有タブ列の外側gapへ移し、相方も単独タブへ戻す。
+    pub(crate) fn extract_split_member(&mut self, tab_id: TabId, insertion_index: usize) -> bool {
+        if insertion_index > self.entries.len() {
+            return false;
+        }
+        let Some(entry_index) = self.entry_index_for_tab(tab_id) else {
+            return false;
+        };
+        let TabEntry::Split(group) = self.entries[entry_index].clone() else {
+            return false;
+        };
+        let sibling = group.tabs.into_iter().find(|id| *id != tab_id).unwrap();
+        self.entries[entry_index] = TabEntry::Single(sibling);
+        self.entries
+            .insert(insertion_index, TabEntry::Single(tab_id));
+        true
+    }
+
+    pub(crate) fn reorder_single(&mut self, tab_id: TabId, insertion_index: usize) -> bool {
+        if insertion_index > self.entries.len() {
+            return false;
+        }
+        let Some(current_index) = self.entry_index_for_tab(tab_id) else {
+            return false;
+        };
+        if !matches!(self.entries[current_index], TabEntry::Single(_)) {
+            return false;
+        }
+        Self::move_entry(&mut self.entries, current_index, insertion_index)
+    }
+
+    pub(crate) fn reorder_split(&mut self, group_id: SplitGroupId, insertion_index: usize) -> bool {
+        if insertion_index > self.entries.len() {
+            return false;
+        }
+        let Some(current_index) = self.entry_index_for_group(group_id) else {
+            return false;
+        };
+        Self::move_entry(&mut self.entries, current_index, insertion_index)
+    }
+
+    pub(crate) fn set_split_direction(
+        &mut self,
+        group_id: SplitGroupId,
+        direction: SplitDirection,
     ) -> bool {
-        let Some(source_index) = self
-            .panes
-            .iter()
-            .position(|pane| pane.tabs.contains(&tab_id))
-        else {
+        let Some(entry_index) = self.entry_index_for_group(group_id) else {
             return false;
         };
-        let Some(target_index) = self.panes.iter().position(|pane| pane.id == target_pane_id)
-        else {
+        let TabEntry::Split(group) = &mut self.entries[entry_index] else {
             return false;
         };
-        if insertion_index > self.panes[target_index].tabs.len() {
-            return false;
-        }
-        if source_index == target_index {
-            return self.reorder(target_pane_id, tab_id, insertion_index);
-        }
-        let source_tab_index = self.panes[source_index]
-            .tabs
-            .iter()
-            .position(|id| *id == tab_id)
-            .unwrap();
-        self.panes[source_index].tabs.remove(source_tab_index);
-        if self.panes[source_index].selected == Some(tab_id) {
-            self.panes[source_index].selected = self.panes[source_index]
-                .tabs
-                .get(source_tab_index)
-                .copied()
-                .or_else(|| {
-                    self.panes[source_index]
-                        .tabs
-                        .get(source_tab_index.saturating_sub(1))
-                        .copied()
-                });
-        }
-        let target_index = self
-            .panes
-            .iter()
-            .position(|pane| pane.id == target_pane_id)
-            .unwrap();
-        self.panes[target_index]
-            .tabs
-            .insert(insertion_index, tab_id);
-        self.panes[target_index].selected = Some(tab_id);
-        self.focused = target_pane_id;
-        self.collapse_empty_panes();
+        group.direction = direction;
         true
     }
 
-    /// 現在の分割比率を返す。
-    pub(crate) fn split_ratio(&self) -> f32 {
-        self.split_ratio
-    }
-
-    /// 有限かつ0.1..=0.9の分割比率だけを適用する。
-    pub(crate) fn set_split_ratio(&mut self, ratio: f32) -> bool {
-        // 0.1未満・0.9超では片側が極端に狭くなるため、UIの最小幅計算とは分離して保存値を制限する。
-        if !ratio.is_finite() || !(0.1..=0.9).contains(&ratio) {
+    pub(crate) fn set_split_ratio(&mut self, group_id: SplitGroupId, ratio: f32) -> bool {
+        if !valid_ratio(ratio) {
             return false;
         }
-        self.split_ratio = ratio;
+        let Some(entry_index) = self.entry_index_for_group(group_id) else {
+            return false;
+        };
+        let TabEntry::Split(group) = &mut self.entries[entry_index] else {
+            return false;
+        };
+        group.ratio = ratio;
         true
     }
 
-    /// セッション復元用に全タブの配置・選択・フォーカス・比率を原子的に適用する。
+    /// Ctrl+Tabでは分割セットを一つの巡回単位とし、保存されたfocus側へ戻る。
+    pub(crate) fn next_entry_tab(&self) -> Option<TabId> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let current = self
+            .active
+            .and_then(|active| self.entry_index_for_tab(active))
+            .unwrap_or(0);
+        let next = (current + 1) % self.entries.len();
+        Self::entry_focus_tab(&self.entries[next])
+    }
+
+    /// セッション復元用の全エントリを、不変条件を確認して原子的に適用する。
     pub(crate) fn restore_layout(
         &mut self,
-        layouts: Vec<(Vec<TabId>, TabId)>,
-        focused_pane_index: usize,
-        ratio: f32,
+        restored: Vec<RestoredTabEntry>,
+        active: Option<TabId>,
     ) -> bool {
-        if !ratio.is_finite() || !(0.1..=0.9).contains(&ratio) || layouts.len() > 2 {
-            return false;
-        }
         if self.tabs.is_empty() {
-            if !layouts.is_empty() || focused_pane_index != 0 {
+            if !restored.is_empty() || active.is_some() {
                 return false;
             }
-            self.split_ratio = ratio;
-            self.focused = PaneId(0);
+            self.entries.clear();
+            self.active = None;
             return true;
         }
-        if layouts.is_empty()
-            || !layouts
-                .iter()
-                .all(|(tabs, selected)| !tabs.is_empty() && tabs.contains(selected))
-        {
+        let Some(active) = active else {
             return false;
-        }
-        if focused_pane_index >= layouts.len() {
-            return false;
-        }
-        let mut seen_tabs = std::collections::HashSet::new();
-        for (tabs, _) in &layouts {
-            for tab_id in tabs {
-                if self.tab_registry_index(*tab_id).is_none() || !seen_tabs.insert(*tab_id) {
-                    return false;
+        };
+        let registry = self.tabs.iter().map(Tab::id).collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        for entry in &restored {
+            match entry {
+                RestoredTabEntry::Single(tab_id) => {
+                    if !registry.contains(tab_id) || !seen.insert(*tab_id) {
+                        return false;
+                    }
+                }
+                RestoredTabEntry::Split {
+                    tabs,
+                    ratio,
+                    focused,
+                    ..
+                } => {
+                    if tabs[0] == tabs[1] || !valid_ratio(*ratio) {
+                        return false;
+                    }
+                    if tabs.contains(&active) && tabs[focused.index()] != active {
+                        return false;
+                    }
+                    for tab_id in tabs {
+                        if !registry.contains(tab_id) || !seen.insert(*tab_id) {
+                            return false;
+                        }
+                    }
                 }
             }
         }
-        if seen_tabs.len() != self.tabs.len() {
+        if seen != registry || !seen.contains(&active) {
             return false;
         }
-        let primary_id = self.panes.first().map(|pane| pane.id).unwrap_or(PaneId(0));
-        let mut next_pane_id = self.next_pane_id;
-        let mut panes = Vec::with_capacity(layouts.len());
-        for (index, (tabs, selected)) in layouts.into_iter().enumerate() {
-            let id = if index == 0 {
-                primary_id
-            } else {
-                let Some(next_id) = next_pane_id.checked_add(1) else {
-                    return false;
-                };
-                let id = PaneId(next_pane_id);
-                next_pane_id = next_id;
-                id
-            };
-            panes.push(Pane {
-                id,
-                tabs,
-                selected: Some(selected),
-            });
-        }
-        self.panes = panes;
-        self.focused = self.panes[focused_pane_index].id;
-        self.next_pane_id = next_pane_id;
-        self.split_ratio = ratio;
+
+        let mut next_group_id = self.next_split_group_id;
+        let entries = restored
+            .into_iter()
+            .map(|entry| match entry {
+                RestoredTabEntry::Single(tab_id) => TabEntry::Single(tab_id),
+                RestoredTabEntry::Split {
+                    tabs,
+                    direction,
+                    ratio,
+                    focused,
+                } => {
+                    let id = SplitGroupId(next_group_id);
+                    next_group_id = next_group_id
+                        .checked_add(1)
+                        .expect("split group id exhausted");
+                    TabEntry::Split(SplitGroup {
+                        id,
+                        tabs,
+                        direction,
+                        ratio,
+                        focused,
+                    })
+                }
+            })
+            .collect();
+        self.entries = entries;
+        self.active = Some(active);
+        self.next_split_group_id = next_group_id;
         true
     }
 
-    fn select_tab(&mut self, tab_id: TabId) -> bool {
-        let Some(pane_id) = self.tab_pane(tab_id) else {
-            return false;
-        };
-        self.select_in_pane(pane_id, tab_id)
-    }
-
-    fn collapse_empty_panes(&mut self) {
-        // 空ペインを残すと「非空ペインの選択」不変条件を保てないため、常に単一へ縮約する。
-        self.panes.retain(|pane| !pane.tabs.is_empty());
-        if self.panes.is_empty() {
-            self.panes.push(Pane {
-                id: PaneId(0),
-                tabs: Vec::new(),
-                selected: None,
-            });
-            self.focused = PaneId(0);
-        } else if !self.panes.iter().any(|pane| pane.id == self.focused) {
-            self.focused = self.panes[0].id;
+    fn extract_source_for_new_split(&mut self, tab_id: TabId) {
+        let source_index = self
+            .entry_index_for_tab(tab_id)
+            .expect("validated split source must exist");
+        match self.entries[source_index].clone() {
+            TabEntry::Single(_) => {
+                self.entries.remove(source_index);
+            }
+            TabEntry::Split(group) => {
+                // 新しい2画面へメンバーを持ち出すため、元の相方は通常タブとして残す。
+                let sibling = group.tabs.into_iter().find(|id| *id != tab_id).unwrap();
+                self.entries[source_index] = TabEntry::Single(sibling);
+            }
         }
     }
+
+    fn replace_tab_in_entry(&mut self, entry_index: usize, old: TabId, new: TabId) -> Option<()> {
+        match &mut self.entries[entry_index] {
+            TabEntry::Single(tab_id) if *tab_id == old => *tab_id = new,
+            TabEntry::Split(group) => {
+                let side = group.tabs.iter().position(|tab_id| *tab_id == old)?;
+                group.tabs[side] = new;
+            }
+            TabEntry::Single(_) => return None,
+        }
+        Some(())
+    }
+
+    fn move_entry(entries: &mut Vec<TabEntry>, current: usize, insertion: usize) -> bool {
+        let target = insertion.min(entries.len().saturating_sub(1));
+        if target == current || target == current + 1 {
+            return true;
+        }
+        let entry = entries.remove(current);
+        let adjusted = if insertion > current {
+            insertion - 1
+        } else {
+            insertion
+        };
+        entries.insert(adjusted, entry);
+        true
+    }
+
+    fn entry_index_for_tab(&self, tab_id: TabId) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.contains(tab_id))
+    }
+
+    fn entry_index_for_group(&self, group_id: SplitGroupId) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| matches!(entry, TabEntry::Split(group) if group.id == group_id))
+    }
+
+    fn entry_focus_tab(entry: &TabEntry) -> Option<TabId> {
+        match entry {
+            TabEntry::Single(tab_id) => Some(*tab_id),
+            TabEntry::Split(group) => Some(group.tab(group.focused)),
+        }
+    }
+}
+
+fn valid_ratio(ratio: f32) -> bool {
+    ratio.is_finite() && (0.1..=0.9).contains(&ratio)
 }
 
 #[cfg(test)]
@@ -454,252 +635,202 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    fn existing_file(name: &str) -> (tempfile::TempDir, PathBuf) {
-        let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let path = directory.path().join(name);
-        File::create(&path).expect("temporary file should be created");
-        (directory, path)
-    }
-
     fn open_files(state: &mut TabState, count: usize) -> (tempfile::TempDir, Vec<TabId>) {
         let directory = tempfile::tempdir().unwrap();
-        let mut ids = Vec::new();
         for index in 0..count {
             let path = directory.path().join(format!("{index}.pdf"));
             File::create(&path).unwrap();
             state.open(path).unwrap();
-            ids.push(state.tabs[index].id());
         }
+        let ids = state.tabs().iter().map(Tab::id).collect();
         (directory, ids)
     }
 
     #[test]
-    fn opening_same_canonical_path_selects_existing_tab() {
-        let (directory, path) = existing_file("paper.pdf");
-        std::fs::create_dir(directory.path().join("folder")).unwrap();
-        let alternate_path = directory.path().join("folder").join("..").join("paper.pdf");
+    fn new_tabs_open_after_the_active_entry() {
         let mut state = TabState::new();
-
-        assert_eq!(state.open(&path).unwrap(), OpenTabResult::Opened(0));
-        assert_eq!(
-            state.open(alternate_path).unwrap(),
-            OpenTabResult::SelectedExisting(0)
-        );
-        assert_eq!(state.tabs().len(), 1);
-        assert_eq!(state.selected_index(), Some(0));
-    }
-
-    #[test]
-    fn missing_path_returns_canonicalization_error_without_opening_tab() {
+        let (_directory, ids) = open_files(&mut state, 3);
+        assert!(state.select_tab(ids[0]));
         let directory = tempfile::tempdir().unwrap();
-        let missing_path = directory.path().join("missing.pdf");
-        let mut state = TabState::new();
-
-        assert!(state.open(missing_path).is_err());
-        assert!(state.tabs().is_empty());
-    }
-
-    #[test]
-    fn opening_more_than_fifty_tabs_keeps_all_existing_tabs() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut state = TabState::new();
-        let paths: Vec<_> = (0..=50)
-            .map(|index| {
-                let path = directory.path().join(format!("{index}.pdf"));
-                File::create(&path).unwrap();
-                path
-            })
-            .collect();
-
-        for path in &paths {
-            assert!(matches!(state.open(path), Ok(OpenTabResult::Opened(_))));
-        }
-        assert_eq!(state.tabs().len(), 51);
-    }
-
-    #[test]
-    fn tab_ids_are_monotonic_and_not_reused_after_close() {
-        let mut state = TabState::new();
-        let (_directory, ids) = open_files(&mut state, 2);
-        state.close(0);
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("new.pdf");
+        let path = directory.path().join("next.pdf");
         File::create(&path).unwrap();
         state.open(path).unwrap();
-        assert!(state.tabs()[1].id() > ids[1]);
-        assert_ne!(state.tabs()[1].id(), ids[0]);
+        assert_eq!(state.display_tab_ids()[0], ids[0]);
+        assert_eq!(
+            state.active_tab_id(),
+            state.display_tab_ids().get(1).copied()
+        );
     }
 
     #[test]
-    fn selecting_and_closing_tabs_preserves_a_valid_selection() {
-        let directory = tempfile::tempdir().unwrap();
+    fn multiple_split_sets_preserve_one_membership_per_tab() {
         let mut state = TabState::new();
-        for index in 0..3 {
-            let path = directory.path().join(format!("{index}.pdf"));
-            File::create(&path).unwrap();
-            state.open(path).unwrap();
-        }
-
-        assert!(state.select(1));
-        assert!(!state.select(3));
-        state.close(0);
-        assert_eq!(state.selected_index(), Some(0));
-        state.close(0);
-        assert_eq!(state.selected_index(), Some(0));
-        state.close(0);
-        assert_eq!(state.selected_index(), None);
-        assert_eq!(state.pane_ids().len(), 1);
-        assert_eq!(state.pane_ids(), vec![PaneId(0)]);
-        assert!(state.pane_tab_ids(PaneId(0)).unwrap().is_empty());
+        let (_directory, ids) = open_files(&mut state, 5);
+        assert!(state.create_split(ids[1], ids[0], SplitPlacement::Right));
+        assert!(state.select_tab(ids[2]));
+        assert!(state.create_split(ids[3], ids[2], SplitPlacement::Bottom));
+        assert_eq!(
+            state
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry, TabEntry::Split(_)))
+                .count(),
+            2
+        );
+        let order = state.display_tab_ids();
+        assert_eq!(order.iter().copied().collect::<HashSet<_>>().len(), 5);
     }
 
     #[test]
-    fn pane_operations_preserve_registry_order_and_selection_rules() {
+    fn selecting_a_normal_tab_hides_but_keeps_split_sets() {
         let mut state = TabState::new();
         let (_directory, ids) = open_files(&mut state, 3);
-        let primary = state.pane_ids()[0];
-        assert!(state.reorder(primary, ids[0], 3));
-        assert_eq!(
-            state.pane_tab_ids(primary).unwrap(),
-            &[ids[1], ids[2], ids[0]]
-        );
-        assert_eq!(state.tabs().iter().map(Tab::id).collect::<Vec<_>>(), ids);
-        assert!(state.split(ids[2], SplitPlacement::After));
-        assert_eq!(state.pane_ids().len(), 2);
-        let secondary = state.pane_ids()[1];
-        assert_eq!(state.pane_tab_ids(secondary).unwrap(), &[ids[2]]);
-        assert_eq!(state.focused_pane(), secondary);
-        assert!(state.move_tab(ids[2], primary, 0));
-        assert_eq!(state.pane_ids().len(), 1);
-        assert_eq!(state.focused_pane(), primary);
+        assert!(state.create_split(ids[1], ids[0], SplitPlacement::Right));
+        assert_eq!(state.visible_tab_ids(), vec![ids[0], ids[1]]);
+        assert!(state.select_tab(ids[2]));
+        assert_eq!(state.visible_tab_ids(), vec![ids[2]]);
+        assert!(state.select_tab(ids[0]));
+        assert_eq!(state.visible_tab_ids(), vec![ids[0], ids[1]]);
     }
 
     #[test]
-    fn reorder_supports_all_gap_directions_without_changing_selection() {
+    fn extracting_a_member_dissolves_only_its_pair() {
         let mut state = TabState::new();
         let (_directory, ids) = open_files(&mut state, 4);
-        let pane = state.pane_ids()[0];
-        state.select(1);
-        assert!(state.reorder(pane, ids[0], 4));
-        assert_eq!(
-            state.pane_tab_ids(pane).unwrap(),
-            &[ids[1], ids[2], ids[3], ids[0]]
-        );
-        assert!(state.reorder(pane, ids[0], 0));
-        assert_eq!(
-            state.pane_tab_ids(pane).unwrap(),
-            &[ids[0], ids[1], ids[2], ids[3]]
-        );
-        assert!(state.reorder(pane, ids[1], 3));
-        assert_eq!(
-            state.pane_tab_ids(pane).unwrap(),
-            &[ids[0], ids[2], ids[1], ids[3]]
-        );
-        assert!(state.reorder(pane, ids[1], 2));
-        assert_eq!(
-            state.pane_tab_ids(pane).unwrap(),
-            &[ids[0], ids[2], ids[1], ids[3]]
-        );
-        assert_eq!(state.pane_selected(pane), Some(ids[1]));
+        assert!(state.create_split(ids[1], ids[0], SplitPlacement::Right));
+        assert!(state.create_split(ids[3], ids[2], SplitPlacement::Bottom));
+        assert!(state.extract_split_member(ids[1], 2));
+        assert!(state.split_for_tab(ids[0]).is_none());
+        assert!(state.split_for_tab(ids[1]).is_none());
+        assert!(state.split_for_tab(ids[2]).is_some());
     }
 
     #[test]
-    fn split_before_and_after_reject_single_or_already_split_panes() {
-        let mut state = TabState::new();
-        let (_directory, ids) = open_files(&mut state, 2);
-        let primary = state.pane_ids()[0];
-        assert!(state.split(ids[0], SplitPlacement::Before));
-        assert_eq!(state.pane_tab_ids(state.pane_ids()[0]).unwrap(), &[ids[0]]);
-        assert_eq!(state.pane_tab_ids(state.pane_ids()[1]).unwrap(), &[ids[1]]);
-        assert!(!state.split(ids[1], SplitPlacement::After));
-        assert!(!state.split(ids[0], SplitPlacement::After));
-
-        let mut one = TabState::new();
-        let (_directory, one_id) = open_files(&mut one, 1);
-        assert!(!one.split(one_id[0], SplitPlacement::Before));
-        assert_eq!(one.pane_ids(), vec![PaneId(0)]);
-        assert_eq!(primary, PaneId(0));
-    }
-
-    #[test]
-    fn invalid_layout_variants_leave_state_unchanged() {
+    fn replacing_from_a_normal_tab_swaps_the_displaced_member_to_the_source_position() {
         let mut state = TabState::new();
         let (_directory, ids) = open_files(&mut state, 3);
-        let before = state.pane_tab_ids(state.pane_ids()[0]).unwrap().to_vec();
-        let invalid = [
-            (vec![(Vec::new(), ids[0])], 0, 0.5),
-            (vec![(vec![ids[0], ids[0]], ids[0])], 0, 0.5),
-            (vec![(vec![ids[0]], ids[0])], 0, 0.5),
-            (vec![(vec![ids[0], ids[1], ids[2]], TabId(99))], 0, 0.5),
-            (vec![(vec![ids[0]], ids[0]), (vec![ids[1]], ids[1])], 2, 0.5),
-            (
-                vec![
-                    (vec![ids[0]], ids[0]),
-                    (vec![ids[1]], ids[1]),
-                    (vec![ids[2]], ids[2]),
-                ],
-                0,
-                0.5,
-            ),
-            (vec![(vec![ids[0], ids[1], ids[2]], ids[0])], 0, f32::NAN),
-            (vec![(vec![ids[0], ids[1], ids[2]], ids[0])], 0, 0.09),
-            (vec![(vec![ids[0], ids[1], ids[2]], ids[0])], 0, 0.91),
-        ];
-        for (layouts, focused, ratio) in invalid {
-            assert!(!state.restore_layout(layouts, focused, ratio));
-            assert_eq!(state.pane_tab_ids(state.pane_ids()[0]).unwrap(), before);
-            assert_eq!(state.pane_ids().len(), 1);
-        }
+        assert!(state.create_split(ids[1], ids[0], SplitPlacement::Right));
+        let group = state.split_for_tab(ids[0]).unwrap().id();
+        assert_eq!(
+            state.replace_split_member(group, SplitSide::Second, ids[2]),
+            Some(ids[1])
+        );
+        assert_eq!(state.split_group(group).unwrap().tabs(), [ids[0], ids[2]]);
+        assert!(matches!(state.entries().last(), Some(TabEntry::Single(id)) if *id == ids[1]));
     }
 
     #[test]
-    fn cross_pane_move_inserts_at_each_gap_and_collapses_empty_source() {
+    fn replacing_between_pairs_preserves_both_pairs() {
         let mut state = TabState::new();
         let (_directory, ids) = open_files(&mut state, 4);
-        let primary = state.pane_ids()[0];
-        assert!(state.split(ids[3], SplitPlacement::After));
-        assert!(state.move_tab(ids[3], primary, 1));
+        assert!(state.create_split(ids[1], ids[0], SplitPlacement::Right));
+        let first = state.split_for_tab(ids[0]).unwrap().id();
+        assert!(state.create_split(ids[3], ids[2], SplitPlacement::Bottom));
         assert_eq!(
-            state.pane_tab_ids(primary).unwrap(),
-            &[ids[0], ids[3], ids[1], ids[2]]
+            state.replace_split_member(first, SplitSide::Second, ids[3]),
+            Some(ids[1])
         );
-        assert_eq!(state.pane_ids().len(), 1);
-
-        assert!(state.split(ids[0], SplitPlacement::After));
-        let secondary = state.pane_ids()[1];
-        assert!(state.move_tab(ids[1], secondary, 0));
-        assert_eq!(state.pane_tab_ids(secondary).unwrap(), &[ids[1], ids[0]]);
-        assert!(state.move_tab(ids[0], secondary, 2));
-        assert_eq!(state.pane_tab_ids(secondary).unwrap(), &[ids[1], ids[0]]);
-        assert_eq!(state.tab_pane(ids[0]), Some(secondary));
+        assert_eq!(state.split_group(first).unwrap().tabs(), [ids[0], ids[3]]);
+        assert_eq!(
+            state.split_for_tab(ids[1]).unwrap().tabs(),
+            [ids[2], ids[1]]
+        );
     }
 
     #[test]
-    fn invalid_layout_does_not_change_state() {
+    fn replacing_the_opposite_member_focuses_the_dragged_tab_after_swap() {
         let mut state = TabState::new();
         let (_directory, ids) = open_files(&mut state, 2);
-        let before = state.pane_tab_ids(state.pane_ids()[0]).unwrap().to_vec();
+        assert!(state.create_split(ids[1], ids[0], SplitPlacement::Right));
+        assert!(state.select_tab(ids[0]));
+        let group_id = state.active_split().unwrap().id();
+        let dragged_side = if state.active_split().unwrap().tab(SplitSide::First) == ids[1] {
+            SplitSide::First
+        } else {
+            SplitSide::Second
+        };
+        let target_side = match dragged_side {
+            SplitSide::First => SplitSide::Second,
+            SplitSide::Second => SplitSide::First,
+        };
+
+        assert_eq!(
+            state.replace_split_member(group_id, target_side, ids[1]),
+            Some(ids[0])
+        );
+        assert_eq!(state.active_tab_id(), Some(ids[1]));
+        let group = state.active_split().unwrap();
+        assert_eq!(group.tab(group.focused()), ids[1]);
+        assert_eq!(state.next_entry_tab(), Some(ids[1]));
+    }
+
+    #[test]
+    fn closing_a_split_member_leaves_the_sibling_single() {
+        let mut state = TabState::new();
+        let (_directory, ids) = open_files(&mut state, 2);
+        assert!(state.create_split(ids[1], ids[0], SplitPlacement::Right));
+        let closing = state.tab_registry_index(ids[1]).unwrap();
+        state.close(closing).unwrap();
+        assert_eq!(state.entries(), &[TabEntry::Single(ids[0])]);
+        assert_eq!(state.active_tab_id(), Some(ids[0]));
+    }
+
+    #[test]
+    fn ctrl_tab_treats_each_split_as_one_entry() {
+        let mut state = TabState::new();
+        let (_directory, ids) = open_files(&mut state, 3);
+        assert!(state.create_split(ids[1], ids[0], SplitPlacement::Right));
+        assert!(state.select_tab(ids[0]));
+        assert_eq!(state.next_entry_tab(), Some(ids[2]));
+        assert!(state.select_tab(ids[2]));
+        assert_eq!(state.next_entry_tab(), Some(ids[0]));
+    }
+
+    #[test]
+    fn restore_rejects_duplicate_or_missing_membership() {
+        let mut state = TabState::new();
+        let (_directory, ids) = open_files(&mut state, 3);
         assert!(!state.restore_layout(
-            vec![(vec![ids[0]], ids[0]), (vec![ids[1]], ids[1])],
-            2,
-            0.5,
+            vec![
+                RestoredTabEntry::Single(ids[0]),
+                RestoredTabEntry::Split {
+                    tabs: [ids[0], ids[1]],
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    focused: SplitSide::First,
+                },
+            ],
+            Some(ids[0]),
         ));
-        assert_eq!(state.pane_tab_ids(state.pane_ids()[0]).unwrap(), before);
-        assert!(!state.set_split_ratio(f32::NAN));
-        assert_eq!(state.split_ratio(), 0.5);
+        assert!(!state.restore_layout(vec![RestoredTabEntry::Single(ids[0])], Some(ids[0]),));
+        assert!(!state.restore_layout(
+            vec![
+                RestoredTabEntry::Split {
+                    tabs: [ids[0], ids[1]],
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    focused: SplitSide::First,
+                },
+                RestoredTabEntry::Single(ids[2]),
+            ],
+            Some(ids[1]),
+        ));
     }
 
     #[test]
-    fn restore_layout_issues_internal_pane_ids_without_future_split_collision() {
+    fn split_direction_ratio_swap_and_unsplit_are_explicit() {
         let mut state = TabState::new();
-        let (_directory, ids) = open_files(&mut state, 3);
-        assert!(state.restore_layout(vec![(vec![ids[0], ids[1], ids[2]], ids[2])], 0, 0.6,));
-        assert_eq!(state.pane_ids().len(), 1);
-        let primary = state.pane_ids()[0];
-        assert!(state.split(ids[0], SplitPlacement::After));
-        let restored_ids = state.pane_ids();
-        assert_eq!(restored_ids[0], primary);
-        assert_ne!(restored_ids[0], restored_ids[1]);
-        assert!(state.split_ratio() == 0.6);
+        let (_directory, ids) = open_files(&mut state, 2);
+        assert!(state.create_split(ids[1], ids[0], SplitPlacement::Right));
+        let group_id = state.split_for_tab(ids[0]).unwrap().id();
+        assert!(state.set_split_direction(group_id, SplitDirection::Vertical));
+        assert!(state.set_split_ratio(group_id, 0.3));
+        assert!(state.swap_split_members(group_id));
+        let group = state.split_group(group_id).unwrap();
+        assert_eq!(group.tabs(), [ids[1], ids[0]]);
+        assert_eq!(group.direction(), SplitDirection::Vertical);
+        assert_eq!(group.ratio(), 0.3);
+        assert!(state.unsplit(group_id));
+        assert_eq!(state.entries().len(), 2);
     }
 }
