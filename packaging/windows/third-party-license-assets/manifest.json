@@ -1,0 +1,113 @@
+[
+  {
+    "package": "accesskit",
+    "version": "0.24.1",
+    "files": [
+      "accesskit-0.24.1/LICENSE-APACHE",
+      "accesskit-0.24.1/LICENSE-MIT",
+      "accesskit-0.24.1/LICENSE.chromium"
+    ]
+  },
+  {
+    "package": "clipboard-win",
+    "version": "5.4.1",
+    "files": ["clipboard-win-5.4.1/LICENSE"]
+  },
+  {
+    "package": "dwrote",
+    "version": "0.11.5",
+    "files": ["dwrote-0.11.5/MPL-2.0.txt"]
+  },
+  {
+    "package": "ecolor",
+    "version": "0.35.0",
+    "files": ["egui-0.35.0/LICENSE-APACHE", "egui-0.35.0/LICENSE-MIT"]
+  },
+  {
+    "package": "eframe",
+    "version": "0.35.0",
+    "files": ["egui-0.35.0/LICENSE-APACHE", "egui-0.35.0/LICENSE-MIT"]
+  },
+  {
+    "package": "egui",
+    "version": "0.35.0",
+    "files": ["egui-0.35.0/LICENSE-APACHE", "egui-0.35.0/LICENSE-MIT"]
+  },
+  {
+    "package": "egui_extras",
+    "version": "0.35.0",
+    "files": ["egui-0.35.0/LICENSE-APACHE", "egui-0.35.0/LICENSE-MIT"]
+  },
+  {
+    "package": "egui_glow",
+    "version": "0.35.0",
+    "files": ["egui-0.35.0/LICENSE-APACHE", "egui-0.35.0/LICENSE-MIT"]
+  },
+  {
+    "package": "egui-wgpu",
+    "version": "0.35.0",
+    "files": ["egui-0.35.0/LICENSE-APACHE", "egui-0.35.0/LICENSE-MIT"]
+  },
+  {
+    "package": "egui-winit",
+    "version": "0.35.0",
+    "files": ["egui-0.35.0/LICENSE-APACHE", "egui-0.35.0/LICENSE-MIT"]
+  },
+  {
+    "package": "emath",
+    "version": "0.35.0",
+    "files": ["egui-0.35.0/LICENSE-APACHE", "egui-0.35.0/LICENSE-MIT"]
+  },
+  {
+    "package": "epaint",
+    "version": "0.35.0",
+    "files": ["egui-0.35.0/LICENSE-APACHE", "egui-0.35.0/LICENSE-MIT"]
+  },
+  {
+    "package": "epaint_default_fonts",
+    "version": "0.35.0",
+    "files": [
+      "egui-0.35.0/LICENSE-APACHE",
+      "egui-0.35.0/LICENSE-MIT",
+      "epaint_default_fonts-0.35.0/Hack-Regular.txt",
+      "epaint_default_fonts-0.35.0/OFL.txt",
+      "epaint_default_fonts-0.35.0/UFL.txt",
+      "epaint_default_fonts-0.35.0/emoji-icon-font-mit-license.txt"
+    ]
+  },
+  {
+    "package": "gl_generator",
+    "version": "0.14.0",
+    "files": ["gl-rs-ea503e8d/LICENSE"]
+  },
+  {
+    "package": "hexf-parse",
+    "version": "0.2.1",
+    "files": ["hexf-parse-0.2.1/CC0-1.0.txt"]
+  },
+  {
+    "package": "khronos_api",
+    "version": "3.1.0",
+    "files": ["gl-rs-ea503e8d/LICENSE"]
+  },
+  {
+    "package": "pathfinder_geometry",
+    "version": "0.5.1",
+    "files": ["pathfinder/LICENSE-APACHE", "pathfinder/LICENSE-MIT"]
+  },
+  {
+    "package": "pathfinder_simd",
+    "version": "0.5.6",
+    "files": ["pathfinder/LICENSE-APACHE", "pathfinder/LICENSE-MIT"]
+  },
+  {
+    "package": "profiling",
+    "version": "1.0.18",
+    "files": ["profiling-1.0.18/LICENSE-APACHE", "profiling-1.0.18/LICENSE-MIT"]
+  },
+  {
+    "package": "winapi-x86_64-pc-windows-gnu",
+    "version": "0.4.0",
+    "files": ["pathfinder/LICENSE-APACHE", "pathfinder/LICENSE-MIT"]
+  }
+]
