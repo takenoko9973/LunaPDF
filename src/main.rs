@@ -40,11 +40,11 @@ fn main() -> Result<()> {
         let listener_repaint_context = Arc::clone(&repaint_context);
         listener
             .spawn(move |event| {
-                if external_event_sender.send(event).is_ok()
-                    && let Some(context) = listener_repaint_context.get()
-                {
+                let queued = external_event_sender.send(event).is_ok();
+                if queued && let Some(context) = listener_repaint_context.get() {
                     context.request_repaint();
                 }
+                queued
             })
             .context("start LunaPDF single-instance listener")?;
         repaint_context

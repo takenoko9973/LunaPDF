@@ -2,9 +2,12 @@ use std::env;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
+use std::ptr;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, prelude::*};
@@ -17,14 +20,22 @@ use windows_sys::Win32::Security::{
     EqualSid, GetTokenInformation, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
     TokenRestrictedSids, TokenUser,
 };
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 const PROTOCOL_MAGIC: [u8; 4] = *b"LNP1";
+const PROTOCOL_ACK: [u8; 4] = *b"LNA1";
 // CreateProcessWのコマンドライン上限と同じ単位数を上限にし、壊れた要求による
 // 過大な割り当てを防ぎつつ、Explorerから渡せる入力は欠落させない。
 const MAX_REQUEST_UTF16_UNITS: usize = 32_767;
+// 既存プロセスが終了中または応答不能でも2回目の起動を無期限に残さず、
+// 通常の起動処理とUI queue投入には十分な猶予を与える。
+const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+// Windowsの名前付きパイプはI/O timeoutを提供しないため、受信可能byte数の
+// 確認間隔を短く保ちつつ、secondary processのbusy loopを避ける。
+const ACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -64,10 +75,11 @@ impl SingleInstanceListener {
     /// 受信ループを専用スレッドで開始し、各接続の結果をUI側コールバックへ渡す。
     ///
     /// 接続ごとに読み取りスレッドを分けるため、起動途中で停止した送信元があっても、
-    /// 後続のExplorer要求を受け付ける受信ループはブロックされない。
+    /// 後続のExplorer要求を受け付ける受信ループはブロックされない。コールバックは
+    /// UI queueへ投入できた場合だけ`true`を返し、その要求にACKを返せるようにする。
     pub(crate) fn spawn<F>(self, on_event: F) -> io::Result<()>
     where
-        F: Fn(std::result::Result<Vec<PathBuf>, String>) + Send + Sync + 'static,
+        F: Fn(std::result::Result<Vec<PathBuf>, String>) -> bool + Send + Sync + 'static,
     {
         let on_event = Arc::new(on_event);
         thread::Builder::new()
@@ -88,12 +100,23 @@ impl SingleInstanceListener {
                         .name("lunapdf-instance-request".to_owned())
                         .spawn(move || {
                             let mut connection = connection;
-                            let event = verify_same_user_peer(&connection)
-                                .and_then(|()| read_paths_from(&mut connection))
-                                .map_err(|error| {
-                                    format!("受信した起動要求を読み取れませんでした: {error}")
-                                });
-                            request_callback(event);
+                            let paths = verify_same_user_peer(&connection)
+                                .and_then(|()| read_paths_from(&mut connection));
+                            match paths {
+                                Ok(paths) => {
+                                    // ACKはUI channelへの投入後だけ返す。送信元processを
+                                    // peer SID検証完了まで生存させ、成功終了時の要求欠落を防ぐ。
+                                    if request_callback(Ok(paths)) {
+                                        let _ = write_ack_to(&mut connection)
+                                            .and_then(|()| connection.flush());
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = request_callback(Err(format!(
+                                        "受信した起動要求を読み取れませんでした: {error}"
+                                    )));
+                                }
+                            }
                         });
                     if let Err(error) = request_thread {
                         on_event(Err(format!(
@@ -125,6 +148,8 @@ fn forward_paths(socket_name: &str, paths: &[PathBuf]) -> Result<()> {
     verify_same_user_peer(&connection).context("authenticate the running LunaPDF instance user")?;
     write_paths_to(&mut connection, paths).context("write LunaPDF open request")?;
     connection.flush().context("flush LunaPDF open request")?;
+    read_ack_with_timeout(&mut connection)
+        .context("wait for LunaPDF open request acknowledgement")?;
     Ok(())
 }
 
@@ -379,6 +404,60 @@ fn read_paths_from(reader: &mut impl Read) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn write_ack_to(writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(&PROTOCOL_ACK)
+}
+
+fn read_ack_from(reader: &mut impl Read) -> io::Result<()> {
+    let mut ack = [0u8; PROTOCOL_ACK.len()];
+    reader.read_exact(&mut ack)?;
+    validate_ack(ack)
+}
+
+fn read_ack_with_timeout(connection: &mut LocalSocketStream) -> io::Result<()> {
+    // interprocessが利用するWindows named pipeはI/O timeout非対応なので、blocking readへ
+    // 入る前に受信可能byte数を監視し、明示した期限までにACK全体が届くことを確認する。
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    while available_pipe_bytes(connection)? < PROTOCOL_ACK.len() as u32 {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "single-instance acknowledgement timed out",
+            ));
+        }
+        thread::sleep(ACK_POLL_INTERVAL);
+    }
+
+    read_ack_from(connection)
+}
+
+fn available_pipe_bytes(connection: &LocalSocketStream) -> io::Result<u32> {
+    let LocalSocketStream::NamedPipe(named_pipe) = connection;
+    let mut available = 0;
+    // bufferを渡さないPeekNamedPipeはdataを消費せず、後続のRead実行可否だけを調べる。
+    let succeeded = unsafe {
+        PeekNamedPipe(
+            named_pipe.inner().as_raw_handle(),
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            &mut available,
+            ptr::null_mut(),
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(available)
+}
+
+fn validate_ack(ack: [u8; PROTOCOL_ACK.len()]) -> io::Result<()> {
+    if ack != PROTOCOL_ACK {
+        return Err(invalid_request("invalid single-instance acknowledgement"));
+    }
+    Ok(())
+}
+
 fn write_u32(writer: &mut impl Write, value: usize) -> io::Result<()> {
     let value = u32::try_from(value).map_err(|_| invalid_request("request field is too large"))?;
     writer.write_all(&value.to_le_bytes())
@@ -398,6 +477,7 @@ fn invalid_request(message: &'static str) -> io::Error {
 mod tests {
     use std::ffi::OsStr;
     use std::io::Cursor;
+    use std::sync::{Arc, Barrier};
 
     use super::*;
     use windows_sys::Win32::Security::{
@@ -442,6 +522,17 @@ mod tests {
 
         let error = write_paths_to(&mut Vec::new(), &[path]).unwrap_err();
 
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn acknowledgement_roundtrip_requires_the_exact_protocol_value() {
+        let mut bytes = Vec::new();
+        write_ack_to(&mut bytes).unwrap();
+
+        read_ack_from(&mut Cursor::new(bytes)).unwrap();
+
+        let error = read_ack_from(&mut Cursor::new(*b"BAD!")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -510,7 +601,7 @@ mod tests {
         let listener = SingleInstanceListener { listener };
         let (sender, receiver) = crossbeam_channel::bounded(1);
         listener
-            .spawn(move |event| sender.send(event).unwrap())
+            .spawn(move |event| sender.send(event).is_ok())
             .unwrap();
         let paths = vec![
             PathBuf::from(r"C:\PDF files\first paper.pdf"),
@@ -518,10 +609,61 @@ mod tests {
         ];
 
         forward_paths(&socket_name, &paths).unwrap();
-        let forwarded = receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
+        // forward_pathsの成功はcallback完了後のACKを意味するため、eventは既にqueue済みである。
+        let forwarded = receiver.try_recv().unwrap();
 
         assert_eq!(forwarded.unwrap(), paths);
+    }
+
+    #[test]
+    fn protected_listener_acknowledges_two_concurrent_requests_after_queueing() {
+        let socket_name = format!(
+            "lunapdf-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let listener_name = socket_name
+            .as_str()
+            .to_ns_name::<GenericNamespaced>()
+            .unwrap();
+        let listener = ListenerOptions::new()
+            .name(listener_name)
+            .security_descriptor(current_user_pipe_security_descriptor().unwrap())
+            .create_sync()
+            .unwrap();
+        let listener = SingleInstanceListener { listener };
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        listener
+            .spawn(move |event| sender.send(event).is_ok())
+            .unwrap();
+        // mainと2 clientを同じbarrierから解放し、accept順序に依存しない同時要求にする。
+        let barrier = Arc::new(Barrier::new(3));
+        let clients = ["first.pdf", "second.pdf"].map(|name| {
+            let socket_name = socket_name.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let path = PathBuf::from(name);
+                barrier.wait();
+                forward_paths(&socket_name, std::slice::from_ref(&path)).unwrap();
+                path
+            })
+        });
+        barrier.wait();
+
+        let expected = clients
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .collect::<Vec<_>>();
+        let mut forwarded = [receiver.try_recv().unwrap(), receiver.try_recv().unwrap()]
+            .map(|event| event.unwrap()[0].clone())
+            .to_vec();
+        forwarded.sort();
+        let mut expected = expected;
+        expected.sort();
+
+        assert_eq!(forwarded, expected);
     }
 }
