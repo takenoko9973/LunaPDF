@@ -31,3 +31,9 @@
 - [LunaPDF 空白パン・自動スクロール カーソル修正 作業報告](ui-improvement/260728_lunapdf_cursor_state_followup_fix_report.md)
 - [LunaPDF 描画欠落・タブUI・テキスト選択 調査・作業報告](ui-improvement/lunapdf_fitpage_tabs_selection_report.md)
 - [LunaPDF タブ・ページ操作・テキスト選択・注釈編集 調査・作業報告](ui-improvement/lunapdf_tabs_paging_selection_annotations_report.md)
+
+## `refactoring/`
+
+既存動作とデータ契約を維持したまま、内部構造・重複・保守性を改善する計画と報告を置く。
+
+- [LunaPDF 大規模リファクタリング計画](refactoring/260730_lunapdf_refactoring_plan.md)
