@@ -39,3 +39,9 @@
 既存動作とデータ契約を維持したまま、内部構造・重複・保守性を改善する計画と報告を置く。
 
 - [LunaPDF 大規模リファクタリング計画](refactoring/260730_lunapdf_refactoring_plan.md)
+
+## `distribution/`
+
+Windows向け実行ファイル、インストーラー、ポータブル版、CI/CDなど、配布に関する指示書と報告を置く。
+
+- [LunaPDF Windows配布対応 指示書](distribution/260802_lunapdf_windows_distribution_instructions.md)
