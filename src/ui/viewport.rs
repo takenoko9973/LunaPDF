@@ -213,6 +213,9 @@ impl PageViewport {
             ui.id().with(("pdf-page", page_index)),
             Sense::click_and_drag(),
         );
+        // ScrollArea内のページ矩形はツールバー、サイドバー、ステータス領域の背後まで
+        // 延びうる。PDF入力は実際に露出しているclip範囲だけへ限定する。
+        let interaction_rect = response.rect.intersect(ui.clip_rect());
 
         if let Some(selection) = selection.filter(|value| value.page_index == page_index) {
             for quad in &selection.display_quads {
@@ -230,7 +233,7 @@ impl PageViewport {
         let pointer_page_point = response
             .interact_pointer_pos()
             .or_else(|| ui.input(|input| input.pointer.latest_pos()))
-            .filter(|position| response.rect.contains(*position))
+            .filter(|position| interaction_rect.contains(*position))
             .filter(|position| input_excluded_rect.is_none_or(|rect| !rect.contains(*position)))
             .filter(|position| ui.ctx().layer_id_at(*position) == Some(ui.layer_id()))
             .map(|position| page_point_from_screen(position, screen_rect, bounds));
@@ -242,7 +245,7 @@ impl PageViewport {
         });
         let secondary_released_here = secondary_released
             && secondary_position.is_some_and(|position| {
-                response.rect.contains(position)
+                interaction_rect.contains(position)
                     && input_excluded_rect.is_none_or(|rect| !rect.contains(position))
                     && ui.ctx().layer_id_at(position) == Some(ui.layer_id())
             });
@@ -299,7 +302,7 @@ impl PageViewport {
         let origin = press_origin.or(pointer_position);
         if primary_pressed
             && origin.is_some_and(|position| {
-                response.rect.contains(position)
+                interaction_rect.contains(position)
                     && input_excluded_rect.is_none_or(|rect| !rect.contains(position))
                     && ui.ctx().layer_id_at(position) == Some(ui.layer_id())
             })
@@ -838,6 +841,59 @@ mod tests {
             button,
             pressed,
             modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn page_input_is_limited_to_the_visible_clip_rect_on_every_edge() {
+        let page_rect = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::splat(100.0));
+        let visible_clip = Rect::from_min_max(Pos2::new(50.0, 50.0), Pos2::new(100.0, 100.0));
+        for position in [
+            Pos2::new(30.0, 70.0),
+            Pos2::new(70.0, 30.0),
+            Pos2::new(110.0, 70.0),
+            Pos2::new(70.0, 110.0),
+        ] {
+            let context = egui::Context::default();
+            let mut viewport = PageViewport::default();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(160.0))),
+                events: vec![
+                    egui::Event::PointerMoved(position),
+                    primary_button_event(position, true),
+                ],
+                ..Default::default()
+            };
+            let snapshot = text_snapshot();
+            let annotations = annotation_page(&[]);
+            let mut interaction = PageInteraction::default();
+            let _output = context.run_ui(input, |ui| {
+                // 実アプリと同じlayer上に別UIがあり、ページだけがclipされる状態を再現する。
+                ui.interact(page_rect, ui.id().with("surrounding-ui"), Sense::hover());
+                ui.set_clip_rect(visible_clip);
+                interaction = viewport.interact_at(
+                    ui,
+                    PageInteractionInput {
+                        screen_rect: page_rect,
+                        page_index: 0,
+                        bounds: PageRect {
+                            x0: 0.0,
+                            y0: 0.0,
+                            x1: 100.0,
+                            y1: 100.0,
+                        },
+                        text_snapshot: Some(&snapshot),
+                        selection: None,
+                        annotation_page: Some(&annotations),
+                        can_create_highlight: false,
+                        suppress_annotation_hover: false,
+                        input_excluded_rect: None,
+                    },
+                );
+            });
+
+            assert!(!viewport.primary_interaction_in_progress());
+            assert!(interaction.cursor_target.is_none());
         }
     }
 
