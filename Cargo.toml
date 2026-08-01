@@ -3,6 +3,7 @@ name = "lunapdf"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
+description = "A lightweight desktop PDF viewer"
 license = "AGPL-3.0-only"
 
 [dependencies]
@@ -19,13 +20,27 @@ tempfile = "3.27.0"
 
 [target.'cfg(windows)'.dependencies]
 dwrote = { version = "0.11.5", default-features = false }
+interprocess = { version = "2.4.2", default-features = false }
+widestring = "1.2.1"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Xps",
+    "Win32_System_Threading",
     "Win32_UI_Controls_Dialogs",
 ] }
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[package.metadata.winresource]
+OriginalFilename = "LunaPDF.exe"
+ProductName = "LunaPDF"
+FileDescription = "LunaPDF PDF viewer"
+LegalCopyright = "Copyright © 2026 LunaPDF contributors"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 font-kit = { version = "0.14.3", default-features = false, features = ["source"] }

@@ -60,6 +60,143 @@ fn finish_async_session_restore(app: &mut PrototypeApp) {
     );
 }
 
+#[test]
+fn external_open_request_uses_the_existing_tab_path_for_multiple_pdfs() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first paper.pdf");
+    let second = directory.path().join("日本語.pdf");
+    write_blank_pdf(&first);
+    write_blank_pdf(&second);
+    let mut app = PrototypeApp::from_startup(
+        Vec::new(),
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    app.external_open_events = receiver;
+
+    sender
+        .send(Ok(vec![first.clone(), second.clone(), first.clone()]))
+        .unwrap();
+    let request_received = app.receive_external_open_events(&egui::Context::default());
+
+    assert!(request_received);
+    assert_eq!(app.documents.len(), 2);
+    assert_eq!(
+        app.tabs.tabs()[app.tabs.selected_index().unwrap()].path(),
+        std::fs::canonicalize(first).unwrap()
+    );
+}
+
+#[test]
+fn external_open_receive_error_is_reported_without_changing_tabs() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = PrototypeApp::from_startup(
+        Vec::new(),
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    app.external_open_events = receiver;
+
+    sender.send(Err("IPC error".to_owned())).unwrap();
+    let request_received = app.receive_external_open_events(&egui::Context::default());
+
+    assert!(!request_received);
+    assert!(app.documents.is_empty());
+    assert_eq!(app.error.as_deref(), Some("IPC error"));
+}
+
+#[test]
+fn external_open_request_cancels_window_close_confirmation() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("unsaved.pdf");
+    let second = directory.path().join("追加.pdf");
+    write_blank_pdf(&first);
+    write_blank_pdf(&second);
+    let mut app = PrototypeApp::from_startup(
+        vec![first.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    app.external_open_events = receiver;
+    app.window_close_pending = true;
+    app.close_confirmation = Some(CloseConfirmation {
+        scope: CloseScope::Window,
+        path: first,
+        save_in_flight: true,
+    });
+
+    sender.send(Ok(vec![second])).unwrap();
+    let request_received = app.receive_external_open_events(&egui::Context::default());
+
+    assert!(request_received);
+    assert!(!app.window_close_pending);
+    assert!(app.close_confirmation.is_none());
+    assert_eq!(app.documents.len(), 2);
+}
+
+#[test]
+fn external_open_request_cancels_a_sent_window_close_in_the_same_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = PrototypeApp::from_startup(
+        Vec::new(),
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    app.external_open_events = receiver;
+    app.allow_window_close = true;
+    sender.send(Ok(Vec::new())).unwrap();
+    let context = egui::Context::default();
+    let mut input = egui::RawInput::default();
+    input
+        .viewports
+        .get_mut(&egui::ViewportId::ROOT)
+        .unwrap()
+        .events
+        .push(egui::ViewportEvent::Close);
+
+    let output = context.run_ui(input, |ui| {
+        let request_received = app.receive_external_open_events(ui.ctx());
+        app.handle_window_close(ui.ctx(), request_received);
+    });
+
+    assert!(!app.allow_window_close);
+    let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, ViewportCommand::CancelClose))
+    );
+}
+
+#[test]
+fn external_open_request_preserves_a_single_tab_close_confirmation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unsaved.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    app.external_open_events = receiver;
+    app.window_close_pending = true;
+    app.close_confirmation = Some(CloseConfirmation {
+        scope: CloseScope::Tab,
+        path: path.clone(),
+        save_in_flight: false,
+    });
+
+    sender.send(Ok(Vec::new())).unwrap();
+    app.receive_external_open_events(&egui::Context::default());
+
+    assert!(!app.window_close_pending);
+    assert!(matches!(
+        app.close_confirmation.as_ref(),
+        Some(confirmation)
+            if confirmation.scope == CloseScope::Tab && confirmation.path == path
+    ));
+}
+
 fn run_autoscroll_frame(
     context: &egui::Context,
     view: &mut ViewState,

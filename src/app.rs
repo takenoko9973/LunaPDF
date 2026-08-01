@@ -13,7 +13,7 @@ use std::time::Duration;
 #[cfg(debug_assertions)]
 use std::time::Instant;
 
-use crossbeam_channel::TryRecvError;
+use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{
     self, Color32, Event, Id, Key, LayerId, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect,
     Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, TouchPhase, UiBuilder, Vec2,
@@ -42,6 +42,8 @@ use crate::domain::tabs::{
 };
 use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService};
 use crate::persistence::session_store::SessionStore;
+#[cfg(windows)]
+use crate::platform::windows::default_apps::open_default_apps_settings;
 use crate::render::cache::WeightedLruCache;
 use crate::render::layout::{ContinuousLayout, PAGE_GAP, PageAnchor};
 use crate::render::tiles::TileGrid;
@@ -180,6 +182,7 @@ pub(crate) struct PrototypeApp {
     session_store: SessionStore,
     restore_enabled: bool,
     session_restore_progress: Option<SessionRestoreProgress>,
+    external_open_events: Receiver<std::result::Result<Vec<PathBuf>, String>>,
     next_document_id: u64,
     activity_sequence: u64,
     // 表示要求は次のタブバーのフレームで消費する。一度だけにすることで、その後に
@@ -754,10 +757,13 @@ impl PrototypeApp {
         creation_context: &eframe::CreationContext<'_>,
         paths: Vec<PathBuf>,
         session_store: SessionStore,
+        external_open_events: Receiver<std::result::Result<Vec<PathBuf>, String>>,
     ) -> Self {
         install_ui_font(&creation_context.egui_ctx);
         egui_extras::install_image_loaders(&creation_context.egui_ctx);
-        Self::from_startup(paths, session_store)
+        let mut app = Self::from_startup(paths, session_store);
+        app.external_open_events = external_open_events;
+        app
     }
 
     fn from_startup(paths: Vec<PathBuf>, session_store: SessionStore) -> Self {
@@ -798,6 +804,7 @@ impl PrototypeApp {
             session_store,
             restore_enabled,
             session_restore_progress: None,
+            external_open_events: crossbeam_channel::never(),
             next_document_id: 1,
             activity_sequence: 0,
             tab_to_reveal: None,
@@ -982,6 +989,59 @@ impl PrototypeApp {
                 self.open_document(path);
             }
         }
+    }
+
+    /// 既存プロセスから届いたPDFパスを、通常のユーザー操作と同じタブ追加経路へ渡す。
+    ///
+    /// 戻り値は、同じフレームに残っているOSの終了要求を抑止すべきかを表す。
+    fn receive_external_open_events(&mut self, context: &egui::Context) -> bool {
+        let mut external_request_received = false;
+        let events = self.external_open_events.try_iter().collect::<Vec<_>>();
+        for event in events {
+            match event {
+                Ok(paths) => {
+                    external_request_received = true;
+                    self.cancel_bulk_close_for_external_open();
+                    for path in paths {
+                        self.open_document(path);
+                    }
+                    // Windows側の前面化制限には従いつつ、最小化解除とフォーカス要求を
+                    // eguiのウィンドウ経路へまとめて送る。
+                    context.send_viewport_cmd(ViewportCommand::Minimized(false));
+                    context.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                Err(error) => {
+                    self.error = Some(error);
+                }
+            }
+        }
+        external_request_received
+    }
+
+    fn cancel_bulk_close_for_external_open(&mut self) {
+        let bulk_confirmation = self
+            .close_confirmation
+            .as_ref()
+            .is_some_and(|confirmation| confirmation.scope != CloseScope::Tab);
+        let bulk_close_in_progress = self.window_close_pending
+            || self.close_all_pending
+            || bulk_confirmation
+            || self.allow_window_close
+            || self.session_close_failure.is_some();
+        if !bulk_close_in_progress {
+            return;
+        }
+
+        // 追加の起動要求は「アプリを使い続ける」意図である。保存中の処理自体は
+        // 完了させるが、その結果から終了シーケンスを再開させない。
+        if bulk_confirmation {
+            self.close_confirmation = None;
+        }
+        self.approved_window_documents.clear();
+        self.allow_window_close = false;
+        self.window_close_pending = false;
+        self.close_all_pending = false;
+        self.session_close_failure = None;
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
@@ -1606,18 +1666,25 @@ impl PrototypeApp {
         }
     }
 
-    fn handle_window_close(&mut self, context: &egui::Context) {
+    fn handle_window_close(&mut self, context: &egui::Context, suppress_close: bool) {
         let close_requested = context.input(|input| input.viewport().close_requested());
         if close_requested {
             self.stop_visible_autoscroll();
             self.cancel_all_viewport_interactions();
         }
-        if !close_requested || self.allow_window_close {
+        if !close_requested {
             return;
         }
 
         // OS のクローズ要求を検知した同じフレーム中にキャンセルを送らない限り、
         // eframe はネイティブウィンドウを閉じる。
+        if suppress_close {
+            context.send_viewport_cmd(ViewportCommand::CancelClose);
+            return;
+        }
+        if self.allow_window_close {
+            return;
+        }
         context.send_viewport_cmd(ViewportCommand::CancelClose);
         if self.focus_blocking_annotation_editor(None) {
             self.window_close_pending = false;
@@ -2628,6 +2695,8 @@ impl PrototypeApp {
         let mut copy_requested = false;
         let mut highlight_requested = false;
         let mut undo_requested = false;
+        #[cfg(windows)]
+        let mut default_apps_requested = false;
 
         egui::Panel::top("menu-bar").show(root_ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -2675,6 +2744,11 @@ impl PrototypeApp {
                     }
                     ui.separator();
                     ui.checkbox(&mut self.restore_enabled, "前回のセッションを復元");
+                    #[cfg(windows)]
+                    if ui.button("既定のPDFアプリを設定…").clicked() {
+                        default_apps_requested = true;
+                        ui.close();
+                    }
                     ui.separator();
                     if ui.button("終了").clicked() {
                         exit_requested = true;
@@ -2778,6 +2852,12 @@ impl PrototypeApp {
         }
         if undo_requested {
             self.undo();
+        }
+        #[cfg(windows)]
+        if default_apps_requested && let Err(error) = open_default_apps_settings() {
+            self.error = Some(format!(
+                "Windowsの既定のアプリ設定を開けませんでした。詳細: {error}"
+            ));
         }
     }
 
@@ -5197,9 +5277,10 @@ impl eframe::App for PrototypeApp {
         }
         self.receive_document_events(context);
         self.maybe_suspend_inactive_document();
+        let external_request_received = self.receive_external_open_events(context);
         self.handle_dropped_files(context);
         self.handle_shortcuts(context);
-        self.handle_window_close(context);
+        self.handle_window_close(context, external_request_received);
         context.request_repaint_after(Duration::from_millis(33));
     }
 
