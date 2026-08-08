@@ -258,6 +258,7 @@ struct DocumentTab {
     save_as: SaveAsState,
     failed_external_version: Option<DocumentVersion>,
     resume_expected_version: Option<DocumentVersion>,
+    external_resume_in_flight: bool,
     pending_rebind_path: Option<PathBuf>,
     rename_scan_in_flight: bool,
 }
@@ -1015,6 +1016,7 @@ impl PrototypeApp {
                 // 休止中はメタデータだけでinfo.versionを更新しない。次回activate時に
                 // MuPDFで完全open検証できた版だけを採用する。
                 self.documents[index].resume_expected_version = Some(candidate.0);
+                self.documents[index].external_resume_in_flight = true;
                 if self.is_visible_index(index)
                     && self.documents[index].state == DocumentState::Suspended
                 {
@@ -5164,6 +5166,7 @@ impl DocumentTab {
             save_as: SaveAsState::Idle,
             failed_external_version: None,
             resume_expected_version: None,
+            external_resume_in_flight: false,
             pending_rebind_path: None,
             rename_scan_in_flight: false,
         }
@@ -5460,6 +5463,20 @@ impl DocumentTab {
         self.view.clamp_to_page_count(page_count);
         self.page_input = (self.view.current_page + 1).to_string();
         let _queued = self.send(DocumentCommand::SetSearchGeneration(self.search.generation));
+    }
+
+    fn prepare_for_external_open(
+        &mut self,
+        revision: u64,
+        page_count: usize,
+    ) -> Vec<ThumbnailCacheKey> {
+        self.prepare_for_external_reload(page_count);
+        self.invalidate_rendering();
+        self.invalidate_text_snapshots();
+        self.invalidate_annotation_pages();
+        self.reset_highlight_index(revision, page_count);
+        self.external_resume_in_flight = false;
+        self.invalidate_thumbnails()
     }
 
     /// サイドバーが初めて表示された後に、そのタブの Highlight スキャンを開始する。

@@ -146,6 +146,10 @@ impl AnnotationEditorState {
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
+        self.buffer != self.original || self.custom_color_draft.is_some()
+    }
+
+    fn buffer_is_dirty(&self) -> bool {
         self.buffer != self.original
     }
 
@@ -158,7 +162,7 @@ impl AnnotationEditorState {
         // 場合にだけ保存する。変更を1つ黙って破棄することは禁止する。
         !self.stale
             && !self.mutation_in_flight
-            && self.is_dirty()
+            && self.buffer_is_dirty()
             && contents_allowed
             && color_allowed
     }

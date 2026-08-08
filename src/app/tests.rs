@@ -17,6 +17,13 @@ fn replace_with_blank_pdf(path: &Path, replacement: &Path) {
     std::fs::rename(replacement, path).unwrap();
 }
 
+fn overwrite_with_blank_pdf(path: &Path, replacement: &Path) {
+    write_blank_pdf(replacement);
+    let mut bytes = std::fs::read(replacement).unwrap();
+    bytes.extend_from_slice(b"\n% external replacement\n");
+    std::fs::write(path, bytes).unwrap();
+}
+
 fn saved_tab(path: PathBuf, page_index: usize) -> SessionTab {
     SessionTab {
         path,
@@ -157,6 +164,83 @@ fn finish_async_resume_failure(app: &mut PrototypeApp) {
     }
     assert_eq!(app.documents[0].state, DocumentState::Suspended);
     assert!(app.documents[0].service.is_none());
+}
+
+fn finish_async_document_opens(app: &mut PrototypeApp) {
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app
+        .documents
+        .iter()
+        .any(|document| document.state == DocumentState::Opening)
+        && std::time::Instant::now() < deadline
+    {
+        app.receive_document_events(&context);
+        if app
+            .documents
+            .iter()
+            .any(|document| document.state == DocumentState::Opening)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(
+        app.documents
+            .iter()
+            .all(|document| document.state != DocumentState::Opening)
+    );
+    assert!(app.documents.iter().all(|document| document.info.is_some()));
+}
+
+fn create_dirty_external_conflict(app: &mut PrototypeApp, path: &Path) -> DocumentVersion {
+    let quad = PageQuad {
+        upper_left: PagePoint::new(20.0, 20.0),
+        upper_right: PagePoint::new(80.0, 20.0),
+        lower_left: PagePoint::new(20.0, 40.0),
+        lower_right: PagePoint::new(80.0, 40.0),
+    };
+    let selection_generation = app.documents[0].selection_generation;
+    app.documents[0].selection = Some(SelectionSnapshot {
+        page_index: 0,
+        text: "selected text".to_owned(),
+        display_quads: vec![quad],
+        quads: vec![quad],
+        generation: selection_generation,
+        #[cfg(debug_assertions)]
+        extraction_time: Duration::ZERO,
+    });
+    app.create_highlight();
+
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while (app.documents[0].pending_edits > 0 || app.documents[0].edit_history.is_empty())
+        && std::time::Instant::now() < deadline
+    {
+        app.receive_document_events(&context);
+        if app.documents[0].pending_edits > 0 || app.documents[0].edit_history.is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(app.documents[0].pending_edits, 0);
+    assert!(!app.documents[0].edit_history.is_empty());
+    assert_eq!(app.documents[0].state, DocumentState::ReadyDirty);
+
+    let expected = app.documents[0].info.as_ref().unwrap().version;
+    let replacement = path.with_file_name("external-conflict-replacement.pdf");
+    overwrite_with_blank_pdf(path, &replacement);
+    let current = read_document_version(path).unwrap();
+    assert!(same_file_identity(current, expected));
+    assert_ne!(current, expected);
+
+    for _ in 0..2 {
+        app.last_external_check = Instant::now() - Duration::from_secs(1);
+        app.check_external_changes();
+    }
+    assert_eq!(
+        app.documents[0].external_conflict,
+        Some(ExternalConflict { version: current })
+    );
+    current
 }
 
 fn receive_rename_scan_result(
@@ -334,6 +418,107 @@ fn rename_scan_result_routes_dirty_conflict_and_recovers_failed_visible_suspende
 }
 
 #[test]
+fn external_resume_opened_event_rebuilds_suspended_document_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("external-resume-state.pdf");
+    let replacement = directory.path().join("external-resume-replacement.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let (expected, expected_revision, expected_page_count) = {
+        let info = app.documents[0].info.as_ref().unwrap();
+        (info.version, info.revision, info.page_bounds.len())
+    };
+    let _expected_handle = std::fs::File::open(&path).unwrap();
+    replace_with_blank_pdf(&path, &replacement);
+    let current = read_document_version(&path).unwrap();
+    assert!(!same_file_identity(current, expected));
+
+    let tab = &mut app.documents[0];
+    tab.outline = Some(Vec::new());
+    tab.outline_requested = true;
+    tab.selection = Some(SelectionSnapshot {
+        page_index: 0,
+        text: "old selection".to_owned(),
+        display_quads: Vec::new(),
+        quads: Vec::new(),
+        generation: tab.selection_generation,
+        #[cfg(debug_assertions)]
+        extraction_time: Duration::ZERO,
+    });
+    tab.annotation_pages.insert(
+        AnnotationPageRequest {
+            page_index: 0,
+            expected_revision,
+        },
+        AnnotationPageSnapshot {
+            page_index: 0,
+            revision: expected_revision,
+            annotations: Vec::new(),
+        },
+    );
+    tab.search.query = "old query".to_owned();
+    tab.search.pages.insert(0, Vec::new());
+    tab.view.current_page = 4;
+    tab.view.scroll_to_page = Some(4);
+    tab.highlight_index.started = true;
+    tab.highlight_index.revision = Some(expected_revision);
+    tab.highlight_index.total_pages = expected_page_count;
+    tab.highlight_index.pages.insert(
+        0,
+        vec![AnnotationSummary {
+            id: AnnotationId {
+                page_index: 0,
+                xref: 99,
+            },
+            kind: AnnotationKind::Highlight,
+            contents: "old highlight".to_owned(),
+            color: None,
+            can_edit_contents: true,
+            can_edit_color: true,
+            can_delete: true,
+        }],
+    );
+    let old_search_generation = tab.search.generation;
+    let old_view_generation = tab.view.generation;
+    let old_thumbnail_generation = tab.thumbnail_generation;
+    let old_highlight_generation = tab.highlight_index.generation;
+    tab.suspend();
+    tab.external_candidate = Some((current, 2));
+    tab.resume_expected_version = Some(current);
+
+    app.apply_external_poll_action(0, path.clone(), ExternalPollAction::Resume((current, 2)));
+    assert_eq!(app.documents[0].state, DocumentState::Opening);
+    finish_async_document_open(&mut app);
+
+    let tab = &app.documents[0];
+    assert_eq!(tab.state, DocumentState::ReadyClean);
+    assert_eq!(tab.info.as_ref().unwrap().version, current);
+    assert_eq!(tab.view.current_page, 0);
+    assert_eq!(tab.view.scroll_to_page, Some(0));
+    assert!(tab.outline.is_none());
+    assert!(tab.selection.is_none());
+    assert!(tab.annotation_pages.is_empty());
+    assert!(tab.search.pages.is_empty());
+    assert_ne!(tab.search.generation, old_search_generation);
+    assert_ne!(tab.view.generation, old_view_generation);
+    assert_ne!(tab.thumbnail_generation, old_thumbnail_generation);
+    assert_ne!(tab.highlight_index.generation, old_highlight_generation);
+    assert!(
+        tab.highlight_index
+            .pages
+            .values()
+            .flatten()
+            .all(|annotation| annotation.contents != "old highlight")
+    );
+    assert!(!tab.external_resume_in_flight);
+    assert!(tab.external_candidate.is_none());
+}
+
+#[test]
 fn saved_as_completion_keeps_edit_copy_and_external_source_reachable() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("saved-as-source.pdf");
@@ -344,26 +529,46 @@ fn saved_as_completion_keeps_edit_copy_and_external_source_reachable() {
         SessionStore::new(directory.path().join("session.json")),
     );
     finish_async_document_open(&mut app);
-    app.documents[0].save_as = SaveAsState::Saving(SaveAsRequest {
-        path: copy.clone(),
-        expected_destination: None,
-    });
-    assert!(app.documents[0].send(DocumentCommand::SaveAs {
-        path: copy.clone(),
-        expected_destination: None,
-    }));
+    let external_version = create_dirty_external_conflict(&mut app, &source);
+    app.begin_conflicted_document_save_as(0, Some(copy.clone()));
+    assert!(matches!(
+        app.documents[0].save_as,
+        SaveAsState::Saving(SaveAsRequest { .. })
+    ));
 
     let context = egui::Context::default();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while app.documents.len() < 2 && std::time::Instant::now() < deadline {
+    while (app.documents.len() < 2
+        || app.documents[0].reload_in_flight
+        || app
+            .documents
+            .iter()
+            .any(|document| document.state == DocumentState::Opening))
+        && std::time::Instant::now() < deadline
+    {
         app.receive_document_events(&context);
-        if app.documents.len() < 2 {
+        if app.documents.len() < 2
+            || app.documents[0].reload_in_flight
+            || app
+                .documents
+                .iter()
+                .any(|document| document.state == DocumentState::Opening)
+        {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
     assert_eq!(app.documents.len(), 2);
     assert_eq!(app.tabs.tabs()[0].path(), source.as_path());
     assert_eq!(app.tabs.tabs()[1].path(), copy.as_path());
+    assert_eq!(app.documents[0].state, DocumentState::ReadyClean);
+    assert_eq!(
+        app.documents[0].info.as_ref().unwrap().version,
+        external_version
+    );
+    assert_eq!(app.documents[0].info.as_ref().unwrap().highlight_count, 0);
+    assert_eq!(app.documents[1].state, DocumentState::ReadyClean);
+    assert_eq!(app.documents[1].info.as_ref().unwrap().highlight_count, 1);
+    assert!(app.documents[0].external_conflict.is_none());
     assert!(matches!(app.documents[0].save_as, SaveAsState::Idle));
 }
 
@@ -373,17 +578,103 @@ fn cancelled_conflicted_save_as_leaves_state_untouched_without_a_command() {
     let source = directory.path().join("cancel-save-as.pdf");
     write_blank_pdf(&source);
     let mut app = PrototypeApp::from_startup(
-        vec![source],
+        vec![source.clone()],
         SessionStore::new(directory.path().join("session.json")),
     );
-    let pending_edits = app.documents[0].pending_edits;
+    finish_async_document_open(&mut app);
+    let external_version = create_dirty_external_conflict(&mut app, &source);
+    let document_id = app.documents[0].document_id;
+    let annotation = AnnotationSummary {
+        id: AnnotationId {
+            page_index: 0,
+            xref: 1,
+        },
+        kind: AnnotationKind::Highlight,
+        contents: "original editor text".to_owned(),
+        color: None,
+        can_edit_contents: true,
+        can_edit_color: true,
+        can_delete: true,
+    };
+    let mut editor = AnnotationEditorState::from_summary(
+        document_id,
+        app.documents[0].info.as_ref().unwrap().revision,
+        &annotation,
+    );
+    editor.buffer.contents = "editor draft".to_owned();
+    app.annotation_editor = Some(editor);
+    let conflict = app.documents[0].external_conflict;
+    let edit_count = app.documents[0].edit_history.len();
+    let source_info_version = app.documents[0].info.as_ref().unwrap().version;
 
     app.begin_conflicted_document_save_as(0, None);
 
     assert!(matches!(app.documents[0].save_as, SaveAsState::Idle));
     assert!(!app.documents[0].save_in_flight);
-    assert_eq!(app.documents[0].pending_edits, pending_edits);
+    assert_eq!(app.documents.len(), 1);
+    assert_eq!(app.documents[0].state, DocumentState::ReadyDirty);
+    assert_eq!(app.documents[0].edit_history.len(), edit_count);
+    assert_eq!(
+        app.documents[0].info.as_ref().unwrap().version,
+        source_info_version
+    );
+    assert_eq!(app.documents[0].external_conflict, conflict);
+    assert_eq!(
+        conflict,
+        Some(ExternalConflict {
+            version: external_version
+        })
+    );
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .map(|editor| editor.buffer.contents.as_str()),
+        Some("editor draft")
+    );
     assert!(app.documents[0].error.is_none());
+}
+
+#[test]
+fn reload_in_flight_close_does_not_mix_delayed_event_into_remaining_tab() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("reload-close-first.pdf");
+    let second = directory.path().join("reload-close-second.pdf");
+    write_blank_pdf(&first);
+    write_blank_pdf(&second);
+    let mut app = PrototypeApp::from_startup(
+        vec![first.clone(), second.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_opens(&mut app);
+    let remaining_id = app.documents[1].document_id;
+    let remaining_version = app.documents[1].info.as_ref().unwrap().version;
+    overwrite_with_blank_pdf(
+        &first,
+        &directory.path().join("reload-close-replacement.pdf"),
+    );
+
+    for _ in 0..2 {
+        app.last_external_check = Instant::now() - Duration::from_secs(1);
+        app.check_external_changes();
+    }
+    assert!(app.documents[0].reload_in_flight);
+    app.close_tab(0);
+    assert_eq!(app.documents.len(), 1);
+    assert_eq!(app.documents[0].document_id, remaining_id);
+    assert_eq!(app.tabs.tabs()[0].path(), second.as_path());
+
+    let context = egui::Context::default();
+    for _ in 0..3 {
+        app.receive_document_events(&context);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(app.documents.len(), 1);
+    assert_eq!(app.documents[0].document_id, remaining_id);
+    assert_eq!(
+        app.documents[0].info.as_ref().unwrap().version,
+        remaining_version
+    );
+    assert!(!app.documents[0].reload_in_flight);
 }
 
 #[test]
@@ -420,6 +711,121 @@ fn reload_in_flight_disables_annotation_editor_mutation_input() {
         },
     );
     assert_eq!(editor.buffer.contents, "before");
+}
+
+#[test]
+fn reload_send_disables_annotation_editor_in_the_production_overlay_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reload-editor-production.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let document_id = app.documents[0].document_id;
+    let revision = app.documents[0].info.as_ref().unwrap().revision;
+    let annotation = AnnotationSummary {
+        id: AnnotationId {
+            page_index: 0,
+            xref: 1,
+        },
+        kind: AnnotationKind::Highlight,
+        contents: "before".to_owned(),
+        color: None,
+        can_edit_contents: true,
+        can_edit_color: true,
+        can_delete: true,
+    };
+    app.annotation_editor = Some(AnnotationEditorState::from_summary(
+        document_id,
+        revision,
+        &annotation,
+    ));
+    overwrite_with_blank_pdf(
+        &path,
+        &directory.path().join("reload-editor-replacement.pdf"),
+    );
+
+    for _ in 0..2 {
+        app.last_external_check = Instant::now() - Duration::from_secs(1);
+        app.check_external_changes();
+    }
+    assert!(app.documents[0].reload_in_flight);
+
+    let context = egui::Context::default();
+    let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+    context.memory_mut(|memory| {
+        memory.request_focus(annotation_comment_id(document_id, annotation.id));
+    });
+    let _ = context.run_ui(
+        egui::RawInput {
+            events: vec![egui::Event::Text("changed".to_owned())],
+            ..Default::default()
+        },
+        |ui| app.annotation_editor_overlay(ui.ctx(), bounds),
+    );
+
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .map(|editor| editor.buffer.contents.as_str()),
+        Some("before")
+    );
+    assert!(app.documents[0].reload_in_flight);
+}
+
+#[test]
+fn custom_color_draft_blocks_reload_and_enters_external_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("custom-color-conflict.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let expected = app.documents[0].info.as_ref().unwrap().version;
+    std::fs::write(&path, b"%PDF-1.7\n% external overwrite\n").unwrap();
+    let current = read_document_version(&path).unwrap();
+    assert!(same_file_identity(current, expected));
+    assert_ne!(current, expected);
+
+    let annotation = AnnotationSummary {
+        id: AnnotationId {
+            page_index: 0,
+            xref: 1,
+        },
+        kind: AnnotationKind::Highlight,
+        contents: String::new(),
+        color: None,
+        can_edit_contents: true,
+        can_edit_color: true,
+        can_delete: true,
+    };
+    let document_id = app.documents[0].document_id;
+    let mut editor = AnnotationEditorState::from_summary(document_id, 0, &annotation);
+    editor.custom_color_draft = Some([10, 20, 30]);
+    assert!(editor.is_dirty());
+    app.annotation_editor = Some(editor);
+
+    app.last_external_check = Instant::now() - Duration::from_secs(1);
+    app.check_external_changes();
+    app.last_external_check = Instant::now() - Duration::from_secs(1);
+    app.check_external_changes();
+
+    assert!(!app.documents[0].reload_in_flight);
+    assert_eq!(
+        app.documents[0].external_conflict,
+        Some(ExternalConflict { version: current })
+    );
+    assert_eq!(app.documents[0].external_candidate, Some((current, 2)));
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .and_then(|editor| editor.custom_color_draft),
+        Some([10, 20, 30])
+    );
 }
 
 #[test]

@@ -12,6 +12,7 @@ impl PrototypeApp {
             {
                 match event {
                     Ok(DocumentEvent::Opened(info)) => {
+                        let external_resume = self.documents[index].external_resume_in_flight;
                         let highlight_index_needs_reset =
                             self.documents[index].highlight_index.started
                                 && self.documents[index].highlight_index.revision
@@ -21,9 +22,10 @@ impl PrototypeApp {
                         let restored_open = self.documents[index].restoring_from_session;
                         self.documents[index].restoring_from_session = false;
                         self.status = format!("Opened {}", info.path.display());
-                        self.documents[index]
-                            .view
-                            .clamp_to_page_count(info.page_bounds.len());
+                        if external_resume && self.is_visible_index(index) {
+                            self.documents[index].view.stop_autoscroll();
+                            self.cancel_viewport_for_index(index);
+                        }
                         self.documents[index].state = if info.dirty {
                             DocumentState::ReadyDirty
                         } else {
@@ -35,10 +37,25 @@ impl PrototypeApp {
                         self.documents[index].reload_in_flight = false;
                         self.documents[index].failed_external_version = None;
                         self.documents[index].resume_expected_version = None;
-                        self.documents[index].info = Some(info);
-                        if highlight_index_needs_reset {
-                            self.documents[index].reset_highlight_index(revision, page_count);
+                        let thumbnail_keys = if external_resume {
+                            let tab = &mut self.documents[index];
+                            tab.error = None;
+                            let thumbnail_keys =
+                                tab.prepare_for_external_open(revision, page_count);
+                            tab.info = Some(info);
+                            thumbnail_keys
                         } else {
+                            let tab = &mut self.documents[index];
+                            tab.view.clamp_to_page_count(page_count);
+                            tab.info = Some(info);
+                            Vec::new()
+                        };
+                        for key in thumbnail_keys {
+                            self.thumbnail_lru.remove(&key);
+                        }
+                        if !external_resume && highlight_index_needs_reset {
+                            self.documents[index].reset_highlight_index(revision, page_count);
+                        } else if !external_resume {
                             self.documents[index].reconnect_highlight_index();
                         }
                         if !self.documents[index].outline_requested
