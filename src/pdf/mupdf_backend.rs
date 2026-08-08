@@ -1101,11 +1101,14 @@ impl MuPdfBackend {
             self.incremental_association_lost = true;
         })?;
 
-        let file_name = self
-            .path
-            .to_str()
-            .context("MuPDF cannot reopen a replaced path that is not valid Unicode")?;
-        let reopened = PdfDocument::open(file_name).map_err(|error| {
+        // 保存完了後も通常表示へパス基盤の MuPDF 文書を戻さない。ここで reopen すると
+        // 次の Explorer rename が再び拒否されるため、検証済みの出力をメモリから開き直す。
+        let saved_bytes = fs::read(&self.path).map_err(|error| {
+            anyhow!(
+                "replacement completed but saved PDF could not be read for verification: {error}"
+            )
+        })?;
+        let reopened = PdfDocument::from_bytes(&saved_bytes).map_err(|error| {
             anyhow!(
                 "replacement completed but verification failed: saved PDF could not be reopened: {error}"
             )
@@ -3456,6 +3459,22 @@ mod tests {
         assert!(error.to_string().contains("changed outside LunaPDF"));
         assert!(backend.info().unwrap().dirty);
         assert_eq!(fs::read(path).unwrap(), external_bytes);
+    }
+
+    #[test]
+    fn renamed_document_rebinds_only_the_same_file_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.pdf");
+        let renamed = directory.path().join("renamed.pdf");
+        write_blank_pdf_for_test(&original);
+        let mut backend = MuPdfBackend::open(original.clone()).unwrap();
+        std::fs::rename(&original, &renamed).unwrap();
+
+        backend.rebind_path(renamed.clone()).unwrap();
+        assert_eq!(backend.info().unwrap().path, renamed);
+
+        write_blank_pdf_for_test(&original);
+        assert!(backend.rebind_path(original).is_err());
     }
 
     #[test]

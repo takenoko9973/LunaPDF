@@ -927,7 +927,13 @@ impl PrototypeApp {
         let source = self.tabs.tabs()[index].path();
         let selected = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
-            .set_file_name(source.file_name().unwrap_or(source.as_os_str()))
+            .set_file_name(
+                source
+                    .file_name()
+                    .unwrap_or(source.as_os_str())
+                    .to_string_lossy()
+                    .into_owned(),
+            )
             .save_file();
         let Some(path) = selected else {
             return;

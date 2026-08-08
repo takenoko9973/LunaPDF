@@ -686,6 +686,23 @@ mod tests {
     }
 
     #[test]
+    fn rebind_path_preserves_tab_identity_and_rejects_existing_path() {
+        let mut state = TabState::new();
+        let (directory, ids) = open_files(&mut state, 2);
+        let renamed = directory.path().join("renamed.pdf");
+        std::fs::rename(directory.path().join("0.pdf"), &renamed).unwrap();
+
+        state.rebind_path(0, &renamed).unwrap();
+        assert_eq!(state.tabs()[0].id(), ids[0]);
+        assert_eq!(
+            state.tabs()[0].path(),
+            std::fs::canonicalize(&renamed).unwrap()
+        );
+        let error = state.rebind_path(0, directory.path().join("1.pdf"));
+        assert_eq!(error.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
     fn multiple_split_sets_preserve_one_membership_per_tab() {
         let mut state = TabState::new();
         let (_directory, ids) = open_files(&mut state, 5);
