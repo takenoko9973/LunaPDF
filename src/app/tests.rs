@@ -2490,10 +2490,13 @@ fn startup_restores_shared_order_split_focus_direction_and_ratio() {
 }
 
 #[test]
-fn startup_does_not_restore_tabs_when_session_restore_is_disabled() {
+fn startup_opens_explicit_pdf_without_restoring_when_session_restore_is_disabled() {
     let directory = tempfile::tempdir().unwrap();
     let saved = directory.path().join("saved.pdf");
+    let explicit = directory.path().join("explicit.pdf");
     write_blank_pdf(&saved);
+    write_blank_pdf(&explicit);
+    let explicit = std::fs::canonicalize(explicit).unwrap();
     let state = SessionState {
         restore_enabled: false,
         tabs: vec![saved_tab(std::fs::canonicalize(saved).unwrap(), 0)],
@@ -2505,11 +2508,11 @@ fn startup_does_not_restore_tabs_when_session_restore_is_disabled() {
         .save(&state)
         .unwrap();
 
-    let app = PrototypeApp::from_startup(Vec::new(), SessionStore::new(session_path));
+    let app = PrototypeApp::from_startup(vec![explicit.clone()], SessionStore::new(session_path));
 
     assert!(!app.restore_enabled);
-    assert!(app.documents.is_empty());
-    assert!(app.tabs.tabs().is_empty());
+    assert_eq!(app.documents.len(), 1);
+    assert_eq!(app.tabs.tabs()[0].path(), explicit);
     assert!(app.session_restore_progress.is_none());
 }
 
@@ -2606,7 +2609,7 @@ fn window_close_waits_for_pending_session_restore_before_saving() {
 }
 
 #[test]
-fn explicit_cli_pdf_takes_precedence_over_saved_session() {
+fn startup_restores_saved_session_before_opening_an_explicit_pdf() {
     let directory = tempfile::tempdir().unwrap();
     let saved = directory.path().join("saved.pdf");
     let explicit = directory.path().join("explicit.pdf");
@@ -2615,7 +2618,7 @@ fn explicit_cli_pdf_takes_precedence_over_saved_session() {
     let saved = std::fs::canonicalize(saved).unwrap();
     let explicit = std::fs::canonicalize(explicit).unwrap();
     let state = SessionState {
-        tabs: vec![saved_tab(saved, 0)],
+        tabs: vec![saved_tab(saved.clone(), 0)],
         layout: single_pane_layout(1, 0),
         ..SessionState::default()
     };
@@ -2624,11 +2627,129 @@ fn explicit_cli_pdf_takes_precedence_over_saved_session() {
         .save(&state)
         .unwrap();
 
-    let app = PrototypeApp::from_startup(vec![explicit.clone()], SessionStore::new(session_path));
+    let mut app =
+        PrototypeApp::from_startup(vec![explicit.clone()], SessionStore::new(session_path));
+
+    assert_eq!(app.documents.len(), 2);
+    assert_eq!(app.tabs.tabs()[0].path(), saved);
+    assert_eq!(app.tabs.tabs()[1].path(), explicit);
+    assert_eq!(app.active_index(), Some(1));
+    assert!(app.session_restore_progress.is_some());
+    finish_async_session_restore(&mut app);
+}
+
+#[test]
+fn startup_selects_explicit_pdf_already_restored_without_duplicate_tab() {
+    let directory = tempfile::tempdir().unwrap();
+    let saved = directory.path().join("saved.pdf");
+    write_blank_pdf(&saved);
+    let saved = std::fs::canonicalize(saved).unwrap();
+    let state = SessionState {
+        tabs: vec![saved_tab(saved.clone(), 0)],
+        layout: single_pane_layout(1, 0),
+        ..SessionState::default()
+    };
+    let session_path = directory.path().join("session.json");
+    SessionStore::new(session_path.clone())
+        .save(&state)
+        .unwrap();
+
+    let mut app = PrototypeApp::from_startup(vec![saved], SessionStore::new(session_path));
 
     assert_eq!(app.documents.len(), 1);
-    assert_eq!(app.tabs.tabs()[0].path(), explicit);
-    assert!(app.session_restore_progress.is_none());
+    assert_eq!(app.tabs.tabs().len(), 1);
+    assert_eq!(app.active_index(), Some(0));
+    assert!(app.session_restore_progress.is_some());
+    finish_async_session_restore(&mut app);
+}
+
+#[test]
+fn startup_opens_multiple_explicit_pdfs_after_restoring_saved_session_in_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let saved = directory.path().join("saved.pdf");
+    let first = directory.path().join("first.pdf");
+    let second = directory.path().join("second.pdf");
+    write_blank_pdf(&saved);
+    write_blank_pdf(&first);
+    write_blank_pdf(&second);
+    let saved = std::fs::canonicalize(saved).unwrap();
+    let first = std::fs::canonicalize(first).unwrap();
+    let second = std::fs::canonicalize(second).unwrap();
+    let state = SessionState {
+        tabs: vec![saved_tab(saved.clone(), 0)],
+        layout: single_pane_layout(1, 0),
+        ..SessionState::default()
+    };
+    let session_path = directory.path().join("session.json");
+    SessionStore::new(session_path.clone())
+        .save(&state)
+        .unwrap();
+
+    let mut app = PrototypeApp::from_startup(
+        vec![first.clone(), second.clone()],
+        SessionStore::new(session_path),
+    );
+
+    let paths = app
+        .tabs
+        .tabs()
+        .iter()
+        .map(|tab| tab.path().to_path_buf())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec![saved, first, second]);
+    assert_eq!(app.active_index(), Some(2));
+    finish_async_session_restore(&mut app);
+}
+
+#[test]
+fn startup_pdf_is_added_without_changing_restored_split_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = (0..4)
+        .map(|index| {
+            let path = directory.path().join(format!("split-startup-{index}.pdf"));
+            write_blank_pdf(&path);
+            std::fs::canonicalize(path).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let explicit = directory.path().join("explicit.pdf");
+    write_blank_pdf(&explicit);
+    let explicit = std::fs::canonicalize(explicit).unwrap();
+    let layout = SessionLayout {
+        entries: vec![
+            SessionEntry::Single { tab_index: 2 },
+            SessionEntry::Split {
+                tab_indices: [0, 3],
+                direction: SessionSplitDirection::Vertical,
+                ratio: 0.35,
+                focused_tab: 3,
+            },
+            SessionEntry::Single { tab_index: 1 },
+        ],
+        active_tab: Some(3),
+    };
+    let state = SessionState {
+        tabs: paths
+            .iter()
+            .cloned()
+            .map(|path| saved_tab(path, 0))
+            .collect(),
+        layout: layout.clone(),
+        ..SessionState::default()
+    };
+    let session_path = directory.path().join("session.json");
+    SessionStore::new(session_path.clone())
+        .save(&state)
+        .unwrap();
+
+    let mut app = PrototypeApp::from_startup(vec![explicit], SessionStore::new(session_path));
+
+    let mut expected_layout = layout;
+    expected_layout
+        .entries
+        .insert(2, SessionEntry::Single { tab_index: 4 });
+    expected_layout.active_tab = Some(4);
+    assert_eq!(app.current_session().layout, expected_layout);
+    finish_async_session_restore(&mut app);
 }
 
 #[test]

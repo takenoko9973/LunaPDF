@@ -818,15 +818,12 @@ impl PrototypeApp {
             recent_annotation_colors,
             copy_shortcut_active: false,
         };
-        if paths.is_empty() && restore_enabled {
-            if let Some(session) = saved_session {
-                app.restore_session(session);
-            }
-        } else {
-            // 明示されたコマンドラインファイルをセッション復元より優先する。
-            for path in paths {
-                app.open_document(path);
-            }
+        if restore_enabled && let Some(session) = saved_session {
+            app.restore_session(session);
+        }
+        // 起動引数の PDF は、セッション復元後に通常のユーザーオープン経路へ渡す。
+        for path in paths {
+            app.open_document(path);
         }
         app
     }
