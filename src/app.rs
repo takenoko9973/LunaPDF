@@ -178,6 +178,8 @@ pub(crate) struct PrototypeApp {
     default_apps_state: DefaultAppState,
     #[cfg(windows)]
     default_apps_menu_open: bool,
+    #[cfg(windows)]
+    auto_rotate_print: bool,
     close_confirmation: Option<CloseConfirmation>,
     approved_window_documents: HashSet<PathBuf>,
     allow_window_close: bool,
@@ -804,6 +806,8 @@ impl PrototypeApp {
             default_apps_state: DefaultAppState::Unavailable("まだ照会していません".to_owned()),
             #[cfg(windows)]
             default_apps_menu_open: false,
+            #[cfg(windows)]
+            auto_rotate_print: true,
             close_confirmation: None,
             approved_window_documents: HashSet::new(),
             allow_window_close: false,
@@ -2739,6 +2743,8 @@ impl PrototypeApp {
                         print_requested = true;
                         ui.close();
                     }
+                    #[cfg(windows)]
+                    ui.checkbox(&mut self.auto_rotate_print, "印刷時に用紙の向きを自動回転");
                     ui.separator();
                     if ui
                         .add_enabled(
@@ -3236,10 +3242,11 @@ impl PrototypeApp {
             if !self.can_print() {
                 return;
             }
+            let auto_rotate = self.auto_rotate_print;
             let tab = self
                 .active_tab_mut()
                 .expect("can_print requires an active tab");
-            if tab.send(DocumentCommand::Print) {
+            if tab.send(DocumentCommand::Print { auto_rotate }) {
                 tab.print_in_flight = true;
                 self.status = "印刷ダイアログを準備しています…".to_owned();
             } else {

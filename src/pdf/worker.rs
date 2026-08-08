@@ -48,7 +48,9 @@ pub(crate) enum DocumentCommand {
     },
     LoadThumbnail(ThumbnailRequest),
     #[cfg(windows)]
-    Print,
+    Print {
+        auto_rotate: bool,
+    },
     Save,
     Shutdown,
 }
@@ -532,8 +534,8 @@ fn run_worker(
                 }
             },
             #[cfg(windows)]
-            DocumentCommand::Print => {
-                match crate::pdf::windows_print::print_document(&mut backend) {
+            DocumentCommand::Print { auto_rotate } => {
+                match crate::pdf::windows_print::print_document(&mut backend, auto_rotate) {
                     Ok(crate::pdf::windows_print::PrintOutcome::Completed) => {
                         let _ = event_sender.send(DocumentEvent::PrintCompleted);
                     }

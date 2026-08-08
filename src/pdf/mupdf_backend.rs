@@ -41,6 +41,8 @@ use crate::domain::selection::{
     GlyphSnapshot, NonTextTarget, NonTextTargetKind, PagePoint, PageQuad, SelectionSnapshot,
     TextPageSnapshot, TextSnapshotRequest, selected_display_quads, selected_quads, selected_text,
 };
+#[cfg(any(windows, test))]
+use crate::pdf::print_layout::PdfRotation;
 
 // PDF の数値オブジェクトは増分更新のシリアライズ時に座標を丸めることがある。
 // PDF ポイントの 100 分の 1 は対応するズーム範囲の表示ピクセル精度を下回りつつ、
@@ -76,6 +78,14 @@ struct CachedDisplayList {
     page_index: usize,
     revision: u64,
     list: DisplayList,
+}
+
+#[cfg(windows)]
+pub(super) struct PrintRaster {
+    pub(super) spec: TileSpec,
+    pub(super) page_pixel_width: u32,
+    pub(super) page_pixel_height: u32,
+    pub(super) pixels_rgba: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -362,6 +372,71 @@ impl MuPdfBackend {
             render_time: render_started.elapsed(),
             #[cfg(debug_assertions)]
             physical_memory_bytes: physical_memory_bytes(),
+        }))
+    }
+
+    /// 印刷専用に、ページの表示座標へ追加回転を適用した帯を描画する。
+    ///
+    /// 回転後のページ全体を一度に保持せず、通常のMuPDF display listと同じstale検査を
+    /// 通すことで、印刷専用のラスタ経路でも既存の8 MiB strip契約を維持する。
+    #[cfg(windows)]
+    pub(super) fn render_print_strip(
+        &mut self,
+        page_index: usize,
+        scale: f32,
+        rotation: PdfRotation,
+        spec: TileSpec,
+        expected_revision: u64,
+    ) -> Result<Option<PrintRaster>> {
+        ensure!(
+            scale.is_finite() && scale > 0.0,
+            "print scale must be finite and positive"
+        );
+        ensure!(
+            spec.pixel_width > 0 && spec.pixel_height > 0,
+            "print strip dimensions must be positive"
+        );
+        page_number(page_index, self.page_bounds.len())?;
+        if expected_revision != self.revision {
+            return Ok(None);
+        }
+
+        let bounds = self.page_bounds[page_index];
+        let (transform, page_pixel_bounds) = print_transform(bounds, scale, rotation)?;
+        let clip = tile_clip(page_pixel_bounds, spec)?;
+        let mut pixmap = Pixmap::new_with_rect(&Colorspace::device_rgb(), clip, false)?;
+        pixmap.clear_with(255)?;
+        let device = Device::from_pixmap_with_clip(&pixmap, clip)?;
+        let display_list = self.display_list(page_index)?;
+        display_list.run(&device, &transform, Rect::from(clip))?;
+        drop(device);
+
+        let pixel_width = usize::try_from(pixmap.width())?;
+        let pixel_height = usize::try_from(pixmap.height())?;
+        let component_count = usize::from(pixmap.n());
+        let stride =
+            usize::try_from(pixmap.stride()).context("MuPDF returned a negative pixmap stride")?;
+        let pixels_rgba = pixmap_samples_to_rgba(
+            pixmap.samples(),
+            pixel_width,
+            pixel_height,
+            stride,
+            component_count,
+        )?;
+        let pixel_x = u32::try_from(pixmap.x() - page_pixel_bounds.x0)
+            .context("MuPDF returned a print strip origin before the page")?;
+        let pixel_y = u32::try_from(pixmap.y() - page_pixel_bounds.y0)
+            .context("MuPDF returned a print strip origin before the page")?;
+        Ok(Some(PrintRaster {
+            spec: TileSpec {
+                pixel_x,
+                pixel_y,
+                pixel_width: pixmap.width(),
+                pixel_height: pixmap.height(),
+            },
+            page_pixel_width: u32::try_from(page_pixel_bounds.x1 - page_pixel_bounds.x0)?,
+            page_pixel_height: u32::try_from(page_pixel_bounds.y1 - page_pixel_bounds.y0)?,
+            pixels_rgba,
         }))
     }
 
@@ -1017,6 +1092,48 @@ impl MuPdfBackend {
     }
 }
 
+#[cfg(any(windows, test))]
+fn print_transform(bounds: PageRect, scale: f32, rotation: PdfRotation) -> Result<(Matrix, IRect)> {
+    ensure!(
+        bounds.width().is_finite()
+            && bounds.height().is_finite()
+            && bounds.width() > 0.0
+            && bounds.height() > 0.0,
+        "print page bounds must be finite and positive"
+    );
+    let transform = match rotation {
+        PdfRotation::None => Matrix::new_scale(scale, scale),
+        // MuPDFの表示座標は左上原点・Y下向きなので、正角度を時計回りとして扱う。
+        // 平行移動は回転後の最小座標を0へ戻し、PrintLayoutの帯座標と一致させる。
+        PdfRotation::Clockwise90 => Matrix::new(
+            0.0,
+            scale,
+            -scale,
+            0.0,
+            bounds.y1 * scale,
+            -bounds.x0 * scale,
+        ),
+        PdfRotation::Clockwise270 => Matrix::new(
+            0.0,
+            -scale,
+            scale,
+            0.0,
+            -bounds.y0 * scale,
+            bounds.x1 * scale,
+        ),
+    };
+    let page_pixel_bounds = Rect::new(bounds.x0, bounds.y0, bounds.x1, bounds.y1)
+        .transform(&transform)
+        .round();
+    ensure!(
+        page_pixel_bounds.x0 <= page_pixel_bounds.x1
+            && page_pixel_bounds.y0 <= page_pixel_bounds.y1
+            && !page_pixel_bounds.is_empty(),
+        "MuPDF returned an empty rotated print page"
+    );
+    Ok((transform, page_pixel_bounds))
+}
+
 fn ensure_current_version(path: &Path, expected: DocumentVersion) -> Result<()> {
     let current_version = read_document_version(path)?;
     ensure!(
@@ -1297,6 +1414,9 @@ fn load_page_bounds(document: &PdfDocument) -> Result<Vec<PageRect>> {
     let mut page_bounds = Vec::with_capacity(page_count);
     for page_index in 0..page_count {
         let page = document.load_pdf_page(page_number(page_index, page_count)?)?;
+        // MuPDF の Page::bounds は PDF の継承可能な /Rotate (0/90/180/270) を反映する。
+        // したがって印刷候補の追加回転は、この最終表示寸法に対する0/90/270だけでよく、
+        // intrinsic Rotate=180 を追加候補として二重に適用してはならない。
         let bounds = page.bounds()?;
         page_bounds.push(PageRect {
             x0: bounds.x0,
@@ -1788,6 +1908,95 @@ mod tests {
             spec,
             priority: crate::domain::document::RenderPriority::Visible,
         }
+    }
+
+    #[test]
+    fn print_transform_keeps_nonzero_page_corners_and_contiguous_strips() {
+        let bounds = PageRect {
+            x0: 10.25,
+            y0: 20.25,
+            x1: 110.75,
+            y1: 220.75,
+        };
+        let printable_area = crate::pdf::print_layout::PrintableArea {
+            width: 800,
+            height: 1_000,
+        };
+        let corners = [
+            Point::new(bounds.x0, bounds.y0),
+            Point::new(bounds.x1, bounds.y0),
+            Point::new(bounds.x0, bounds.y1),
+            Point::new(bounds.x1, bounds.y1),
+        ];
+
+        for rotation in [
+            PdfRotation::None,
+            PdfRotation::Clockwise90,
+            PdfRotation::Clockwise270,
+        ] {
+            let (transform, pixel_bounds) = print_transform(bounds, 2.0, rotation).unwrap();
+            let transformed_bounds = Rect::new(bounds.x0, bounds.y0, bounds.x1, bounds.y1)
+                .transform(&transform)
+                .round();
+            assert_eq!(transformed_bounds, pixel_bounds);
+            for corner in corners {
+                let transformed = corner.transform(&transform);
+                let x = transformed.x.round() as i32;
+                let y = transformed.y.round() as i32;
+                assert!(
+                    (pixel_bounds.x0..=pixel_bounds.x1).contains(&x)
+                        && (pixel_bounds.y0..=pixel_bounds.y1).contains(&y),
+                    "corner {transformed:?} escaped {pixel_bounds:?} for {rotation:?}"
+                );
+            }
+
+            let layout = crate::pdf::print_layout::PrintLayout::fit_rotated(
+                bounds,
+                rotation,
+                printable_area,
+            )
+            .unwrap();
+            assert!(layout.pixel_width <= printable_area.width);
+            assert!(layout.pixel_height <= printable_area.height);
+            let strips = layout.strips(16 * 1_024).unwrap();
+            assert_eq!(strips.first().unwrap().pixel_y, 0);
+            for pair in strips.windows(2) {
+                assert_eq!(
+                    pair[0].pixel_y + pair[0].pixel_height,
+                    pair[1].pixel_y,
+                    "print strips must be adjacent for {rotation:?}"
+                );
+            }
+            assert_eq!(
+                strips.last().unwrap().pixel_y + strips.last().unwrap().pixel_height,
+                layout.pixel_height
+            );
+        }
+    }
+
+    #[test]
+    fn page_bounds_include_intrinsic_pdf_rotate_0_90_180_270() {
+        let mut document = PdfDocument::new();
+        for rotation in [0, 90, 180, 270] {
+            let mut page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+            page.set_rotation(rotation).unwrap();
+            page.update().unwrap();
+        }
+
+        let page_bounds = load_page_bounds(&document).unwrap();
+        let dimensions = page_bounds
+            .iter()
+            .map(|bounds| (bounds.width(), bounds.height()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dimensions,
+            vec![
+                (300.0, 400.0),
+                (400.0, 300.0),
+                (300.0, 400.0),
+                (400.0, 300.0)
+            ]
+        );
     }
 
     #[test]
