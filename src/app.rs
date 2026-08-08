@@ -1214,6 +1214,17 @@ impl PrototypeApp {
             expected_destination,
         };
         let document_id = self.documents[index].document_id;
+        if let Some(editor) = self.annotation_editor.as_mut().filter(|editor| {
+            editor.document_id == document_id && editor.custom_color_draft.is_some()
+        }) {
+            // 色の下書きは PDF へ送れる更新ではないため、WaitingEditorCommit に置くと
+            // 「戻る」だけでは保留を解消できず、別名保存とタブ終了を永久に塞いでしまう。
+            editor.notice = Some(
+                "カスタム色を「適用」または「戻る」で確定してから、もう一度別名保存を選択してください。"
+                    .to_owned(),
+            );
+            return;
+        }
         if self.annotation_editor.as_ref().is_some_and(|editor| {
             editor.document_id == document_id && (editor.is_dirty() || editor.mutation_in_flight)
         }) {

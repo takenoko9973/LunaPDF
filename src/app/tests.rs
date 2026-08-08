@@ -829,6 +829,126 @@ fn custom_color_draft_blocks_reload_and_enters_external_conflict() {
 }
 
 #[test]
+fn custom_color_draft_save_as_stays_idle_and_cancel_allows_tab_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("custom-color-save-as-source.pdf");
+    let copy = directory.path().join("custom-color-save-as-copy.pdf");
+    write_blank_pdf(&source);
+    let mut app = PrototypeApp::from_startup(
+        vec![source],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let document_id = app.documents[0].document_id;
+    let annotation = AnnotationSummary {
+        id: AnnotationId {
+            page_index: 0,
+            xref: 1,
+        },
+        kind: AnnotationKind::Highlight,
+        contents: String::new(),
+        color: None,
+        can_edit_contents: true,
+        can_edit_color: true,
+        can_delete: true,
+    };
+    let mut editor = AnnotationEditorState::from_summary(
+        document_id,
+        app.documents[0].info.as_ref().unwrap().revision,
+        &annotation,
+    );
+    editor.custom_color_draft = Some([10, 20, 30]);
+    app.annotation_editor = Some(editor);
+
+    app.begin_conflicted_document_save_as(0, Some(copy.clone()));
+
+    assert!(matches!(app.documents[0].save_as, SaveAsState::Idle));
+    assert_eq!(app.documents[0].pending_edits, 0);
+    assert!(!copy.exists());
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .and_then(|editor| editor.custom_color_draft),
+        Some([10, 20, 30])
+    );
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .and_then(|editor| editor.notice.as_deref()),
+        Some(
+            "カスタム色を「適用」または「戻る」で確定してから、もう一度別名保存を選択してください。"
+        )
+    );
+
+    app.close_tab(0);
+    assert_eq!(app.documents.len(), 1);
+    app.annotation_editor.as_mut().unwrap().custom_color_draft = None;
+    app.close_tab(0);
+    assert!(app.documents.is_empty());
+}
+
+#[test]
+fn buffer_and_custom_color_draft_never_auto_commits_or_continues_save_as() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("buffer-color-save-as-source.pdf");
+    let copy = directory.path().join("buffer-color-save-as-copy.pdf");
+    write_blank_pdf(&source);
+    let mut app = PrototypeApp::from_startup(
+        vec![source],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let document_id = app.documents[0].document_id;
+    let annotation = AnnotationSummary {
+        id: AnnotationId {
+            page_index: 0,
+            xref: 1,
+        },
+        kind: AnnotationKind::Highlight,
+        contents: "before".to_owned(),
+        color: None,
+        can_edit_contents: true,
+        can_edit_color: true,
+        can_delete: true,
+    };
+    let mut editor = AnnotationEditorState::from_summary(
+        document_id,
+        app.documents[0].info.as_ref().unwrap().revision,
+        &annotation,
+    );
+    editor.buffer.contents = "buffer draft".to_owned();
+    editor.custom_color_draft = Some([10, 20, 30]);
+    app.annotation_editor = Some(editor);
+
+    app.request_annotation_update(0);
+    assert_eq!(app.documents[0].pending_edits, 0);
+    app.begin_conflicted_document_save_as(0, Some(copy.clone()));
+    assert!(matches!(app.documents[0].save_as, SaveAsState::Idle));
+    assert_eq!(app.documents[0].pending_edits, 0);
+    assert!(!copy.exists());
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .map(|editor| editor.buffer.contents.as_str()),
+        Some("buffer draft")
+    );
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .and_then(|editor| editor.custom_color_draft),
+        Some([10, 20, 30])
+    );
+
+    app.annotation_editor.as_mut().unwrap().custom_color_draft = None;
+    app.begin_conflicted_document_save_as(0, Some(copy));
+    assert!(matches!(
+        app.documents[0].save_as,
+        SaveAsState::WaitingEditorCommit(_)
+    ));
+    assert_eq!(app.documents[0].pending_edits, 1);
+}
+
+#[test]
 fn consecutive_versions_reset_stability_to_the_latest_candidate() {
     let first = DocumentVersion {
         identity_primary: 1,

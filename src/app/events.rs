@@ -298,7 +298,26 @@ impl PrototypeApp {
                         }
                         if let SaveAsState::WaitingEditorCommit(request) = &tab.save_as {
                             let request = request.clone();
-                            if tab.send(DocumentCommand::SaveAs {
+                            let custom_color_draft =
+                                self.annotation_editor.as_ref().is_some_and(|editor| {
+                                    editor.document_id == tab.document_id
+                                        && editor.custom_color_draft.is_some()
+                                });
+                            if custom_color_draft {
+                                // 下書きは注釈更新に含まれないため、ここから別名保存へ
+                                // 自動継続すると未適用色だけが黙って失われる。
+                                tab.save_as = SaveAsState::Idle;
+                                if let Some(editor) = self
+                                    .annotation_editor
+                                    .as_mut()
+                                    .filter(|editor| editor.document_id == tab.document_id)
+                                {
+                                    editor.notice = Some(
+                                        "カスタム色を「適用」または「戻る」で確定してから、もう一度別名保存を選択してください。"
+                                            .to_owned(),
+                                    );
+                                }
+                            } else if tab.send(DocumentCommand::SaveAs {
                                 path: request.path.clone(),
                                 expected_destination: request.expected_destination,
                             }) {

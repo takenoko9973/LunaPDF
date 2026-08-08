@@ -162,6 +162,7 @@ impl AnnotationEditorState {
         // 場合にだけ保存する。変更を1つ黙って破棄することは禁止する。
         !self.stale
             && !self.mutation_in_flight
+            && self.custom_color_draft.is_none()
             && self.buffer_is_dirty()
             && contents_allowed
             && color_allowed
