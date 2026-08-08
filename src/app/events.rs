@@ -31,8 +31,10 @@ impl PrototypeApp {
                         };
                         self.documents[index].error = None;
                         self.documents[index].external_candidate = None;
-                        self.documents[index].external_conflict_reported = false;
+                        self.documents[index].external_conflict = None;
                         self.documents[index].reload_in_flight = false;
+                        self.documents[index].failed_external_version = None;
+                        self.documents[index].resume_expected_version = None;
                         self.documents[index].info = Some(info);
                         if highlight_index_needs_reset {
                             self.documents[index].reset_highlight_index(revision, page_count);
@@ -66,7 +68,8 @@ impl PrototypeApp {
                         let page_count = info.page_bounds.len();
                         let saved_path = (!info.dirty).then(|| info.path.clone());
                         let document_id = self.documents[index].document_id;
-                        if !info.dirty
+                        if !external_reload
+                            && !info.dirty
                             && self
                                 .annotation_editor
                                 .as_ref()
@@ -83,22 +86,19 @@ impl PrototypeApp {
                             && !self.documents[index].search.query.trim().is_empty();
                         let tab = &mut self.documents[index];
                         if external_reload {
-                            tab.external_candidate = None;
-                            tab.external_conflict_reported = false;
-                            tab.reload_in_flight = false;
-                            tab.failed_external_version = None;
-                            tab.outline = None;
-                            tab.outline_requested = false;
-                            tab.clear_selection();
-                            tab.search.generation = tab.search.generation.wrapping_add(1);
-                            tab.search.pages.clear();
-                            tab.search.selected = None;
-                            tab.search.completed_pages = 0;
-                            tab.search.truncated = false;
-                            tab.search.in_progress = false;
-                            tab.view.clamp_to_page_count(page_count);
+                            // 失敗後の再試行が成功した時点で、旧版に対するエラーだけを
+                            // 残さない。DocumentChanged は完全検証済み版の通知である。
+                            tab.error = None;
+                            tab.prepare_for_external_reload(page_count);
                         }
                         tab.pending_rebind_path = None;
+                        if !external_reload && !info.dirty {
+                            // 自身の保存はCASを通過した版だけを返すため、直前の外部候補を
+                            // 外部競合として残さず、このversionへ同期する。
+                            tab.external_candidate = None;
+                            tab.external_conflict = None;
+                            tab.failed_external_version = None;
+                        }
                         let changed_highlight_page = tab.pending_highlight_refresh_page.take();
                         if info.dirty {
                             tab.state = state_after_document_info(tab.state, true);
@@ -143,13 +143,14 @@ impl PrototypeApp {
                     }
                     Ok(DocumentEvent::PathRebound { path, info }) => {
                         self.documents[index].info = Some(info);
-                        self.documents[index].external_candidate = None;
                         self.documents[index].pending_rebind_path = None;
                         self.status = format!("PDF の名前変更を追跡しました: {}", path.display());
                     }
                     Ok(DocumentEvent::SavedAs(path)) => {
-                        if !matches!(self.documents[index].save_as, SaveAsState::Saving(ref expected) if expected == &path)
-                        {
+                        if !matches!(
+                            &self.documents[index].save_as,
+                            SaveAsState::Saving(request) if request.path == path
+                        ) {
                             continue;
                         }
                         self.documents[index].save_as = SaveAsState::Idle;
@@ -162,6 +163,10 @@ impl PrototypeApp {
                         if self.documents[index].reload_in_flight {
                             self.status =
                                 "編集版を保存しました。外部版を再読み込みしています…".to_owned();
+                        } else {
+                            self.status =
+                                "編集版を保存しました。外部版の再読み込みを開始できませんでした。"
+                                    .to_owned();
                         }
                     }
                     Ok(DocumentEvent::TileRendered(mut tile)) => {
@@ -274,10 +279,13 @@ impl PrototypeApp {
                         }) {
                             self.annotation_editor = None;
                         }
-                        if let SaveAsState::WaitingEditorCommit(path) = &tab.save_as {
-                            let path = path.clone();
-                            if tab.send(DocumentCommand::SaveAs(path.clone())) {
-                                tab.save_as = SaveAsState::Saving(path);
+                        if let SaveAsState::WaitingEditorCommit(request) = &tab.save_as {
+                            let request = request.clone();
+                            if tab.send(DocumentCommand::SaveAs {
+                                path: request.path.clone(),
+                                expected_destination: request.expected_destination,
+                            }) {
+                                tab.save_as = SaveAsState::Saving(request);
                                 self.status =
                                     "未確定の注釈を反映し、編集版を別名保存しています…".to_owned();
                             } else {
@@ -510,14 +518,26 @@ impl PrototypeApp {
                     }
                     Ok(DocumentEvent::Status(status)) => {
                         self.status = status;
-                        self.documents[index].error = None;
                     }
                     Ok(DocumentEvent::Failed { operation, message }) => {
                         if self.is_visible_index(index) {
                             self.documents[index].view.stop_autoscroll();
                             self.cancel_viewport_for_index(index);
                         }
-                        if operation == "open" && self.documents[index].restoring_from_session {
+                        if operation == "open"
+                            && self.documents[index].resume_expected_version.is_some()
+                        {
+                            let tab = &mut self.documents[index];
+                            tab.state = DocumentState::Suspended;
+                            tab.failed_external_version = tab
+                                .resume_expected_version
+                                .or_else(|| tab.external_candidate.map(|(version, _)| version));
+                            // オープン失敗後のワーカーを残すと、直後の切断イベントで
+                            // Suspended を Error に上書きしてしまう。
+                            tab.service = None;
+                        } else if operation == "open"
+                            && self.documents[index].restoring_from_session
+                        {
                             // イベントキューを走査中はタブ配列をずらせない。現在の全インデックスを
                             // 調べ終えてから、復元に失敗したタブを削除する。
                             let path = self.tabs.tabs()[index].path().to_path_buf();
@@ -558,6 +578,12 @@ impl PrototypeApp {
                                         .to_owned(),
                                 );
                             }
+                            if matches!(
+                                self.documents[index].save_as,
+                                SaveAsState::WaitingEditorCommit(_)
+                            ) {
+                                self.documents[index].save_as = SaveAsState::Idle;
+                            }
                         }
                         if operation == "search" {
                             // ページエラーは通常、キューに入った全ページで繰り返される。
@@ -591,8 +617,15 @@ impl PrototypeApp {
                             {
                                 let _ = self.tabs.replace_path(index, previous);
                             }
-                        } else if operation == "open"
-                            || operation == "resume"
+                        } else if operation == "resume" {
+                            let tab = &mut self.documents[index];
+                            tab.state = DocumentState::Suspended;
+                            tab.failed_external_version = tab
+                                .resume_expected_version
+                                .or_else(|| tab.external_candidate.map(|(version, _)| version));
+                            tab.service = None;
+                        } else if (operation == "open"
+                            && self.documents[index].resume_expected_version.is_none())
                             || operation == "document-info"
                         {
                             self.documents[index].state = DocumentState::Error;
@@ -611,6 +644,9 @@ impl PrototypeApp {
                         }
                         let failed_path = self.tabs.tabs()[index].path().to_path_buf();
                         let document_id = self.documents[index].document_id;
+                        if let Some(previous) = self.documents[index].pending_rebind_path.take() {
+                            let _ = self.tabs.replace_path(index, previous);
+                        }
                         self.documents[index].mark_worker_disconnected();
                         if let Some(editor) = self
                             .annotation_editor

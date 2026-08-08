@@ -157,16 +157,30 @@ impl MuPdfBackend {
     }
 
     /// 同一 file identity を保った名前変更だけを新しい保存先へ反映する。
-    pub(super) fn rebind_path(&mut self, path: PathBuf) -> Result<()> {
+    pub(super) fn rebind_path(&mut self, path: PathBuf) -> Result<DocumentInfo> {
+        let previous_path = self.path.clone();
+        let previous_version = self.version;
         let version = read_document_version(&path)?;
         ensure!(
-            version.identity_primary == self.version.identity_primary
-                && version.identity_secondary == self.version.identity_secondary,
+            version.identity_primary == previous_version.identity_primary
+                && version.identity_secondary == previous_version.identity_secondary,
             "the renamed path does not identify the open PDF"
         );
         self.path = path;
-        self.version = version;
-        Ok(())
+        // rename と同時に内容が再生成された場合は、パスだけを先に追従させる。
+        // ここで新しいメタデータを確定すると、UIが安定性を確認する前に旧表示を
+        // 新版として扱ってしまうため、同じversionの場合だけ更新する。
+        if version == previous_version {
+            self.version = version;
+        }
+        match self.info() {
+            Ok(info) => Ok(info),
+            Err(error) => {
+                self.path = previous_path;
+                self.version = previous_version;
+                Err(error.context("failed to build document info after path rebind"))
+            }
+        }
     }
 
     /// 外部更新を完全に検証してから入れ替える。失敗時は呼び出し側の表示を維持する。
@@ -179,29 +193,76 @@ impl MuPdfBackend {
     }
 
     /// Save As は現在の関連付け先を変更せず、編集中の版だけを新規ファイルへ書き出す。
-    pub(super) fn save_as(&self, path: &Path) -> Result<()> {
+    pub(super) fn save_as(
+        &self,
+        path: &Path,
+        expected_destination: Option<DocumentVersion>,
+    ) -> Result<()> {
         ensure!(
             path != self.path,
             "Save As destination must differ from the source PDF"
         );
-        let name = path
+        let source_version = read_document_version(&self.path)?;
+        let destination_version = read_optional_document_version(path)?;
+        ensure!(
+            !same_file_identity(destination_version, source_version),
+            "Save As destination identifies the source PDF"
+        );
+        ensure!(
+            destination_version == expected_destination,
+            "Save As destination changed before writing"
+        );
+        let parent = path
+            .parent()
+            .context("Save As destination has no parent directory")?;
+        let named_temp = TempFileBuilder::new()
+            .prefix(".lunapdf-save-as-")
+            .suffix(".pdf")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary Save As PDF in {}",
+                    parent.display()
+                )
+            })?;
+        let temp_path = named_temp.into_temp_path();
+        let name = temp_path
             .to_str()
             .context("MuPDF cannot save a path that is not valid Unicode")?;
         let mut options = PdfWriteOptions::default();
         options
             .set_incremental(false)
             .set_encryption(Encryption::Keep);
-        self.document
+        if let Err(error) = self
+            .document
             .save_with_options(name, options)
-            .with_context(|| format!("failed to save PDF copy: {}", path.display()))?;
-        let saved = PdfDocument::open(name).context("saved PDF copy could not be reopened")?;
-        verify_saved_document(
+            .with_context(|| format!("failed to save PDF copy: {}", path.display()))
+        {
+            return Err(cleanup_temp_after_error(temp_path, error));
+        }
+        if let Err(error) = sync_file(&temp_path) {
+            return Err(cleanup_temp_after_error(temp_path, error));
+        }
+        let saved = match PdfDocument::open(name).context("saved PDF copy could not be reopened") {
+            Ok(saved) => saved,
+            Err(error) => return Err(cleanup_temp_after_error(temp_path, error)),
+        };
+        if let Err(error) = verify_saved_document(
             &saved,
             self.page_bounds.len(),
             highlight_count(&self.document)?,
             &self.pending_edits,
-        )?;
-        Ok(())
+        ) {
+            return Err(cleanup_temp_after_error(temp_path, error));
+        }
+        drop(saved);
+
+        // パスを再確認してからinstallする。取得時に存在しなかった保存先を第三者が
+        // 作成した場合も、既存ファイルの上書きと同じく拒否する。
+        if let Err(error) = ensure_destination_version(path, expected_destination) {
+            return Err(cleanup_temp_after_error(temp_path, error));
+        }
+        install_save_as_temp(temp_path, path, expected_destination.is_some())
     }
 
     pub(super) fn info(&self) -> Result<DocumentInfo> {
@@ -1195,6 +1256,34 @@ fn ensure_current_version(path: &Path, expected: DocumentVersion) -> Result<()> 
     Ok(())
 }
 
+fn read_optional_document_version(path: &Path) -> Result<Option<DocumentVersion>> {
+    match fs::metadata(path) {
+        Ok(_) => read_document_version(path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect Save As destination: {}", path.display())),
+    }
+}
+
+fn same_file_identity(left: Option<DocumentVersion>, right: DocumentVersion) -> bool {
+    left.is_some_and(|version| {
+        version.identity_primary == right.identity_primary
+            && version.identity_secondary == right.identity_secondary
+    })
+}
+
+fn ensure_destination_version(
+    path: &Path,
+    expected_destination: Option<DocumentVersion>,
+) -> Result<()> {
+    let actual = read_optional_document_version(path)?;
+    ensure!(
+        actual == expected_destination,
+        "Save As destination changed before atomic install"
+    );
+    Ok(())
+}
+
 /// このワーカーが開いたバージョンと元ファイルが一致している間だけ置換する。
 ///
 /// 比較によって `rename` をファイルシステムの比較交換にはできないが、`persist` の
@@ -1241,6 +1330,45 @@ fn replace_temp_file(temp_path: TempPath, destination: &Path) -> Result<()> {
                 destination.display()
             ),
         ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn install_save_as_temp(
+    temp_path: TempPath,
+    destination: &Path,
+    _replace_existing: bool,
+) -> Result<()> {
+    replace_temp_file(temp_path, destination)
+}
+
+#[cfg(windows)]
+fn install_save_as_temp(
+    temp_path: TempPath,
+    destination: &Path,
+    replace_existing: bool,
+) -> Result<()> {
+    if replace_existing {
+        return replace_temp_file(temp_path, destination);
+    }
+    let replacement = match temp_path.keep() {
+        Ok(path) => path,
+        Err(tempfile::PathPersistError { error, path }) => {
+            return Err(cleanup_temp_after_error(
+                path,
+                anyhow!("failed to prepare temporary PDF for Save As: {error}"),
+            ));
+        }
+    };
+    if let Err(error) = fs::rename(&replacement, destination) {
+        return cleanup_kept_temp_after_error(
+            &replacement,
+            anyhow!(
+                "failed to create Save As destination {}: {error}",
+                destination.display()
+            ),
+        );
     }
     Ok(())
 }
@@ -3475,6 +3603,166 @@ mod tests {
 
         write_blank_pdf_for_test(&original);
         assert!(backend.rebind_path(original).is_err());
+    }
+
+    #[test]
+    fn rename_with_content_change_rebinds_path_without_falsifying_old_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("rename-content-original.pdf");
+        let renamed = directory.path().join("rename-content-renamed.pdf");
+        write_blank_pdf_for_test(&original);
+        let mut backend = MuPdfBackend::open(original).unwrap();
+        let old_version = backend.info().unwrap().version;
+        fs::rename(
+            directory.path().join("rename-content-original.pdf"),
+            &renamed,
+        )
+        .unwrap();
+        fs::write(&renamed, b"%PDF-1.7\n% changed after rename\n").unwrap();
+        let new_version = read_document_version(&renamed).unwrap();
+
+        let info = backend.rebind_path(renamed.clone()).unwrap();
+
+        assert_eq!(info.path, renamed);
+        assert_eq!(info.version, old_version);
+        assert_ne!(new_version, old_version);
+    }
+
+    #[test]
+    fn reload_failure_keeps_old_info_and_corrupt_to_valid_reloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reload-corrupt-valid.pdf");
+        write_blank_pdf_for_test(&path);
+        let mut backend = MuPdfBackend::open(path.clone()).unwrap();
+        let old_info = backend.info().unwrap();
+
+        fs::write(&path, b"not a PDF").unwrap();
+        assert!(backend.reload(path.clone()).is_err());
+        let preserved = backend.info().unwrap();
+        assert_eq!(preserved.version, old_info.version);
+        assert_eq!(preserved.page_bounds, old_info.page_bounds);
+
+        write_blank_pdf_for_test(&path);
+        let recovered = backend.reload(path).unwrap();
+        assert_eq!(recovered.page_bounds.len(), old_info.page_bounds.len());
+        assert_ne!(recovered.version, old_info.version);
+    }
+
+    #[test]
+    fn zero_byte_reload_and_disappear_recreate_preserve_the_old_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reload-transient.pdf");
+        write_blank_pdf_for_test(&path);
+        let mut backend = MuPdfBackend::open(path.clone()).unwrap();
+        let old_info = backend.info().unwrap();
+
+        fs::write(&path, []).unwrap();
+        assert!(backend.reload(path.clone()).is_err());
+        assert_eq!(backend.info().unwrap().version, old_info.version);
+
+        fs::remove_file(&path).unwrap();
+        write_blank_pdf_for_test(&path);
+        assert_ne!(read_document_version(&path).unwrap(), old_info.version);
+        assert_eq!(backend.info().unwrap().version, old_info.version);
+    }
+
+    #[test]
+    fn save_as_verifies_temp_copy_and_keeps_source_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("save-as-source.pdf");
+        let destination = directory.path().join("save-as-copy.pdf");
+        write_blank_pdf_for_test(&source);
+        let source_before = fs::read(&source).unwrap();
+        let mut backend = MuPdfBackend::open(source.clone()).unwrap();
+        backend
+            .create_highlight(
+                0,
+                &[PageQuad {
+                    upper_left: PagePoint::new(20.0, 20.0),
+                    upper_right: PagePoint::new(80.0, 20.0),
+                    lower_left: PagePoint::new(20.0, 40.0),
+                    lower_right: PagePoint::new(80.0, 40.0),
+                }],
+            )
+            .unwrap();
+
+        backend.save_as(&destination, None).unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        let saved = PdfDocument::open(destination.to_str().unwrap()).unwrap();
+        assert_eq!(highlight_count(&saved).unwrap(), 1);
+        assert!(backend.info().unwrap().dirty);
+        assert!(!fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lunapdf-save-as-")
+        }));
+    }
+
+    #[test]
+    fn self_save_synchronizes_version_without_an_external_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("self-save-sync.pdf");
+        write_blank_pdf_for_test(&source);
+        let mut backend = MuPdfBackend::open(source.clone()).unwrap();
+        backend
+            .create_highlight(
+                0,
+                &[PageQuad {
+                    upper_left: PagePoint::new(20.0, 20.0),
+                    upper_right: PagePoint::new(80.0, 20.0),
+                    lower_left: PagePoint::new(20.0, 40.0),
+                    lower_right: PagePoint::new(80.0, 40.0),
+                }],
+            )
+            .unwrap();
+        let before_save = backend.info().unwrap().version;
+
+        backend.save().unwrap();
+        let after_save = backend.info().unwrap();
+
+        assert_eq!(after_save.version, read_document_version(&source).unwrap());
+        assert_ne!(after_save.version, before_save);
+        assert!(!after_save.dirty);
+    }
+
+    #[test]
+    fn save_as_destination_compare_and_swap_rejects_third_party_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("save-as-cas-source.pdf");
+        let destination = directory.path().join("save-as-cas-destination.pdf");
+        write_blank_pdf_for_test(&source);
+        write_blank_pdf_for_test(&destination);
+        let backend = MuPdfBackend::open(source).unwrap();
+        let expected = read_document_version(&destination).unwrap();
+        let external = b"third party destination";
+        fs::write(&destination, external).unwrap();
+
+        let error = backend.save_as(&destination, Some(expected)).unwrap_err();
+
+        assert!(error.to_string().contains("destination changed"));
+        assert_eq!(fs::read(&destination).unwrap(), external);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_rejects_hardlink_to_source_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("save-as-hardlink-source.pdf");
+        let destination = directory.path().join("save-as-hardlink-destination.pdf");
+        write_blank_pdf_for_test(&source);
+        fs::hard_link(&source, &destination).unwrap();
+        let backend = MuPdfBackend::open(source).unwrap();
+
+        let error = backend.save_as(
+            &destination,
+            Some(read_document_version(&destination).unwrap()),
+        );
+
+        assert!(error.is_err());
+        assert!(error.unwrap_err().to_string().contains("source PDF"));
     }
 
     #[test]

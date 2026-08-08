@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, TryRecvError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui::{
     self, Color32, Event, Id, Key, LayerId, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect,
     Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, TouchPhase, UiBuilder, Vec2,
@@ -190,6 +190,8 @@ pub(crate) struct PrototypeApp {
     restore_enabled: bool,
     session_restore_progress: Option<SessionRestoreProgress>,
     external_open_events: Receiver<std::result::Result<Vec<PathBuf>, String>>,
+    rename_scan_results: Receiver<RenameScanResult>,
+    rename_scan_result_sender: Sender<RenameScanResult>,
     next_document_id: u64,
     activity_sequence: u64,
     // 表示要求は次のタブバーのフレームで消費する。一度だけにすることで、その後に
@@ -251,11 +253,48 @@ struct DocumentTab {
     render_performance: RenderPerformance,
     restoring_from_session: bool,
     external_candidate: Option<(DocumentVersion, u8)>,
-    external_conflict_reported: bool,
+    external_conflict: Option<ExternalConflict>,
     reload_in_flight: bool,
     save_as: SaveAsState,
     failed_external_version: Option<DocumentVersion>,
+    resume_expected_version: Option<DocumentVersion>,
     pending_rebind_path: Option<PathBuf>,
+    rename_scan_in_flight: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExternalConflict {
+    version: DocumentVersion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExternalPollInput {
+    expected: DocumentVersion,
+    current: Option<DocumentVersion>,
+    previous_candidate: Option<(DocumentVersion, u8)>,
+    failed_version: Option<DocumentVersion>,
+    reload_in_flight: bool,
+    suspended: bool,
+    has_unsaved_changes: bool,
+    editor_dirty: bool,
+    conflict_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalPollAction {
+    Synchronized,
+    ScanRename,
+    Wait((DocumentVersion, u8)),
+    Conflict((DocumentVersion, u8)),
+    Resume((DocumentVersion, u8)),
+    Reload((DocumentVersion, u8)),
+}
+
+struct RenameScanResult {
+    document_id: u64,
+    path: PathBuf,
+    expected: DocumentVersion,
+    candidate: Option<(PathBuf, DocumentVersion)>,
 }
 
 struct HighlightIndexState {
@@ -273,8 +312,14 @@ struct HighlightIndexState {
 enum SaveAsState {
     #[default]
     Idle,
-    WaitingEditorCommit(PathBuf),
-    Saving(PathBuf),
+    WaitingEditorCommit(SaveAsRequest),
+    Saving(SaveAsRequest),
+}
+
+#[derive(Clone, Debug)]
+struct SaveAsRequest {
+    path: PathBuf,
+    expected_destination: Option<DocumentVersion>,
 }
 
 impl Default for HighlightIndexState {
@@ -810,6 +855,7 @@ impl PrototypeApp {
         let tabs = TabState::new();
         let mut viewports = HashMap::new();
         viewports.insert(SplitSide::First, PageViewport::default());
+        let (rename_scan_result_sender, rename_scan_results) = crossbeam_channel::unbounded();
         let mut app = Self {
             tabs,
             documents: Vec::new(),
@@ -833,6 +879,8 @@ impl PrototypeApp {
             restore_enabled,
             session_restore_progress: None,
             external_open_events: crossbeam_channel::never(),
+            rename_scan_results,
+            rename_scan_result_sender,
             next_document_id: 1,
             activity_sequence: 0,
             tab_to_reveal: None,
@@ -869,9 +917,107 @@ impl PrototypeApp {
         let _opened_index = self.open_document_with_intent(path, OpenIntent::User);
     }
 
+    fn receive_rename_scan_results(&mut self) {
+        while let Ok(result) = self.rename_scan_results.try_recv() {
+            let Some(index) = self
+                .documents
+                .iter()
+                .position(|document| document.document_id == result.document_id)
+            else {
+                continue;
+            };
+            let tab = &mut self.documents[index];
+            tab.rename_scan_in_flight = false;
+            let path_is_current = self.tabs.tabs()[index].path() == result.path;
+            let version_is_current = tab
+                .info
+                .as_ref()
+                .is_some_and(|info| info.version == result.expected);
+            if !path_is_current || !version_is_current {
+                continue;
+            }
+            if let Some((candidate, version)) = result.candidate {
+                self.handle_rename_candidate(index, candidate, version);
+            }
+        }
+    }
+
+    fn start_rename_scan(&mut self, index: usize, path: PathBuf, expected: DocumentVersion) {
+        if self.documents[index].rename_scan_in_flight {
+            return;
+        }
+        self.documents[index].rename_scan_in_flight = true;
+        let sender = self.rename_scan_result_sender.clone();
+        let document_id = self.documents[index].document_id;
+        std::thread::spawn(move || {
+            let candidate = find_same_folder_rename(&path, expected).and_then(|candidate| {
+                let version = read_document_version(&candidate).ok()?;
+                (candidate != path).then_some((candidate, version))
+            });
+            let _ = sender.send(RenameScanResult {
+                document_id,
+                path,
+                expected,
+                candidate,
+            });
+        });
+    }
+
+    fn handle_rename_candidate(
+        &mut self,
+        index: usize,
+        renamed: PathBuf,
+        candidate_version: DocumentVersion,
+    ) {
+        if renamed == self.tabs.tabs()[index].path()
+            || self.documents[index].pending_rebind_path.is_some()
+        {
+            return;
+        }
+        let collides = self
+            .tabs
+            .tabs()
+            .iter()
+            .enumerate()
+            .any(|(other, tab)| other != index && tab.path() == renamed);
+        if collides {
+            self.documents[index].error = Some(
+                "名前変更先は既存タブで開かれているため、タブを統合せず追跡を停止しました。"
+                    .to_owned(),
+            );
+            return;
+        }
+
+        let previous = self.tabs.tabs()[index].path().to_path_buf();
+        if self.tabs.rebind_path(index, &renamed).is_err() {
+            return;
+        }
+        let expected = self.documents[index]
+            .info
+            .as_ref()
+            .expect("rename candidates belong to opened documents")
+            .version;
+        self.documents[index].external_candidate =
+            (candidate_version != expected).then_some((candidate_version, 1));
+        if self.documents[index].state == DocumentState::Suspended {
+            if let Some(info) = self.documents[index].info.as_mut() {
+                info.path = self.tabs.tabs()[index].path().to_path_buf();
+            }
+            self.status = "休止中のPDFの名前変更を追跡しました。".to_owned();
+            return;
+        }
+        if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
+            self.documents[index].pending_rebind_path = Some(previous);
+            self.status = "PDF の名前変更を追跡しています…".to_owned();
+        } else {
+            let _ = self.tabs.replace_path(index, previous);
+        }
+    }
+
     /// 短いポーリングで安定した外部版だけを採用する。通知 API の一回限りのイベントでは
     /// 0 byte・delete/recreate・atomic replace の途中状態を区別できないためである。
     fn check_external_changes(&mut self) {
+        self.receive_rename_scan_results();
         if self.last_external_check.elapsed() < Duration::from_millis(300) {
             return;
         }
@@ -883,92 +1029,64 @@ impl PrototypeApp {
             let path = self.tabs.tabs()[index].path().to_path_buf();
             let expected = info.version;
             let current = read_document_version(&path).ok();
-            if current == Some(expected) {
-                self.documents[index].external_candidate = None;
-                continue;
-            }
-
-            // 旧パスへ別 PDF がすぐ再作成されても、先に元 identity の候補を探す。
-            // これを後回しにすると、その新しい PDF を旧タブへ誤って reload してしまう。
-            if let Some(renamed) =
-                find_same_folder_rename(&path, expected).filter(|renamed| renamed != &path)
-            {
-                let collides = self
-                    .tabs
-                    .tabs()
-                    .iter()
-                    .enumerate()
-                    .any(|(other, tab)| other != index && tab.path() == renamed);
-                if collides {
-                    self.documents[index].error = Some(
-                            "名前変更先は既存タブで開かれているため、タブを統合せず追跡を停止しました。"
-                                .to_owned(),
-                        );
-                } else if self.tabs.rebind_path(index, &renamed).is_ok() {
-                    if self.documents[index].state == DocumentState::Suspended {
-                        if let Some(info) = self.documents[index].info.as_mut() {
-                            info.path = self.tabs.tabs()[index].path().to_path_buf();
-                        }
-                        self.status = "休止中のPDFの名前変更を追跡しました。".to_owned();
-                        continue;
-                    }
-                    if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
-                        self.documents[index].pending_rebind_path = Some(path);
-                        self.status = "PDF の名前変更を追跡しています…".to_owned();
-                    } else {
-                        let _ = self.tabs.replace_path(index, path);
-                    }
-                }
-                continue;
-            }
-            if current.is_none() {
-                continue;
-            }
-            let current = current.expect("checked above");
-            let stable_count = match self.documents[index].external_candidate {
-                Some((candidate, count)) if candidate == current => count.saturating_add(1),
-                _ => 1,
-            };
-            self.documents[index].external_candidate = Some((current, stable_count));
-            if !external_reload_is_ready(
-                self.documents[index].external_candidate,
-                self.documents[index].failed_external_version,
-                self.documents[index].reload_in_flight,
-            ) {
-                continue;
-            }
-            if self.documents[index].state == DocumentState::Suspended {
-                // 休止中は表示キャッシュを持たず、次の resume が安定した最新版を検証して開く。
-                if let Some(info) = self.documents[index].info.as_mut() {
-                    info.version = current;
-                }
-                self.documents[index].external_candidate = None;
-                continue;
-            }
             let document_id = self.documents[index].document_id;
             let editor_dirty = self.annotation_editor.as_ref().is_some_and(|editor| {
                 editor.document_id == document_id
                     && (editor.is_dirty() || editor.mutation_in_flight)
             });
-            if self.documents[index].has_unsaved_changes() || editor_dirty {
-                if !self.documents[index].external_conflict_reported {
-                    self.documents[index].external_conflict_reported = true;
-                    self.documents[index].error = Some(
-                        "外部でPDFが更新されました。未保存の編集を保護するため、自動再読み込みを停止しています。編集版を別名保存してから外部版を再読み込みしてください。".to_owned(),
-                    );
+            let action = external_poll_action(ExternalPollInput {
+                expected,
+                current,
+                previous_candidate: self.documents[index].external_candidate,
+                failed_version: self.documents[index].failed_external_version,
+                reload_in_flight: self.documents[index].reload_in_flight,
+                suspended: self.documents[index].state == DocumentState::Suspended,
+                has_unsaved_changes: self.documents[index].has_unsaved_changes(),
+                editor_dirty,
+                conflict_pending: self.documents[index].external_conflict.is_some(),
+            });
+            match action {
+                ExternalPollAction::Synchronized => {
+                    self.documents[index].external_candidate = None;
+                    self.documents[index].resume_expected_version = None;
+                    self.documents[index].failed_external_version = None;
                 }
-                continue;
-            }
-            self.documents[index].reload_in_flight =
-                self.documents[index].send(DocumentCommand::Reload(path));
-            if self.documents[index].reload_in_flight {
-                self.status = "外部更新されたPDFを再読み込みしています…".to_owned();
+                ExternalPollAction::ScanRename => {
+                    self.documents[index].resume_expected_version = None;
+                    self.start_rename_scan(index, path, expected);
+                }
+                ExternalPollAction::Wait(candidate) => {
+                    self.documents[index].external_candidate = Some(candidate);
+                }
+                ExternalPollAction::Conflict(candidate) => {
+                    self.documents[index].external_candidate = Some(candidate);
+                    self.documents[index].external_conflict = Some(ExternalConflict {
+                        version: candidate.0,
+                    });
+                }
+                ExternalPollAction::Resume(candidate) => {
+                    self.documents[index].external_candidate = Some(candidate);
+                    // 休止中はメタデータだけでinfo.versionを更新しない。次回activate時に
+                    // MuPDFで完全open検証できた版だけを採用する。
+                    self.documents[index].resume_expected_version = Some(candidate.0);
+                }
+                ExternalPollAction::Reload(candidate) => {
+                    self.documents[index].external_candidate = Some(candidate);
+                    self.documents[index].reload_in_flight =
+                        self.documents[index].send(DocumentCommand::Reload(path));
+                    if self.documents[index].reload_in_flight {
+                        self.status = "外部更新されたPDFを再読み込みしています…".to_owned();
+                    }
+                }
             }
         }
     }
 
     fn save_conflicted_document_as(&mut self, index: usize) {
-        if !matches!(self.documents[index].save_as, SaveAsState::Idle) {
+        if !matches!(self.documents[index].save_as, SaveAsState::Idle)
+            || self.documents[index].save_in_flight
+            || self.documents[index].reload_in_flight
+        {
             return;
         }
         let source = self.tabs.tabs()[index].path();
@@ -985,7 +1103,13 @@ impl PrototypeApp {
         let Some(path) = selected else {
             return;
         };
-        let destination = std::fs::canonicalize(&path).unwrap_or(path.clone());
+        let destination = match canonical_save_as_destination(&path) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.documents[index].error = Some(error);
+                return;
+            }
+        };
         if self.tabs.tabs().iter().any(|tab| tab.path() == destination) {
             self.documents[index].error = Some(
                 "別名保存先は既に開かれているタブです。編集版と既存タブを保護するため上書きを中止しました。"
@@ -993,11 +1117,35 @@ impl PrototypeApp {
             );
             return;
         }
+        let Some(source_version) = self.documents[index].info.as_ref().map(|info| info.version)
+        else {
+            return;
+        };
+        let expected_destination = match optional_document_version(&destination) {
+            Ok(version) => version,
+            Err(error) => {
+                self.documents[index].error = Some(format!(
+                    "別名保存先を確認できませんでした。保存先の権限を確認してください。詳細: {error}"
+                ));
+                return;
+            }
+        };
+        if expected_destination.is_some_and(|version| same_file_identity(version, source_version)) {
+            self.documents[index].error = Some(
+                "別名保存先は元PDFと同じファイル実体です。ハードリンクを含む上書きは中止しました。"
+                    .to_owned(),
+            );
+            return;
+        }
+        let request = SaveAsRequest {
+            path: destination,
+            expected_destination,
+        };
         let document_id = self.documents[index].document_id;
         if self.annotation_editor.as_ref().is_some_and(|editor| {
             editor.document_id == document_id && (editor.is_dirty() || editor.mutation_in_flight)
         }) {
-            self.documents[index].save_as = SaveAsState::WaitingEditorCommit(path);
+            self.documents[index].save_as = SaveAsState::WaitingEditorCommit(request);
             if self
                 .annotation_editor
                 .as_ref()
@@ -1007,9 +1155,18 @@ impl PrototypeApp {
             }
             return;
         }
-        if self.documents[index].send(DocumentCommand::SaveAs(path.clone())) {
-            self.documents[index].save_as = SaveAsState::Saving(path);
+        if self.documents[index].send(DocumentCommand::SaveAs {
+            path: request.path.clone(),
+            expected_destination: request.expected_destination,
+        }) {
+            self.documents[index].save_as = SaveAsState::Saving(request);
             self.status = "編集版を別名保存しています…".to_owned();
+        } else {
+            self.documents[index].save_as = SaveAsState::Idle;
+            self.error = Some(
+                "PDFを別名保存できませんでした。文書処理が停止しているため、編集内容は保持されています。"
+                    .to_owned(),
+            );
         }
     }
 
@@ -1519,8 +1676,16 @@ impl PrototypeApp {
         for visible_index in currently_visible {
             if self.documents[visible_index].state == DocumentState::Suspended {
                 let path = self.tabs.tabs()[visible_index].path().to_path_buf();
-                self.documents[visible_index].resume(path);
-                self.status = "Reopening suspended PDF after external-change check…".to_owned();
+                let expected = self.documents[visible_index].resume_version_for_activation();
+                if expected.is_some_and(|version| {
+                    self.documents[visible_index].failed_external_version == Some(version)
+                }) {
+                    continue;
+                }
+                if let Some(expected) = expected {
+                    self.documents[visible_index].resume(path, expected);
+                    self.status = "Reopening suspended PDF after external-change check…".to_owned();
+                }
             }
         }
         let sequence = self.next_activity_sequence();
@@ -1793,7 +1958,15 @@ impl PrototypeApp {
         for visible_index in self.visible_indices() {
             if self.documents[visible_index].state == DocumentState::Suspended {
                 let path = self.tabs.tabs()[visible_index].path().to_path_buf();
-                self.documents[visible_index].resume(path);
+                let expected = self.documents[visible_index].resume_version_for_activation();
+                if expected.is_some_and(|version| {
+                    self.documents[visible_index].failed_external_version == Some(version)
+                }) {
+                    continue;
+                }
+                if let Some(expected) = expected {
+                    self.documents[visible_index].resume(path, expected);
+                }
             }
         }
         if let Some(active_index) = self.active_index() {
@@ -2046,6 +2219,10 @@ impl PrototypeApp {
                 };
                 if self.documents[index].is_saving() {
                     self.status = "Waiting for the current save before closing…".to_owned();
+                    return;
+                }
+                if self.documents[index].reload_in_flight {
+                    self.status = "外部PDFの再読み込みが完了するまで保存できません".to_owned();
                     return;
                 }
                 let queued = self.documents[index].send(DocumentCommand::Save);
@@ -2343,6 +2520,19 @@ impl PrototypeApp {
     }
 
     fn request_annotation_update(&mut self, index: usize) {
+        if self.documents[index].reload_in_flight
+            || matches!(self.documents[index].save_as, SaveAsState::Saving(_))
+        {
+            if let Some(editor) = self
+                .annotation_editor
+                .as_mut()
+                .filter(|editor| editor.document_id == self.documents[index].document_id)
+            {
+                editor.notice =
+                    Some("外部PDFの再読み込みが完了するまで変更できません。".to_owned());
+            }
+            return;
+        }
         let document_id = self.documents[index].document_id;
         let Some(editor) = self
             .annotation_editor
@@ -2366,6 +2556,12 @@ impl PrototypeApp {
             editor.notice = Some("注釈の変更を反映しています…".to_owned());
             self.status = "注釈の変更を反映しています…".to_owned();
         } else {
+            if matches!(
+                self.documents[index].save_as,
+                SaveAsState::WaitingEditorCommit(_)
+            ) {
+                self.documents[index].save_as = SaveAsState::Idle;
+            }
             self.error = Some(
                 "注釈を更新できません。文書処理が停止しているため、タブを開き直してください。"
                     .to_owned(),
@@ -2403,6 +2599,12 @@ impl PrototypeApp {
         can_delete: bool,
     ) {
         let document_id = self.documents[index].document_id;
+        if self.documents[index].reload_in_flight
+            || !matches!(self.documents[index].save_as, SaveAsState::Idle)
+        {
+            self.error = Some("外部PDFの再読み込みが完了するまで注釈を変更できません。".to_owned());
+            return;
+        }
         if let Some(editor) = &mut self.annotation_editor {
             let same_target = editor.document_id == document_id
                 && editor.revision == revision
@@ -2454,6 +2656,10 @@ impl PrototypeApp {
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
+        if tab.reload_in_flight || !matches!(tab.save_as, SaveAsState::Idle) {
+            self.status = "外部PDFの再読み込みが完了するまで注釈を作成できません".to_owned();
+            return;
+        }
         if tab.is_printing() {
             return;
         }
@@ -2505,6 +2711,10 @@ impl PrototypeApp {
         let tab = self
             .active_tab_mut()
             .expect("can_undo requires an active tab");
+        if tab.reload_in_flight || !matches!(tab.save_as, SaveAsState::Idle) {
+            self.status = "外部PDFの再読み込みが完了するまでUndoできません".to_owned();
+            return;
+        }
         let action = tab
             .edit_history
             .last()
@@ -2531,6 +2741,10 @@ impl PrototypeApp {
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
+        if tab.reload_in_flight || !matches!(tab.save_as, SaveAsState::Idle) {
+            self.status = "外部PDFの再読み込みが完了するまで保存できません".to_owned();
+            return;
+        }
         if tab.is_saving() {
             self.status = "A save is already in progress".to_owned();
             return;
@@ -3348,6 +3562,8 @@ impl PrototypeApp {
             .as_ref()
             .is_some_and(|info| info.highlight_capability.is_allowed())
             && !self.documents[index].print_in_flight
+            && !self.documents[index].reload_in_flight
+            && matches!(self.documents[index].save_as, SaveAsState::Idle)
             && self.documents[index]
                 .selection
                 .as_ref()
@@ -3373,6 +3589,8 @@ impl PrototypeApp {
             !tab.edit_history.is_empty()
                 && !tab.undo_in_flight
                 && !tab.save_in_flight
+                && !tab.reload_in_flight
+                && matches!(tab.save_as, SaveAsState::Idle)
                 && !tab.print_in_flight
                 && tab.service.is_some()
         })
@@ -3387,7 +3605,9 @@ impl PrototypeApp {
                 && tab.state != DocumentState::Suspended
                 && tab.state != DocumentState::Error
                 && !tab.save_in_flight
+                && !tab.reload_in_flight
                 && !tab.print_in_flight
+                && matches!(tab.save_as, SaveAsState::Idle)
                 && tab.service.is_some()
                 && tab.info.is_some()
         }) && !self.window_close_pending
@@ -3510,17 +3730,16 @@ impl PrototypeApp {
         let page_input_error = self
             .active_index()
             .and_then(|index| self.documents[index].page_input_error.clone());
-        if app_error.is_none() && document_error.is_none() && page_input_error.is_none() {
+        let conflict_index = self
+            .active_index()
+            .filter(|index| self.documents[*index].external_conflict.is_some());
+        if app_error.is_none()
+            && document_error.is_none()
+            && page_input_error.is_none()
+            && conflict_index.is_none()
+        {
             return;
         }
-        let conflict_index = self.active_index().filter(|index| {
-            self.documents[*index].external_conflict_reported
-                && (self.documents[*index].has_unsaved_changes()
-                    || self.annotation_editor.as_ref().is_some_and(|editor| {
-                        editor.document_id == self.documents[*index].document_id
-                            && (editor.is_dirty() || editor.mutation_in_flight)
-                    }))
-        });
         egui::Panel::top("persistent-error-banner").show(root_ui, |ui| {
             if let Some(error) = app_error.as_deref() {
                 ui.colored_label(Color32::LIGHT_RED, error);
@@ -3531,10 +3750,14 @@ impl PrototypeApp {
             if let Some(error) = page_input_error.as_deref() {
                 ui.colored_label(Color32::LIGHT_RED, error);
             }
-            if let Some(index) = conflict_index
-                && ui.button("編集版を別名保存して外部版を読み込む").clicked()
-            {
-                self.save_conflicted_document_as(index);
+            if let Some(index) = conflict_index {
+                ui.colored_label(
+                    Color32::YELLOW,
+                    "外部でPDFが更新されました。未保存の編集を保護するため自動再読み込みを停止しています。",
+                );
+                if ui.button("編集版を別名保存して外部版を読み込む").clicked() {
+                    self.save_conflicted_document_as(index);
+                }
             }
         });
     }
@@ -3860,6 +4083,20 @@ impl PrototypeApp {
                         .error
                         .as_deref()
                         .unwrap_or("PDF文書ワーカーが停止しました"),
+                );
+            });
+            return;
+        }
+        if self.documents[index].state == DocumentState::Suspended
+            && self.documents[index].error.is_some()
+        {
+            ui.centered_and_justified(|ui| {
+                ui.colored_label(
+                    Color32::LIGHT_RED,
+                    self.documents[index]
+                        .error
+                        .as_deref()
+                        .unwrap_or("PDFの再開を待っています"),
                 );
             });
             return;
@@ -4846,11 +5083,13 @@ impl DocumentTab {
             render_performance: RenderPerformance::default(),
             restoring_from_session,
             external_candidate: None,
-            external_conflict_reported: false,
+            external_conflict: None,
             reload_in_flight: false,
             save_as: SaveAsState::Idle,
             failed_external_version: None,
+            resume_expected_version: None,
             pending_rebind_path: None,
+            rename_scan_in_flight: false,
         }
     }
 
@@ -4877,6 +5116,8 @@ impl DocumentTab {
 
     fn is_saving(&self) -> bool {
         document_save_blocks_close(self.save_in_flight)
+            || !matches!(self.save_as, SaveAsState::Idle)
+            || self.pending_rebind_path.is_some()
     }
 
     fn is_printing(&self) -> bool {
@@ -4892,6 +5133,9 @@ impl DocumentTab {
         self.undo_in_flight = false;
         self.save_in_flight = false;
         self.print_in_flight = false;
+        self.reload_in_flight = false;
+        self.save_as = SaveAsState::Idle;
+        self.rename_scan_in_flight = false;
         if self.state != DocumentState::Error {
             self.error = Some(
                 "文書処理が予期せず終了しました。タブを閉じ、PDFを開き直してください。".to_owned(),
@@ -4907,6 +5151,7 @@ impl DocumentTab {
         self.state == DocumentState::ReadyClean
             && !self.has_unsaved_changes()
             && !self.is_printing()
+            && self.pending_rebind_path.is_none()
     }
 
     fn suspend(&mut self) {
@@ -4926,12 +5171,16 @@ impl DocumentTab {
         self.state = DocumentState::Suspended;
     }
 
-    fn resume(&mut self, path: PathBuf) {
-        let expected_version = self
-            .info
-            .as_ref()
-            .expect("only an opened clean document can be suspended")
-            .version;
+    fn resume_version_for_activation(&self) -> Option<DocumentVersion> {
+        if let Some((candidate, count)) = self.external_candidate {
+            return (count >= 2).then_some(candidate);
+        }
+        self.resume_expected_version
+            .or_else(|| self.info.as_ref().map(|info| info.version))
+    }
+
+    fn resume(&mut self, path: PathBuf, expected_version: DocumentVersion) {
+        self.resume_expected_version = Some(expected_version);
         self.service = Some(DocumentService::resume(path, expected_version));
         self.state = DocumentState::Opening;
         self.invalidate_rendering();
@@ -5068,6 +5317,7 @@ impl DocumentTab {
         self.state == DocumentState::ReadyDirty
             || self.state == DocumentState::Saving
             || self.pending_edits > 0
+            || !self.edit_history.is_empty()
             || self.info.as_ref().is_some_and(|info| info.dirty)
     }
 
@@ -5115,6 +5365,25 @@ impl DocumentTab {
         self.pending_annotation_pages.clear();
         self.failed_annotation_pages.clear();
         self.wanted_annotation_pages.clear();
+    }
+
+    fn prepare_for_external_reload(&mut self, page_count: usize) {
+        self.external_candidate = None;
+        self.external_conflict = None;
+        self.reload_in_flight = false;
+        self.failed_external_version = None;
+        self.outline = None;
+        self.outline_requested = false;
+        self.clear_selection();
+        self.search.generation = self.search.generation.wrapping_add(1);
+        self.search.pages.clear();
+        self.search.selected = None;
+        self.search.completed_pages = 0;
+        self.search.truncated = false;
+        self.search.in_progress = false;
+        self.view.clamp_to_page_count(page_count);
+        self.page_input = (self.view.current_page + 1).to_string();
+        let _queued = self.send(DocumentCommand::SetSearchGeneration(self.search.generation));
     }
 
     /// サイドバーが初めて表示された後に、そのタブの Highlight スキャンを開始する。
@@ -5594,6 +5863,36 @@ fn find_same_folder_rename(path: &Path, expected: DocumentVersion) -> Option<Pat
         })
 }
 
+fn same_file_identity(left: DocumentVersion, right: DocumentVersion) -> bool {
+    left.identity_primary == right.identity_primary
+        && left.identity_secondary == right.identity_secondary
+}
+
+fn optional_document_version(path: &Path) -> std::result::Result<Option<DocumentVersion>, String> {
+    match std::fs::metadata(path) {
+        Ok(_) => read_document_version(path)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn canonical_save_as_destination(path: &Path) -> std::result::Result<PathBuf, String> {
+    if path.exists() {
+        return std::fs::canonicalize(path).map_err(|error| error.to_string());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "別名保存先のフォルダを特定できません。".to_owned())?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "別名保存先のファイル名を特定できません。".to_owned())?;
+    Ok(std::fs::canonicalize(parent)
+        .map_err(|error| error.to_string())?
+        .join(file_name))
+}
+
 fn external_reload_is_ready(
     candidate: Option<(DocumentVersion, u8)>,
     failed: Option<DocumentVersion>,
@@ -5601,6 +5900,46 @@ fn external_reload_is_ready(
 ) -> bool {
     matches!(candidate, Some((version, count)) if count >= 2 && failed != Some(version))
         && !reload_in_flight
+}
+
+fn next_external_candidate(
+    previous: Option<(DocumentVersion, u8)>,
+    current: DocumentVersion,
+) -> (DocumentVersion, u8) {
+    let count = match previous {
+        Some((candidate, count)) if candidate == current => count.saturating_add(1),
+        _ => 1,
+    };
+    (current, count)
+}
+
+fn external_poll_action(input: ExternalPollInput) -> ExternalPollAction {
+    if input.current == Some(input.expected) {
+        return ExternalPollAction::Synchronized;
+    }
+
+    let Some(current) = input.current else {
+        return ExternalPollAction::ScanRename;
+    };
+    if !same_file_identity(current, input.expected) {
+        return ExternalPollAction::ScanRename;
+    }
+
+    let candidate = next_external_candidate(input.previous_candidate, current);
+    if !external_reload_is_ready(
+        Some(candidate),
+        input.failed_version,
+        input.reload_in_flight,
+    ) {
+        return ExternalPollAction::Wait(candidate);
+    }
+    if input.suspended {
+        return ExternalPollAction::Resume(candidate);
+    }
+    if input.has_unsaved_changes || input.editor_dirty || input.conflict_pending {
+        return ExternalPollAction::Conflict(candidate);
+    }
+    ExternalPollAction::Reload(candidate)
 }
 
 fn text_snapshot_result_is_current(

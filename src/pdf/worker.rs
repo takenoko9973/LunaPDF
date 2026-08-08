@@ -52,7 +52,10 @@ pub(crate) enum DocumentCommand {
         auto_rotate: bool,
     },
     Save,
-    SaveAs(PathBuf),
+    SaveAs {
+        path: PathBuf,
+        expected_destination: Option<DocumentVersion>,
+    },
     Reload(PathBuf),
     RebindPath(PathBuf),
     Shutdown,
@@ -565,7 +568,10 @@ fn run_worker(
                 }
                 Err(error) => send_failure(&event_sender, "save", error),
             },
-            DocumentCommand::SaveAs(path) => match backend.save_as(&path) {
+            DocumentCommand::SaveAs {
+                path,
+                expected_destination,
+            } => match backend.save_as(&path, expected_destination) {
                 Ok(()) => {
                     let _ = event_sender.send(DocumentEvent::SavedAs(path));
                 }
@@ -581,12 +587,9 @@ fn run_worker(
                 Err(error) => send_failure(&event_sender, "reload", error),
             },
             DocumentCommand::RebindPath(path) => match backend.rebind_path(path.clone()) {
-                Ok(()) => match backend.info() {
-                    Ok(info) => {
-                        let _ = event_sender.send(DocumentEvent::PathRebound { path, info });
-                    }
-                    Err(error) => send_failure(&event_sender, "rename", error),
-                },
+                Ok(info) => {
+                    let _ = event_sender.send(DocumentEvent::PathRebound { path, info });
+                }
                 Err(error) => send_failure(&event_sender, "rename", error),
             },
             DocumentCommand::Shutdown => return,

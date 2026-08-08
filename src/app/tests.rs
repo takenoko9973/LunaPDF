@@ -96,6 +96,195 @@ fn failed_external_version_is_not_retried_until_a_new_stable_version_arrives() {
     ));
 }
 
+#[test]
+fn direct_overwrite_keeps_identity_but_requires_two_stable_observations() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("direct-overwrite.pdf");
+    write_blank_pdf(&path);
+    let expected = read_document_version(&path).unwrap();
+    std::fs::write(&path, b"%PDF-1.7\n% overwritten\n").unwrap();
+    let current = read_document_version(&path).unwrap();
+
+    assert!(same_file_identity(current, expected));
+    assert_ne!(current, expected);
+    assert!(!external_reload_is_ready(Some((current, 1)), None, false));
+    assert!(external_reload_is_ready(Some((current, 2)), None, false));
+}
+
+#[test]
+fn atomic_replace_changes_identity_and_is_the_only_case_that_needs_rename_scan() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("atomic-source.pdf");
+    let replacement = directory.path().join("atomic-replacement.pdf");
+    write_blank_pdf(&path);
+    let expected = read_document_version(&path).unwrap();
+    write_blank_pdf(&replacement);
+    std::fs::rename(&replacement, &path).unwrap();
+    let current = read_document_version(&path).unwrap();
+
+    assert!(!same_file_identity(current, expected));
+    assert_eq!(find_same_folder_rename(&path, expected), None);
+}
+
+#[test]
+fn consecutive_versions_reset_stability_to_the_latest_candidate() {
+    let first = DocumentVersion {
+        identity_primary: 1,
+        identity_secondary: 2,
+        length: 10,
+        modified: std::time::SystemTime::UNIX_EPOCH,
+    };
+    let second = DocumentVersion {
+        length: 11,
+        ..first
+    };
+
+    assert_eq!(next_external_candidate(None, first), (first, 1));
+    assert_eq!(next_external_candidate(Some((first, 1)), first), (first, 2));
+    assert_eq!(
+        next_external_candidate(Some((first, 2)), second),
+        (second, 1)
+    );
+    assert!(external_reload_is_ready(Some((second, 2)), None, false));
+}
+
+#[test]
+fn external_poll_reducer_separates_reload_conflict_and_rename_actions() {
+    let expected = DocumentVersion {
+        identity_primary: 7,
+        identity_secondary: 8,
+        length: 10,
+        modified: std::time::SystemTime::UNIX_EPOCH,
+    };
+    let direct_overwrite = DocumentVersion {
+        length: 11,
+        ..expected
+    };
+    let input = |current,
+                 previous_candidate,
+                 has_unsaved_changes,
+                 editor_dirty,
+                 conflict_pending,
+                 reload_in_flight| ExternalPollInput {
+        expected,
+        current,
+        previous_candidate,
+        failed_version: None,
+        reload_in_flight,
+        suspended: false,
+        has_unsaved_changes,
+        editor_dirty,
+        conflict_pending,
+    };
+
+    assert_eq!(
+        external_poll_action(input(
+            Some(direct_overwrite),
+            None,
+            false,
+            false,
+            false,
+            false,
+        )),
+        ExternalPollAction::Wait((direct_overwrite, 1))
+    );
+    assert_eq!(
+        external_poll_action(input(
+            Some(direct_overwrite),
+            Some((direct_overwrite, 1)),
+            false,
+            false,
+            false,
+            false,
+        )),
+        ExternalPollAction::Reload((direct_overwrite, 2))
+    );
+    assert_eq!(
+        external_poll_action(input(
+            Some(direct_overwrite),
+            Some((direct_overwrite, 1)),
+            false,
+            true,
+            false,
+            false,
+        )),
+        ExternalPollAction::Conflict((direct_overwrite, 2))
+    );
+    assert_eq!(
+        external_poll_action(input(
+            Some(direct_overwrite),
+            Some((direct_overwrite, 1)),
+            false,
+            false,
+            true,
+            false,
+        )),
+        ExternalPollAction::Conflict((direct_overwrite, 2))
+    );
+    assert_eq!(
+        external_poll_action(input(
+            Some(direct_overwrite),
+            Some((direct_overwrite, 1)),
+            false,
+            false,
+            false,
+            true,
+        )),
+        ExternalPollAction::Wait((direct_overwrite, 2))
+    );
+
+    let replacement = DocumentVersion {
+        identity_primary: 9,
+        ..direct_overwrite
+    };
+    assert_eq!(
+        external_poll_action(input(Some(replacement), None, false, false, false, false,)),
+        ExternalPollAction::ScanRename
+    );
+    assert_eq!(
+        external_poll_action(input(None, None, false, false, false, false,)),
+        ExternalPollAction::ScanRename
+    );
+}
+
+#[test]
+fn suspended_external_version_requires_stable_valid_resume_before_adoption() {
+    let expected = DocumentVersion {
+        identity_primary: 11,
+        identity_secondary: 12,
+        length: 20,
+        modified: std::time::SystemTime::UNIX_EPOCH,
+    };
+    let current = DocumentVersion {
+        length: 21,
+        ..expected
+    };
+    let input = |previous_candidate, failed_version| ExternalPollInput {
+        expected,
+        current: Some(current),
+        previous_candidate,
+        failed_version,
+        reload_in_flight: false,
+        suspended: true,
+        has_unsaved_changes: false,
+        editor_dirty: false,
+        conflict_pending: false,
+    };
+
+    assert_eq!(
+        external_poll_action(input(None, None)),
+        ExternalPollAction::Wait((current, 1))
+    );
+    assert_eq!(
+        external_poll_action(input(Some((current, 1)), None)),
+        ExternalPollAction::Resume((current, 2))
+    );
+    assert_eq!(
+        external_poll_action(input(Some((current, 1)), Some(current))),
+        ExternalPollAction::Wait((current, 2))
+    );
+}
+
 fn finish_async_session_restore(app: &mut PrototypeApp) {
     let context = egui::Context::default();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1963,6 +2152,50 @@ fn page_navigation_preserves_the_render_generation() {
 }
 
 #[test]
+fn reload_success_clamps_page_clears_outline_selection_search_and_advances_generations() {
+    let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None);
+    tab.view.current_page = 4;
+    tab.view.scroll_to_page = Some(4);
+    tab.page_input = "5".to_owned();
+    tab.outline = Some(Vec::new());
+    tab.outline_requested = true;
+    tab.search.query = "needle".to_owned();
+    tab.search.pages.insert(4, Vec::new());
+    tab.selection_generation = 7;
+    tab.search.generation = 9;
+    tab.selection = Some(SelectionSnapshot {
+        page_index: 4,
+        text: "selected".to_owned(),
+        display_quads: Vec::new(),
+        quads: Vec::new(),
+        generation: 7,
+        #[cfg(debug_assertions)]
+        extraction_time: Duration::ZERO,
+    });
+    let search_generation = tab.search.generation;
+    let selection_generation = tab.selection_generation;
+    let render_generation = tab.view.generation;
+    let thumbnail_generation = tab.thumbnail_generation;
+
+    tab.prepare_for_external_reload(2);
+    tab.invalidate_rendering();
+    let _ = tab.invalidate_thumbnails();
+
+    assert_eq!(tab.view.current_page, 1);
+    assert_eq!(tab.view.scroll_to_page, Some(1));
+    assert_eq!(tab.page_input, "2");
+    assert!(tab.outline.is_none());
+    assert!(!tab.outline_requested);
+    assert!(tab.selection.is_none());
+    assert!(tab.search.pages.is_empty());
+    assert_eq!(tab.search.query, "needle");
+    assert_ne!(tab.search.generation, search_generation);
+    assert_ne!(tab.selection_generation, selection_generation);
+    assert_ne!(tab.view.generation, render_generation);
+    assert_ne!(tab.thumbnail_generation, thumbnail_generation);
+}
+
+#[test]
 fn display_mode_roundtrip_preserves_page_and_normalized_position() {
     let expected = PageAnchor {
         page_index: 4,
@@ -2159,6 +2392,14 @@ fn worker_disconnect_clears_every_close_blocking_operation() {
     tab.undo_in_flight = true;
     tab.save_in_flight = true;
     tab.print_in_flight = true;
+    tab.edit_history.push(EditAction::CreateHighlight {
+        page_index: 0,
+        annotation_xref: 1,
+    });
+    tab.save_as = SaveAsState::Saving(SaveAsRequest {
+        path: PathBuf::from("saved-copy.pdf"),
+        expected_destination: None,
+    });
 
     tab.mark_worker_disconnected();
 
@@ -2166,9 +2407,53 @@ fn worker_disconnect_clears_every_close_blocking_operation() {
     assert!(tab.pending_annotation_pages.is_empty());
     assert!(!tab.undo_in_flight);
     assert!(!tab.is_saving());
+    assert!(matches!(tab.save_as, SaveAsState::Idle));
     assert!(!tab.is_printing());
+    assert!(tab.has_unsaved_changes());
     assert_eq!(tab.state, DocumentState::Error);
     assert!(tab.service.is_none());
+}
+
+#[test]
+fn conflict_state_is_dedicated_and_survives_status_like_local_changes() {
+    let version = DocumentVersion {
+        identity_primary: 1,
+        identity_secondary: 2,
+        length: 3,
+        modified: std::time::SystemTime::UNIX_EPOCH,
+    };
+    let mut tab = DocumentTab::new(1, PathBuf::from("conflict.pdf"), 0, None);
+    tab.external_conflict = Some(ExternalConflict { version });
+    tab.state = DocumentState::ReadyDirty;
+    tab.edit_history.clear();
+
+    assert!(tab.error.is_none());
+    assert_eq!(tab.external_conflict, Some(ExternalConflict { version }));
+    assert!(tab.has_unsaved_changes());
+}
+
+#[test]
+fn save_as_single_flight_and_cancel_keep_dirty_state_and_worker_disconnect_resets_state() {
+    let mut tab = DocumentTab::new(1, PathBuf::from("source.pdf"), 0, None);
+    tab.state = DocumentState::ReadyDirty;
+    tab.save_as = SaveAsState::Saving(SaveAsRequest {
+        path: PathBuf::from("copy.pdf"),
+        expected_destination: None,
+    });
+    assert!(tab.is_saving());
+    assert!(tab.has_unsaved_changes());
+
+    tab.save_as = SaveAsState::Idle;
+    assert!(!tab.is_saving());
+    assert!(tab.has_unsaved_changes());
+
+    tab.save_as = SaveAsState::Saving(SaveAsRequest {
+        path: PathBuf::from("copy.pdf"),
+        expected_destination: None,
+    });
+    tab.mark_worker_disconnected();
+    assert!(matches!(tab.save_as, SaveAsState::Idle));
+    assert!(tab.error.is_some());
 }
 
 #[test]
