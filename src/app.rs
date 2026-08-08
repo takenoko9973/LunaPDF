@@ -294,6 +294,7 @@ struct RenameScanResult {
     document_id: u64,
     path: PathBuf,
     expected: DocumentVersion,
+    observed_current: Option<DocumentVersion>,
     candidate: Option<(PathBuf, DocumentVersion)>,
 }
 
@@ -917,7 +918,8 @@ impl PrototypeApp {
         let _opened_index = self.open_document_with_intent(path, OpenIntent::User);
     }
 
-    fn receive_rename_scan_results(&mut self) {
+    fn receive_rename_scan_results(&mut self) -> HashSet<u64> {
+        let mut accepted_documents = HashSet::new();
         while let Ok(result) = self.rename_scan_results.try_recv() {
             let Some(index) = self
                 .documents
@@ -933,11 +935,100 @@ impl PrototypeApp {
                 .info
                 .as_ref()
                 .is_some_and(|info| info.version == result.expected);
-            if !path_is_current || !version_is_current {
+            let observed_current = read_document_version(&result.path).ok();
+            if !path_is_current
+                || !version_is_current
+                || observed_current != result.observed_current
+            {
                 continue;
             }
+            accepted_documents.insert(result.document_id);
             if let Some((candidate, version)) = result.candidate {
                 self.handle_rename_candidate(index, candidate, version);
+                continue;
+            }
+            let Some(action) = self.external_replacement_action(index, result.observed_current)
+            else {
+                continue;
+            };
+            self.apply_external_poll_action(index, result.path, action);
+        }
+        accepted_documents
+    }
+
+    fn external_replacement_action(
+        &self,
+        index: usize,
+        current: Option<DocumentVersion>,
+    ) -> Option<ExternalPollAction> {
+        let tab = &self.documents[index];
+        let expected = tab.info.as_ref()?.version;
+        let document_id = tab.document_id;
+        let editor_dirty = self.annotation_editor.as_ref().is_some_and(|editor| {
+            editor.document_id == document_id && (editor.is_dirty() || editor.mutation_in_flight)
+        });
+        external_replacement_action(ExternalPollInput {
+            expected,
+            current,
+            previous_candidate: tab.external_candidate,
+            failed_version: tab.failed_external_version,
+            reload_in_flight: tab.reload_in_flight,
+            suspended: tab.state == DocumentState::Suspended,
+            has_unsaved_changes: tab.has_unsaved_changes(),
+            editor_dirty,
+            conflict_pending: tab.external_conflict.is_some(),
+        })
+    }
+
+    fn apply_external_poll_action(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        action: ExternalPollAction,
+    ) {
+        match action {
+            ExternalPollAction::Synchronized => {
+                self.documents[index].external_candidate = None;
+                self.documents[index].resume_expected_version = None;
+                self.documents[index].failed_external_version = None;
+            }
+            ExternalPollAction::ScanRename => {
+                self.documents[index].resume_expected_version = None;
+                let expected = self.documents[index]
+                    .info
+                    .as_ref()
+                    .expect("rename scans belong to opened documents")
+                    .version;
+                self.start_rename_scan(index, path, expected);
+            }
+            ExternalPollAction::Wait(candidate) => {
+                self.documents[index].external_candidate = Some(candidate);
+            }
+            ExternalPollAction::Conflict(candidate) => {
+                self.documents[index].external_candidate = Some(candidate);
+                self.documents[index].external_conflict = Some(ExternalConflict {
+                    version: candidate.0,
+                });
+            }
+            ExternalPollAction::Resume(candidate) => {
+                self.documents[index].external_candidate = Some(candidate);
+                // 休止中はメタデータだけでinfo.versionを更新しない。次回activate時に
+                // MuPDFで完全open検証できた版だけを採用する。
+                self.documents[index].resume_expected_version = Some(candidate.0);
+                if self.is_visible_index(index)
+                    && self.documents[index].state == DocumentState::Suspended
+                {
+                    self.documents[index].resume(path, candidate.0);
+                    self.status = "Reopening suspended PDF after external-change check…".to_owned();
+                }
+            }
+            ExternalPollAction::Reload(candidate) => {
+                self.documents[index].external_candidate = Some(candidate);
+                self.documents[index].reload_in_flight =
+                    self.documents[index].send(DocumentCommand::Reload(path));
+                if self.documents[index].reload_in_flight {
+                    self.status = "外部更新されたPDFを再読み込みしています…".to_owned();
+                }
             }
         }
     }
@@ -954,10 +1045,12 @@ impl PrototypeApp {
                 let version = read_document_version(&candidate).ok()?;
                 (candidate != path).then_some((candidate, version))
             });
+            let observed_current = read_document_version(&path).ok();
             let _ = sender.send(RenameScanResult {
                 document_id,
                 path,
                 expected,
+                observed_current,
                 candidate,
             });
         });
@@ -1017,7 +1110,7 @@ impl PrototypeApp {
     /// 短いポーリングで安定した外部版だけを採用する。通知 API の一回限りのイベントでは
     /// 0 byte・delete/recreate・atomic replace の途中状態を区別できないためである。
     fn check_external_changes(&mut self) {
-        self.receive_rename_scan_results();
+        let accepted_scan_documents = self.receive_rename_scan_results();
         if self.last_external_check.elapsed() < Duration::from_millis(300) {
             return;
         }
@@ -1026,10 +1119,16 @@ impl PrototypeApp {
             let Some(info) = self.documents[index].info.as_ref() else {
                 continue;
             };
+            if self.documents[index].state == DocumentState::Opening {
+                continue;
+            }
             let path = self.tabs.tabs()[index].path().to_path_buf();
             let expected = info.version;
             let current = read_document_version(&path).ok();
             let document_id = self.documents[index].document_id;
+            if accepted_scan_documents.contains(&document_id) {
+                continue;
+            }
             let editor_dirty = self.annotation_editor.as_ref().is_some_and(|editor| {
                 editor.document_id == document_id
                     && (editor.is_dirty() || editor.mutation_in_flight)
@@ -1045,40 +1144,7 @@ impl PrototypeApp {
                 editor_dirty,
                 conflict_pending: self.documents[index].external_conflict.is_some(),
             });
-            match action {
-                ExternalPollAction::Synchronized => {
-                    self.documents[index].external_candidate = None;
-                    self.documents[index].resume_expected_version = None;
-                    self.documents[index].failed_external_version = None;
-                }
-                ExternalPollAction::ScanRename => {
-                    self.documents[index].resume_expected_version = None;
-                    self.start_rename_scan(index, path, expected);
-                }
-                ExternalPollAction::Wait(candidate) => {
-                    self.documents[index].external_candidate = Some(candidate);
-                }
-                ExternalPollAction::Conflict(candidate) => {
-                    self.documents[index].external_candidate = Some(candidate);
-                    self.documents[index].external_conflict = Some(ExternalConflict {
-                        version: candidate.0,
-                    });
-                }
-                ExternalPollAction::Resume(candidate) => {
-                    self.documents[index].external_candidate = Some(candidate);
-                    // 休止中はメタデータだけでinfo.versionを更新しない。次回activate時に
-                    // MuPDFで完全open検証できた版だけを採用する。
-                    self.documents[index].resume_expected_version = Some(candidate.0);
-                }
-                ExternalPollAction::Reload(candidate) => {
-                    self.documents[index].external_candidate = Some(candidate);
-                    self.documents[index].reload_in_flight =
-                        self.documents[index].send(DocumentCommand::Reload(path));
-                    if self.documents[index].reload_in_flight {
-                        self.status = "外部更新されたPDFを再読み込みしています…".to_owned();
-                    }
-                }
-            }
+            self.apply_external_poll_action(index, path, action);
         }
     }
 
@@ -1100,6 +1166,10 @@ impl PrototypeApp {
                     .into_owned(),
             )
             .save_file();
+        self.begin_conflicted_document_save_as(index, selected);
+    }
+
+    fn begin_conflicted_document_save_as(&mut self, index: usize, selected: Option<PathBuf>) {
         let Some(path) = selected else {
             return;
         };
@@ -4523,8 +4593,14 @@ impl PrototypeApp {
                     .to_owned(),
             );
         }
-        let action =
-            show_annotation_editor(context, bounds, editor, &mut self.recent_annotation_colors);
+        let editing_enabled = !self.documents[index].reload_in_flight;
+        let action = show_annotation_editor(
+            context,
+            bounds,
+            editor,
+            &mut self.recent_annotation_colors,
+            editing_enabled,
+        );
         match action {
             Some(AnnotationEditorAction::Close | AnnotationEditorAction::Discard) => {
                 self.annotation_editor = None;
@@ -5925,6 +6001,21 @@ fn external_poll_action(input: ExternalPollInput) -> ExternalPollAction {
         return ExternalPollAction::ScanRename;
     }
 
+    external_change_action(input)
+}
+
+fn external_replacement_action(input: ExternalPollInput) -> Option<ExternalPollAction> {
+    let current = input.current?;
+    if current == input.expected || same_file_identity(current, input.expected) {
+        return None;
+    }
+    Some(external_change_action(input))
+}
+
+fn external_change_action(input: ExternalPollInput) -> ExternalPollAction {
+    let current = input
+        .current
+        .expect("external change actions require an observed file version");
     let candidate = next_external_candidate(input.previous_candidate, current);
     if !external_reload_is_ready(
         Some(candidate),

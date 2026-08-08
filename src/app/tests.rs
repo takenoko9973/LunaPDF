@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::annotation::{AnnotationId, AnnotationKind, AnnotationSummary};
 use crate::domain::selection::PageQuad;
 use mupdf::Size;
 use mupdf::pdf::PdfDocument;
@@ -8,6 +9,12 @@ fn write_blank_pdf(path: &Path) {
     let mut document = PdfDocument::new();
     let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
     document.save(path_text).unwrap();
+}
+
+fn replace_with_blank_pdf(path: &Path, replacement: &Path) {
+    write_blank_pdf(replacement);
+    std::fs::remove_file(path).unwrap();
+    std::fs::rename(replacement, path).unwrap();
 }
 
 fn saved_tab(path: PathBuf, page_index: usize) -> SessionTab {
@@ -124,6 +131,295 @@ fn atomic_replace_changes_identity_and_is_the_only_case_that_needs_rename_scan()
 
     assert!(!same_file_identity(current, expected));
     assert_eq!(find_same_folder_rename(&path, expected), None);
+}
+
+fn finish_async_document_open(app: &mut PrototypeApp) {
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.documents[0].state == DocumentState::Opening && std::time::Instant::now() < deadline {
+        app.receive_document_events(&context);
+        if app.documents[0].state == DocumentState::Opening {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_ne!(app.documents[0].state, DocumentState::Opening);
+    assert!(app.documents[0].info.is_some());
+}
+
+fn finish_async_resume_failure(app: &mut PrototypeApp) {
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.documents[0].state == DocumentState::Opening && std::time::Instant::now() < deadline {
+        app.receive_document_events(&context);
+        if app.documents[0].state == DocumentState::Opening {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(app.documents[0].state, DocumentState::Suspended);
+    assert!(app.documents[0].service.is_none());
+}
+
+fn receive_rename_scan_result(
+    app: &mut PrototypeApp,
+    path: &Path,
+    expected: DocumentVersion,
+    observed_current: Option<DocumentVersion>,
+    candidate: Option<(PathBuf, DocumentVersion)>,
+) -> HashSet<u64> {
+    let document_id = app.documents[0].document_id;
+    app.documents[0].rename_scan_in_flight = true;
+    app.rename_scan_result_sender
+        .send(RenameScanResult {
+            document_id,
+            path: path.to_path_buf(),
+            expected,
+            observed_current,
+            candidate,
+        })
+        .unwrap();
+    app.receive_rename_scan_results()
+}
+
+#[test]
+fn rename_scan_miss_adopts_atomic_replacement_after_two_stable_results() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("atomic-source.pdf");
+    let replacement = directory.path().join("atomic-replacement.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let expected = app.documents[0].info.as_ref().unwrap().version;
+    replace_with_blank_pdf(&path, &replacement);
+    let current = read_document_version(&path).unwrap();
+
+    assert!(
+        receive_rename_scan_result(&mut app, &path, expected, Some(current), None)
+            .contains(&app.documents[0].document_id)
+    );
+    assert_eq!(app.documents[0].external_candidate, Some((current, 1)));
+    assert!(!app.documents[0].reload_in_flight);
+
+    receive_rename_scan_result(&mut app, &path, expected, Some(current), None);
+    assert_eq!(app.documents[0].external_candidate, Some((current, 2)));
+    assert!(app.documents[0].reload_in_flight);
+}
+
+#[test]
+fn rename_scan_waits_through_delete_and_recreate_before_reload() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("delete-recreate.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let expected = app.documents[0].info.as_ref().unwrap().version;
+    let _expected_handle = std::fs::File::open(&path).unwrap();
+
+    std::fs::remove_file(&path).unwrap();
+    receive_rename_scan_result(&mut app, &path, expected, None, None);
+    assert!(app.documents[0].external_candidate.is_none());
+    assert!(!app.documents[0].reload_in_flight);
+
+    write_blank_pdf(&path);
+    let recreated = read_document_version(&path).unwrap();
+    receive_rename_scan_result(&mut app, &path, expected, Some(recreated), None);
+    assert_eq!(app.documents[0].external_candidate, Some((recreated, 1)));
+    receive_rename_scan_result(&mut app, &path, expected, Some(recreated), None);
+    assert!(app.documents[0].reload_in_flight);
+}
+
+#[test]
+fn stale_rename_scan_result_is_discarded_and_new_version_starts_over() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("stale-scan.pdf");
+    let first_replacement = directory.path().join("stale-first.pdf");
+    let second_replacement = directory.path().join("stale-second.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let expected = app.documents[0].info.as_ref().unwrap().version;
+    let _expected_handle = std::fs::File::open(&path).unwrap();
+    replace_with_blank_pdf(&path, &first_replacement);
+    let stale = read_document_version(&path).unwrap();
+    replace_with_blank_pdf(&path, &second_replacement);
+    let current = read_document_version(&path).unwrap();
+    assert_ne!(stale, current);
+    assert!(!same_file_identity(current, expected));
+
+    let accepted = receive_rename_scan_result(&mut app, &path, expected, Some(stale), None);
+    assert!(accepted.is_empty());
+    assert!(app.documents[0].external_candidate.is_none());
+
+    let accepted = receive_rename_scan_result(&mut app, &path, expected, Some(current), None);
+    assert!(accepted.contains(&app.documents[0].document_id));
+    assert_eq!(app.documents[0].external_candidate, Some((current, 1)));
+}
+
+#[test]
+fn rename_candidate_wins_over_replacement_version_in_scan_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("rename-source.pdf");
+    let renamed = directory.path().join("rename-target.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let expected = app.documents[0].info.as_ref().unwrap().version;
+    std::fs::rename(&path, &renamed).unwrap();
+    write_blank_pdf(&path);
+    let replacement = read_document_version(&path).unwrap();
+
+    receive_rename_scan_result(
+        &mut app,
+        &path,
+        expected,
+        Some(replacement),
+        Some((renamed.clone(), expected)),
+    );
+    assert_eq!(app.tabs.tabs()[0].path(), renamed.as_path());
+    assert!(app.documents[0].external_candidate.is_none());
+}
+
+#[test]
+fn rename_scan_result_routes_dirty_conflict_and_recovers_failed_visible_suspended_tab() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("conflict-resume.pdf");
+    let first_replacement = directory.path().join("conflict-replacement.pdf");
+    let second_replacement = directory.path().join("resume-replacement.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let expected = app.documents[0].info.as_ref().unwrap().version;
+    let _expected_handle = std::fs::File::open(&path).unwrap();
+    replace_with_blank_pdf(&path, &first_replacement);
+    let current = read_document_version(&path).unwrap();
+
+    app.documents[0].state = DocumentState::ReadyDirty;
+    receive_rename_scan_result(&mut app, &path, expected, Some(current), None);
+    receive_rename_scan_result(&mut app, &path, expected, Some(current), None);
+    assert_eq!(
+        app.documents[0].external_conflict,
+        Some(ExternalConflict { version: current })
+    );
+
+    app.documents[0].state = DocumentState::Suspended;
+    app.documents[0].service = None;
+    app.documents[0].external_candidate = None;
+    app.documents[0].external_conflict = None;
+    app.documents[0].resume_expected_version = Some(expected);
+    app.documents[0].resume(path.clone(), expected);
+    finish_async_resume_failure(&mut app);
+    assert_eq!(app.documents[0].failed_external_version, Some(expected));
+
+    replace_with_blank_pdf(&path, &second_replacement);
+    let current = read_document_version(&path).unwrap();
+    receive_rename_scan_result(&mut app, &path, expected, Some(current), None);
+    receive_rename_scan_result(&mut app, &path, expected, Some(current), None);
+    assert_eq!(app.documents[0].state, DocumentState::Opening);
+    assert_eq!(app.documents[0].resume_expected_version, Some(current));
+    assert!(app.documents[0].service.is_some());
+}
+
+#[test]
+fn saved_as_completion_keeps_edit_copy_and_external_source_reachable() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("saved-as-source.pdf");
+    let copy = directory.path().join("saved-as-copy.pdf");
+    write_blank_pdf(&source);
+    let mut app = PrototypeApp::from_startup(
+        vec![source.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    app.documents[0].save_as = SaveAsState::Saving(SaveAsRequest {
+        path: copy.clone(),
+        expected_destination: None,
+    });
+    assert!(app.documents[0].send(DocumentCommand::SaveAs {
+        path: copy.clone(),
+        expected_destination: None,
+    }));
+
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.documents.len() < 2 && std::time::Instant::now() < deadline {
+        app.receive_document_events(&context);
+        if app.documents.len() < 2 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(app.documents.len(), 2);
+    assert_eq!(app.tabs.tabs()[0].path(), source.as_path());
+    assert_eq!(app.tabs.tabs()[1].path(), copy.as_path());
+    assert!(matches!(app.documents[0].save_as, SaveAsState::Idle));
+}
+
+#[test]
+fn cancelled_conflicted_save_as_leaves_state_untouched_without_a_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("cancel-save-as.pdf");
+    write_blank_pdf(&source);
+    let mut app = PrototypeApp::from_startup(
+        vec![source],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let pending_edits = app.documents[0].pending_edits;
+
+    app.begin_conflicted_document_save_as(0, None);
+
+    assert!(matches!(app.documents[0].save_as, SaveAsState::Idle));
+    assert!(!app.documents[0].save_in_flight);
+    assert_eq!(app.documents[0].pending_edits, pending_edits);
+    assert!(app.documents[0].error.is_none());
+}
+
+#[test]
+fn reload_in_flight_disables_annotation_editor_mutation_input() {
+    let annotation = AnnotationSummary {
+        id: AnnotationId {
+            page_index: 0,
+            xref: 1,
+        },
+        kind: AnnotationKind::Highlight,
+        contents: "before".to_owned(),
+        color: None,
+        can_edit_contents: true,
+        can_edit_color: true,
+        can_delete: true,
+    };
+    let mut editor = AnnotationEditorState::from_summary(1, 1, &annotation);
+    let context = egui::Context::default();
+    let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+    let mut colors = Vec::new();
+    let _ = context.run_ui(Default::default(), |ui| {
+        show_annotation_editor(ui.ctx(), bounds, &mut editor, &mut colors, true);
+    });
+    context.memory_mut(|memory| {
+        memory.request_focus(annotation_comment_id(1, annotation.id));
+    });
+    let _ = context.run_ui(
+        egui::RawInput {
+            events: vec![egui::Event::Text("changed".to_owned())],
+            ..Default::default()
+        },
+        |ui| {
+            show_annotation_editor(ui.ctx(), bounds, &mut editor, &mut colors, false);
+        },
+    );
+    assert_eq!(editor.buffer.contents, "before");
 }
 
 #[test]

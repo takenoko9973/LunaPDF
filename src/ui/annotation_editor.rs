@@ -352,6 +352,7 @@ pub(crate) fn show_annotation_editor(
     bounds: Rect,
     state: &mut AnnotationEditorState,
     recent_annotation_colors: &mut Vec<[u8; 3]>,
+    editing_enabled: bool,
 ) -> Option<AnnotationEditorAction> {
     let rect = match state.placement {
         AnnotationOverlayPlacement::RightEdge => annotation_overlay_rect(bounds),
@@ -424,9 +425,17 @@ pub(crate) fn show_annotation_editor(
                     )
                     .show(ui, |ui| {
                         ui.label("コメント／メモ");
+                        let contents_enabled = editing_enabled
+                            && state.can_edit_contents
+                            && !state.stale
+                            && !state.mutation_in_flight;
+                        // 既存フォーカスへ届く入力は `add_enabled(false, TextEdit)` だけでは
+                        // 保持されることがある。外部再読み込み中は作業コピーにだけ渡し、
+                        // 状態バッファへ書き戻さないことで同フレームの変更を遮断する。
+                        let mut contents = state.buffer.contents.clone();
                         ui.add_enabled(
-                            state.can_edit_contents && !state.stale && !state.mutation_in_flight,
-                            egui::TextEdit::multiline(&mut state.buffer.contents)
+                            contents_enabled,
+                            egui::TextEdit::multiline(&mut contents)
                                 .id(annotation_comment_id(
                                     state.document_id,
                                     state.annotation_id,
@@ -434,16 +443,22 @@ pub(crate) fn show_annotation_editor(
                                 .desired_rows(8)
                                 .desired_width(f32::INFINITY),
                         );
+                        if contents_enabled {
+                            state.buffer.contents = contents;
+                        }
                         ui.add_space(8.0);
                         ui.label("色");
-                        color_menu(ui, state, recent_annotation_colors);
+                        color_menu(ui, state, recent_annotation_colors, editing_enabled);
                         if let Some(notice) = &state.notice {
                             ui.colored_label(Color32::LIGHT_RED, notice);
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(state.can_save(), Button::new("保存"))
+                                .add_enabled(
+                                    editing_enabled && state.can_save(),
+                                    Button::new("保存"),
+                                )
                                 .clicked()
                             {
                                 action = Some(AnnotationEditorAction::Save);
@@ -458,7 +473,10 @@ pub(crate) fn show_annotation_editor(
                         ui.separator();
                         if ui
                             .add_enabled(
-                                state.can_delete && !state.stale && !state.mutation_in_flight,
+                                editing_enabled
+                                    && state.can_delete
+                                    && !state.stale
+                                    && !state.mutation_in_flight,
                                 Button::new("注釈を削除"),
                             )
                             .clicked()
@@ -484,8 +502,10 @@ fn color_menu(
     ui: &mut egui::Ui,
     state: &mut AnnotationEditorState,
     recent_annotation_colors: &mut Vec<[u8; 3]>,
+    editing_enabled: bool,
 ) {
-    let enabled = state.can_edit_color && !state.stale && !state.mutation_in_flight;
+    let enabled =
+        editing_enabled && state.can_edit_color && !state.stale && !state.mutation_in_flight;
     // 権限またはリビジョン状態が変わった後は下書きを適用できないため、
     // 古い変更をピッカーから通さずに破棄する。
     if !enabled {
@@ -1019,7 +1039,7 @@ mod tests {
 
         let context = egui::Context::default();
         let _output = context.run_ui(egui::RawInput::default(), |ui| {
-            color_menu(ui, &mut editor, &mut recent);
+            color_menu(ui, &mut editor, &mut recent, true);
         });
 
         assert_eq!(editor.buffer, original);
