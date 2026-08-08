@@ -5,4 +5,5 @@ mod print_layout;
 mod windows_print;
 mod worker;
 
+pub(crate) use mupdf_backend::read_document_version;
 pub(crate) use worker::{DocumentCommand, DocumentEvent, DocumentService};

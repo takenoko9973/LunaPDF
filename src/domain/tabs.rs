@@ -214,6 +214,29 @@ impl TabState {
         Ok(OpenTabResult::Opened(self.tabs.len() - 1))
     }
 
+    /// 同じファイルを追跡していることが確認できた後だけ、タブの表示・保存用パスを更新する。
+    /// TabId と分割構成はパスではなくレジストリ順に結び付くため、ここで再作成してはならない。
+    pub(crate) fn rebind_path(&mut self, index: usize, path: impl AsRef<Path>) -> io::Result<()> {
+        let canonical_path = std::fs::canonicalize(path)?;
+        if self
+            .tabs
+            .iter()
+            .enumerate()
+            .any(|(other, tab)| other != index && tab.path == canonical_path)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a tab for the renamed PDF already exists",
+            ));
+        }
+        let tab = self
+            .tabs
+            .get_mut(index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tab index is unavailable"))?;
+        tab.path = canonical_path;
+        Ok(())
+    }
+
     pub(crate) fn select(&mut self, index: usize) -> bool {
         let Some(tab_id) = self.tabs.get(index).map(Tab::id) else {
             return false;

@@ -120,13 +120,14 @@ impl MuPdfBackend {
     /// PDF を開き、所有ワーカー上で軽量なページ形状を読み取る。
     pub(super) fn open(path: PathBuf) -> Result<Self> {
         let version_before_open = read_document_version(&path)?;
-        let mupdf_path = path
-            .to_str()
-            .context("MuPDF requires a Unicode path on Windows")?;
+        // 通常表示では MuPDF にパスを渡さない。Windows ではその FILE* が rename を拒否する
+        // ため、検証済みのバイト列を所有して開き、ファイルハンドルの寿命をこの読み取りだけにする。
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read PDF: {}", path.display()))?;
         // 起動時間はデバッグ表示専用なので、リリースでは計測自体を省く。
         #[cfg(debug_assertions)]
         let open_started = Instant::now();
-        let document = PdfDocument::open(mupdf_path)
+        let document = PdfDocument::from_bytes(&bytes)
             .with_context(|| format!("failed to open PDF: {}", path.display()))?;
         ensure!(
             !document.needs_password()?,
@@ -151,8 +152,56 @@ impl MuPdfBackend {
             highlight_capability,
             pending_edits: Vec::new(),
             display_list: None,
-            incremental_association_lost: false,
+            incremental_association_lost: true,
         })
+    }
+
+    /// 同一 file identity を保った名前変更だけを新しい保存先へ反映する。
+    pub(super) fn rebind_path(&mut self, path: PathBuf) -> Result<()> {
+        let version = read_document_version(&path)?;
+        ensure!(
+            version.identity_primary == self.version.identity_primary
+                && version.identity_secondary == self.version.identity_secondary,
+            "the renamed path does not identify the open PDF"
+        );
+        self.path = path;
+        self.version = version;
+        Ok(())
+    }
+
+    /// 外部更新を完全に検証してから入れ替える。失敗時は呼び出し側の表示を維持する。
+    pub(super) fn reload(&mut self, path: PathBuf) -> Result<DocumentInfo> {
+        let mut replacement = Self::open(path)?;
+        replacement.revision = self.revision.wrapping_add(1);
+        let info = replacement.info()?;
+        *self = replacement;
+        Ok(info)
+    }
+
+    /// Save As は現在の関連付け先を変更せず、編集中の版だけを新規ファイルへ書き出す。
+    pub(super) fn save_as(&self, path: &Path) -> Result<()> {
+        ensure!(
+            path != self.path,
+            "Save As destination must differ from the source PDF"
+        );
+        let name = path
+            .to_str()
+            .context("MuPDF cannot save a path that is not valid Unicode")?;
+        let mut options = PdfWriteOptions::default();
+        options
+            .set_incremental(false)
+            .set_encryption(Encryption::Keep);
+        self.document
+            .save_with_options(name, options)
+            .with_context(|| format!("failed to save PDF copy: {}", path.display()))?;
+        let saved = PdfDocument::open(name).context("saved PDF copy could not be reopened")?;
+        verify_saved_document(
+            &saved,
+            self.page_bounds.len(),
+            highlight_count(&self.document)?,
+            &self.pending_edits,
+        )?;
+        Ok(())
     }
 
     pub(super) fn info(&self) -> Result<DocumentInfo> {
@@ -1318,7 +1367,7 @@ fn cleanup_temp_after_error(temp_path: TempPath, error: anyhow::Error) -> anyhow
     }
 }
 
-fn read_document_version(path: &Path) -> Result<DocumentVersion> {
+pub(crate) fn read_document_version(path: &Path) -> Result<DocumentVersion> {
     // ハンドルベースのメタデータは Windows のボリューム ID とファイル ID を提供する。
     // パスのみのメタデータではこれらが欠落し、同じサイズのパス置換を検出できない場合がある。
     let file = fs::File::open(path)

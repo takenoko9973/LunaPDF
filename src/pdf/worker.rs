@@ -52,6 +52,9 @@ pub(crate) enum DocumentCommand {
         auto_rotate: bool,
     },
     Save,
+    SaveAs(PathBuf),
+    Reload(PathBuf),
+    RebindPath(PathBuf),
     Shutdown,
 }
 
@@ -59,6 +62,11 @@ pub(crate) enum DocumentCommand {
 pub(crate) enum DocumentEvent {
     Opened(DocumentInfo),
     DocumentChanged(DocumentInfo),
+    PathRebound {
+        path: PathBuf,
+        info: DocumentInfo,
+    },
+    SavedAs(PathBuf),
     TileRendered(RenderedTile),
     SelectionReady(SelectionSnapshot),
     TextSnapshotReady(TextPageSnapshot),
@@ -553,6 +561,27 @@ fn run_worker(
                     send_info(&backend, &event_sender, "save");
                 }
                 Err(error) => send_failure(&event_sender, "save", error),
+            },
+            DocumentCommand::SaveAs(path) => match backend.save_as(&path) {
+                Ok(()) => {
+                    let _ = event_sender.send(DocumentEvent::SavedAs(path));
+                }
+                Err(error) => send_failure(&event_sender, "save-as", error),
+            },
+            DocumentCommand::Reload(path) => match backend.reload(path) {
+                Ok(info) => {
+                    let _ = event_sender.send(DocumentEvent::DocumentChanged(info));
+                }
+                Err(error) => send_failure(&event_sender, "reload", error),
+            },
+            DocumentCommand::RebindPath(path) => match backend.rebind_path(path.clone()) {
+                Ok(()) => match backend.info() {
+                    Ok(info) => {
+                        let _ = event_sender.send(DocumentEvent::PathRebound { path, info });
+                    }
+                    Err(error) => send_failure(&event_sender, "rename", error),
+                },
+                Err(error) => send_failure(&event_sender, "rename", error),
             },
             DocumentCommand::Shutdown => return,
         }

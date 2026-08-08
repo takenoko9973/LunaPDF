@@ -3,6 +3,7 @@ use super::*;
 impl PrototypeApp {
     pub(super) fn receive_document_events(&mut self, context: &egui::Context) {
         let mut failed_restored_paths = Vec::new();
+        let mut saved_as_paths = Vec::new();
         for index in 0..self.documents.len() {
             while let Some(event) = self.documents[index]
                 .service
@@ -29,6 +30,9 @@ impl PrototypeApp {
                             DocumentState::ReadyClean
                         };
                         self.documents[index].error = None;
+                        self.documents[index].external_candidate = None;
+                        self.documents[index].external_conflict_reported = false;
+                        self.documents[index].reload_in_flight = false;
                         self.documents[index].info = Some(info);
                         if highlight_index_needs_reset {
                             self.documents[index].reset_highlight_index(revision, page_count);
@@ -75,6 +79,9 @@ impl PrototypeApp {
                             && !self.close_all_pending
                             && !self.documents[index].search.query.trim().is_empty();
                         let tab = &mut self.documents[index];
+                        tab.external_candidate = None;
+                        tab.external_conflict_reported = false;
+                        tab.reload_in_flight = false;
                         let changed_highlight_page = tab.pending_highlight_refresh_page.take();
                         if info.dirty {
                             tab.state = state_after_document_info(tab.state, true);
@@ -109,6 +116,31 @@ impl PrototypeApp {
                         }
                         if restart_search {
                             self.begin_search(index);
+                        }
+                    }
+                    Ok(DocumentEvent::PathRebound { path, info }) => {
+                        match self.tabs.rebind_path(index, &path) {
+                            Ok(()) => {
+                                self.documents[index].info = Some(info);
+                                self.documents[index].external_candidate = None;
+                                self.status =
+                                    format!("PDF の名前変更を追跡しました: {}", path.display());
+                            }
+                            Err(error) => {
+                                self.documents[index].error = Some(format!(
+                                    "名前変更後のPDFを追跡できませんでした。既存タブとの衝突を解消してください。詳細: {error}"
+                                ));
+                            }
+                        }
+                    }
+                    Ok(DocumentEvent::SavedAs(path)) => {
+                        let original = self.tabs.tabs()[index].path().to_path_buf();
+                        self.documents[index].reload_in_flight =
+                            self.documents[index].send(DocumentCommand::Reload(original));
+                        if self.documents[index].reload_in_flight {
+                            self.documents[index].saved_as_path = Some(path);
+                            self.status =
+                                "編集版を保存しました。外部版を再読み込みしています…".to_owned();
                         }
                     }
                     Ok(DocumentEvent::TileRendered(mut tile)) => {
@@ -516,6 +548,10 @@ impl PrototypeApp {
                             {
                                 confirmation.save_in_flight = false;
                             }
+                        } else if operation == "reload" {
+                            self.documents[index].reload_in_flight = false;
+                        } else if operation == "save-as" {
+                            self.documents[index].saved_as_path = None;
                         } else if operation == "open"
                             || operation == "resume"
                             || operation == "document-info"
@@ -565,6 +601,22 @@ impl PrototypeApp {
         // おそれがある。すべてのキューの後で遅延クローズを実行する。
         if let Some(path) = self.saved_tab_to_close.take() {
             self.close_tab_by_path(&path);
+        }
+        for index in 0..self.documents.len() {
+            if !self.documents[index].reload_in_flight
+                && self.documents[index].saved_as_path.is_some()
+                && self.documents[index]
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| !info.dirty)
+            {
+                if let Some(path) = self.documents[index].saved_as_path.take() {
+                    saved_as_paths.push(path);
+                }
+            }
+        }
+        for path in saved_as_paths {
+            self.open_document(path);
         }
         for path in failed_restored_paths {
             if let Some(index) = self.tabs.tabs().iter().position(|tab| tab.path() == path) {

@@ -9,9 +9,7 @@ mod workspace;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-#[cfg(debug_assertions)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{
@@ -25,8 +23,9 @@ use crate::domain::annotation::{
     AnnotationSummary, HighlightIndexBatch, HighlightIndexRequest,
 };
 use crate::domain::document::{
-    DocumentInfo, EditAction, HighlightRequest, OutlineItem, RenderPriority, RenderedThumbnail,
-    RenderedTile, SearchMatch, SearchPageResult, ThumbnailRequest, TileRequest, TileSpec,
+    DocumentInfo, DocumentVersion, EditAction, HighlightRequest, OutlineItem, RenderPriority,
+    RenderedThumbnail, RenderedTile, SearchMatch, SearchPageResult, ThumbnailRequest, TileRequest,
+    TileSpec,
 };
 use crate::domain::selection::{
     PagePoint, SelectionSnapshot, TextPageSnapshot, TextSnapshotRequest,
@@ -40,7 +39,7 @@ use crate::domain::tabs::{
     OpenTabResult, RestoredTabEntry, SplitDirection, SplitGroupId, SplitSide, TabEntry, TabId,
     TabState,
 };
-use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService};
+use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService, read_document_version};
 use crate::persistence::session_store::SessionStore;
 #[cfg(windows)]
 use crate::platform::windows::default_apps::{
@@ -207,6 +206,7 @@ pub(crate) struct PrototypeApp {
     // egui-winit は対応する押下状態の Key イベントなしに Event::Copy を送る。
     // 解放イベントでラッチを解除し、OS のキーリピートで PDF を再コピーしない。
     copy_shortcut_active: bool,
+    last_external_check: Instant,
 }
 
 struct DocumentTab {
@@ -250,6 +250,10 @@ struct DocumentTab {
     #[cfg(debug_assertions)]
     render_performance: RenderPerformance,
     restoring_from_session: bool,
+    external_candidate: Option<(DocumentVersion, u8)>,
+    external_conflict_reported: bool,
+    reload_in_flight: bool,
+    saved_as_path: Option<PathBuf>,
 }
 
 struct HighlightIndexState {
@@ -831,6 +835,7 @@ impl PrototypeApp {
             annotation_picker: None,
             recent_annotation_colors,
             copy_shortcut_active: false,
+            last_external_check: Instant::now(),
         };
         if restore_enabled && let Some(session) = saved_session {
             app.restore_session(session);
@@ -852,6 +857,85 @@ impl PrototypeApp {
 
     fn open_document(&mut self, path: PathBuf) {
         let _opened_index = self.open_document_with_intent(path, OpenIntent::User);
+    }
+
+    /// 短いポーリングで安定した外部版だけを採用する。通知 API の一回限りのイベントでは
+    /// 0 byte・delete/recreate・atomic replace の途中状態を区別できないためである。
+    fn check_external_changes(&mut self) {
+        if self.last_external_check.elapsed() < Duration::from_millis(300) {
+            return;
+        }
+        self.last_external_check = Instant::now();
+        for index in 0..self.documents.len() {
+            let Some(info) = self.documents[index].info.as_ref() else {
+                continue;
+            };
+            if self.documents[index].state == DocumentState::Suspended {
+                continue;
+            }
+            let path = self.tabs.tabs()[index].path().to_path_buf();
+            let expected = info.version;
+            let current = read_document_version(&path).ok();
+            if current == Some(expected) {
+                self.documents[index].external_candidate = None;
+                continue;
+            }
+
+            if current.is_none() {
+                if let Some(renamed) = find_same_folder_rename(&path, expected) {
+                    if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
+                        self.status = "PDF の名前変更を追跡しています…".to_owned();
+                    }
+                }
+                continue;
+            }
+            let current = current.expect("checked above");
+            let stable_count = match self.documents[index].external_candidate {
+                Some((candidate, count)) if candidate == current => count.saturating_add(1),
+                _ => 1,
+            };
+            self.documents[index].external_candidate = Some((current, stable_count));
+            if stable_count < 2 || self.documents[index].reload_in_flight {
+                continue;
+            }
+            let document_id = self.documents[index].document_id;
+            let editor_dirty = self.annotation_editor.as_ref().is_some_and(|editor| {
+                editor.document_id == document_id
+                    && (editor.is_dirty() || editor.mutation_in_flight)
+            });
+            if self.documents[index].has_unsaved_changes() || editor_dirty {
+                if !self.documents[index].external_conflict_reported {
+                    self.documents[index].external_conflict_reported = true;
+                    self.documents[index].error = Some(
+                        "外部でPDFが更新されました。未保存の編集を保護するため、自動再読み込みを停止しています。編集版を別名保存してから外部版を再読み込みしてください。".to_owned(),
+                    );
+                }
+                continue;
+            }
+            self.documents[index].reload_in_flight =
+                self.documents[index].send(DocumentCommand::Reload(path));
+            if self.documents[index].reload_in_flight {
+                self.documents[index].invalidate_rendering();
+                self.documents[index].invalidate_text_snapshots();
+                self.documents[index].invalidate_annotation_pages();
+                self.status = "外部更新されたPDFを再読み込みしています…".to_owned();
+            }
+        }
+    }
+
+    fn save_conflicted_document_as(&mut self, index: usize) {
+        let source = self.tabs.tabs()[index].path();
+        let selected = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(source.file_name().unwrap_or(source.as_os_str()))
+            .save_file();
+        let Some(path) = selected else {
+            return;
+        };
+        if self.documents[index].send(DocumentCommand::SaveAs(path.clone())) {
+            self.documents[index].saved_as_path = Some(path);
+            self.status = "編集版を別名保存しています…".to_owned();
+        }
     }
 
     /// ネイティブピッカーを開き、明示的に選択された PDF だけを渡す。
@@ -3343,26 +3427,35 @@ impl PrototypeApp {
         });
     }
 
-    fn error_banner(&self, root_ui: &mut egui::Ui) {
-        let app_error = self.error.as_deref();
+    fn error_banner(&mut self, root_ui: &mut egui::Ui) {
+        let app_error = self.error.clone();
         let document_error = self
             .active_index()
-            .and_then(|index| self.documents[index].error.as_deref());
+            .and_then(|index| self.documents[index].error.clone());
         let page_input_error = self
             .active_index()
-            .and_then(|index| self.documents[index].page_input_error.as_deref());
+            .and_then(|index| self.documents[index].page_input_error.clone());
         if app_error.is_none() && document_error.is_none() && page_input_error.is_none() {
             return;
         }
+        let conflict_index = self.active_index().filter(|index| {
+            self.documents[*index].external_conflict_reported
+                && self.documents[*index].has_unsaved_changes()
+        });
         egui::Panel::top("persistent-error-banner").show(root_ui, |ui| {
-            if let Some(error) = app_error {
+            if let Some(error) = app_error.as_deref() {
                 ui.colored_label(Color32::LIGHT_RED, error);
             }
-            if let Some(error) = document_error {
+            if let Some(error) = document_error.as_deref() {
                 ui.colored_label(Color32::LIGHT_RED, error);
             }
-            if let Some(error) = page_input_error {
+            if let Some(error) = page_input_error.as_deref() {
                 ui.colored_label(Color32::LIGHT_RED, error);
+            }
+            if let Some(index) = conflict_index
+                && ui.button("編集版を別名保存して外部版を読み込む").clicked()
+            {
+                self.save_conflicted_document_as(index);
             }
         });
     }
@@ -4673,6 +4766,10 @@ impl DocumentTab {
             #[cfg(debug_assertions)]
             render_performance: RenderPerformance::default(),
             restoring_from_session,
+            external_candidate: None,
+            external_conflict_reported: false,
+            reload_in_flight: false,
+            saved_as_path: None,
         }
     }
 
@@ -4888,6 +4985,7 @@ impl DocumentTab {
 
     fn has_unsaved_changes(&self) -> bool {
         self.state == DocumentState::ReadyDirty
+            || self.state == DocumentState::Saving
             || self.pending_edits > 0
             || self.info.as_ref().is_some_and(|info| info.dirty)
     }
@@ -5315,6 +5413,7 @@ impl eframe::App for PrototypeApp {
             self.cancel_all_viewport_interactions();
         }
         self.receive_document_events(context);
+        self.check_external_changes();
         self.maybe_suspend_inactive_document();
         let external_request_received = self.receive_external_open_events(context);
         self.handle_dropped_files(context);
@@ -5396,6 +5495,22 @@ fn state_after_document_info(current: DocumentState, dirty: bool) -> DocumentSta
     } else {
         DocumentState::ReadyClean
     }
+}
+
+/// 同一フォルダだけを走査し、元の file identity と一致する候補を名前変更として扱う。
+/// 元パスへ新しい PDF が作られた場合は identity が異なるため、この経路で誤認しない。
+fn find_same_folder_rename(path: &Path, expected: DocumentVersion) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    std::fs::read_dir(parent)
+        .ok()?
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let candidate = entry.path();
+            let version = read_document_version(&candidate).ok()?;
+            (version.identity_primary == expected.identity_primary
+                && version.identity_secondary == expected.identity_secondary)
+                .then(|| candidate)
+        })
 }
 
 fn text_snapshot_result_is_current(
