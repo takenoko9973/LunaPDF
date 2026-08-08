@@ -53,7 +53,10 @@ impl PrototypeApp {
                             self.finish_session_restore(true);
                         }
                     }
-                    Ok(DocumentEvent::DocumentChanged(info)) => {
+                    Ok(DocumentEvent::DocumentChanged {
+                        info,
+                        external_reload,
+                    }) => {
                         if self.is_visible_index(index) {
                             self.documents[index].view.stop_autoscroll();
                             self.cancel_viewport_for_index(index);
@@ -79,10 +82,21 @@ impl PrototypeApp {
                             && !self.close_all_pending
                             && !self.documents[index].search.query.trim().is_empty();
                         let tab = &mut self.documents[index];
-                        tab.external_candidate = None;
-                        tab.external_conflict_reported = false;
-                        tab.reload_in_flight = false;
-                        tab.failed_external_version = None;
+                        if external_reload {
+                            tab.external_candidate = None;
+                            tab.external_conflict_reported = false;
+                            tab.reload_in_flight = false;
+                            tab.failed_external_version = None;
+                            tab.outline = None;
+                            tab.outline_requested = false;
+                            tab.clear_selection();
+                            tab.search.generation = tab.search.generation.wrapping_add(1);
+                            tab.search.pages.clear();
+                            tab.search.selected = None;
+                            tab.search.completed_pages = 0;
+                            tab.search.truncated = false;
+                            tab.search.in_progress = false;
+                        }
                         tab.pending_rebind_path = None;
                         let changed_highlight_page = tab.pending_highlight_refresh_page.take();
                         if info.dirty {
@@ -118,6 +132,12 @@ impl PrototypeApp {
                         }
                         if restart_search {
                             self.begin_search(index);
+                        }
+                        if external_reload
+                            && !self.documents[index].outline_requested
+                            && self.documents[index].send(DocumentCommand::LoadOutline)
+                        {
+                            self.documents[index].outline_requested = true;
                         }
                     }
                     Ok(DocumentEvent::PathRebound { path, info }) => {

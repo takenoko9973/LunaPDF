@@ -872,9 +872,6 @@ impl PrototypeApp {
             let Some(info) = self.documents[index].info.as_ref() else {
                 continue;
             };
-            if self.documents[index].state == DocumentState::Suspended {
-                continue;
-            }
             let path = self.tabs.tabs()[index].path().to_path_buf();
             let expected = info.version;
             let current = read_document_version(&path).ok();
@@ -899,6 +896,13 @@ impl PrototypeApp {
                                 .to_owned(),
                         );
                     } else if self.tabs.rebind_path(index, &renamed).is_ok() {
+                        if self.documents[index].state == DocumentState::Suspended {
+                            if let Some(info) = self.documents[index].info.as_mut() {
+                                info.path = self.tabs.tabs()[index].path().to_path_buf();
+                            }
+                            self.status = "休止中のPDFの名前変更を追跡しました。".to_owned();
+                            continue;
+                        }
                         if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
                             self.documents[index].pending_rebind_path = Some(path);
                             self.status = "PDF の名前変更を追跡しています…".to_owned();
@@ -923,6 +927,14 @@ impl PrototypeApp {
                 self.documents[index].failed_external_version,
                 self.documents[index].reload_in_flight,
             ) {
+                continue;
+            }
+            if self.documents[index].state == DocumentState::Suspended {
+                // 休止中は表示キャッシュを持たず、次の resume が安定した最新版を検証して開く。
+                if let Some(info) = self.documents[index].info.as_mut() {
+                    info.version = current;
+                }
+                self.documents[index].external_candidate = None;
                 continue;
             }
             let document_id = self.documents[index].document_id;

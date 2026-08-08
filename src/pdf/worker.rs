@@ -61,7 +61,10 @@ pub(crate) enum DocumentCommand {
 #[derive(Debug)]
 pub(crate) enum DocumentEvent {
     Opened(DocumentInfo),
-    DocumentChanged(DocumentInfo),
+    DocumentChanged {
+        info: DocumentInfo,
+        external_reload: bool,
+    },
     PathRebound {
         path: PathBuf,
         info: DocumentInfo,
@@ -570,7 +573,10 @@ fn run_worker(
             },
             DocumentCommand::Reload(path) => match backend.reload(path) {
                 Ok(info) => {
-                    let _ = event_sender.send(DocumentEvent::DocumentChanged(info));
+                    let _ = event_sender.send(DocumentEvent::DocumentChanged {
+                        info,
+                        external_reload: true,
+                    });
                 }
                 Err(error) => send_failure(&event_sender, "reload", error),
             },
@@ -749,7 +755,10 @@ fn send_info(
 ) {
     match backend.info() {
         Ok(info) => {
-            let _ = event_sender.send(DocumentEvent::DocumentChanged(info));
+            let _ = event_sender.send(DocumentEvent::DocumentChanged {
+                info,
+                external_reload: false,
+            });
         }
         Err(error) => send_failure(event_sender, failure_operation, error),
     }
@@ -1256,7 +1265,7 @@ mod tests {
                     assert_eq!(revision_after, 1);
                     action_received = true;
                 }
-                Ok(DocumentEvent::DocumentChanged(info)) => {
+                Ok(DocumentEvent::DocumentChanged { info, .. }) => {
                     if info.revision == 1 {
                         assert!(info.dirty);
                         revision_received = true;
