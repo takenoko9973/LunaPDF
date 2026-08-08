@@ -253,7 +253,9 @@ struct DocumentTab {
     external_candidate: Option<(DocumentVersion, u8)>,
     external_conflict_reported: bool,
     reload_in_flight: bool,
-    saved_as_path: Option<PathBuf>,
+    save_as_after_editor_commit: Option<PathBuf>,
+    failed_external_version: Option<DocumentVersion>,
+    pending_rebind_path: Option<PathBuf>,
 }
 
 struct HighlightIndexState {
@@ -881,8 +883,10 @@ impl PrototypeApp {
                 continue;
             }
 
-            if current.is_none() {
-                if let Some(renamed) = find_same_folder_rename(&path, expected) {
+            // 旧パスへ別 PDF がすぐ再作成されても、先に元 identity の候補を探す。
+            // これを後回しにすると、その新しい PDF を旧タブへ誤って reload してしまう。
+            if let Some(renamed) = find_same_folder_rename(&path, expected) {
+                if renamed != path {
                     let collides = self
                         .tabs
                         .tabs()
@@ -894,10 +898,18 @@ impl PrototypeApp {
                             "名前変更先は既存タブで開かれているため、タブを統合せず追跡を停止しました。"
                                 .to_owned(),
                         );
-                    } else if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
-                        self.status = "PDF の名前変更を追跡しています…".to_owned();
+                    } else if self.tabs.rebind_path(index, &renamed).is_ok() {
+                        if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
+                            self.documents[index].pending_rebind_path = Some(path);
+                            self.status = "PDF の名前変更を追跡しています…".to_owned();
+                        } else {
+                            let _ = self.tabs.replace_path(index, path);
+                        }
                     }
                 }
+                continue;
+            }
+            if current.is_none() {
                 continue;
             }
             let current = current.expect("checked above");
@@ -906,7 +918,11 @@ impl PrototypeApp {
                 _ => 1,
             };
             self.documents[index].external_candidate = Some((current, stable_count));
-            if stable_count < 2 || self.documents[index].reload_in_flight {
+            if !external_reload_is_ready(
+                self.documents[index].external_candidate,
+                self.documents[index].failed_external_version,
+                self.documents[index].reload_in_flight,
+            ) {
                 continue;
             }
             let document_id = self.documents[index].document_id;
@@ -926,9 +942,6 @@ impl PrototypeApp {
             self.documents[index].reload_in_flight =
                 self.documents[index].send(DocumentCommand::Reload(path));
             if self.documents[index].reload_in_flight {
-                self.documents[index].invalidate_rendering();
-                self.documents[index].invalidate_text_snapshots();
-                self.documents[index].invalidate_annotation_pages();
                 self.status = "外部更新されたPDFを再読み込みしています…".to_owned();
             }
         }
@@ -949,8 +962,29 @@ impl PrototypeApp {
         let Some(path) = selected else {
             return;
         };
+        let destination = std::fs::canonicalize(&path).unwrap_or(path.clone());
+        if self.tabs.tabs().iter().any(|tab| tab.path() == destination) {
+            self.documents[index].error = Some(
+                "別名保存先は既に開かれているタブです。編集版と既存タブを保護するため上書きを中止しました。"
+                    .to_owned(),
+            );
+            return;
+        }
+        let document_id = self.documents[index].document_id;
+        if self.annotation_editor.as_ref().is_some_and(|editor| {
+            editor.document_id == document_id && (editor.is_dirty() || editor.mutation_in_flight)
+        }) {
+            self.documents[index].save_as_after_editor_commit = Some(path);
+            if self
+                .annotation_editor
+                .as_ref()
+                .is_some_and(|editor| editor.is_dirty())
+            {
+                self.request_annotation_update(index);
+            }
+            return;
+        }
         if self.documents[index].send(DocumentCommand::SaveAs(path.clone())) {
-            self.documents[index].saved_as_path = Some(path);
             self.status = "編集版を別名保存しています…".to_owned();
         }
     }
@@ -4786,7 +4820,9 @@ impl DocumentTab {
             external_candidate: None,
             external_conflict_reported: false,
             reload_in_flight: false,
-            saved_as_path: None,
+            save_as_after_editor_commit: None,
+            failed_external_version: None,
+            pending_rebind_path: None,
         }
     }
 
@@ -5528,6 +5564,15 @@ fn find_same_folder_rename(path: &Path, expected: DocumentVersion) -> Option<Pat
                 && version.identity_secondary == expected.identity_secondary)
                 .then_some(candidate)
         })
+}
+
+fn external_reload_is_ready(
+    candidate: Option<(DocumentVersion, u8)>,
+    failed: Option<DocumentVersion>,
+    reload_in_flight: bool,
+) -> bool {
+    matches!(candidate, Some((version, count)) if count >= 2 && failed != Some(version))
+        && !reload_in_flight
 }
 
 fn text_snapshot_result_is_current(

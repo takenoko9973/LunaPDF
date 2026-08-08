@@ -82,6 +82,8 @@ impl PrototypeApp {
                         tab.external_candidate = None;
                         tab.external_conflict_reported = false;
                         tab.reload_in_flight = false;
+                        tab.failed_external_version = None;
+                        tab.pending_rebind_path = None;
                         let changed_highlight_page = tab.pending_highlight_refresh_page.take();
                         if info.dirty {
                             tab.state = state_after_document_info(tab.state, true);
@@ -119,26 +121,19 @@ impl PrototypeApp {
                         }
                     }
                     Ok(DocumentEvent::PathRebound { path, info }) => {
-                        match self.tabs.rebind_path(index, &path) {
-                            Ok(()) => {
-                                self.documents[index].info = Some(info);
-                                self.documents[index].external_candidate = None;
-                                self.status =
-                                    format!("PDF の名前変更を追跡しました: {}", path.display());
-                            }
-                            Err(error) => {
-                                self.documents[index].error = Some(format!(
-                                    "名前変更後のPDFを追跡できませんでした。既存タブとの衝突を解消してください。詳細: {error}"
-                                ));
-                            }
-                        }
+                        self.documents[index].info = Some(info);
+                        self.documents[index].external_candidate = None;
+                        self.documents[index].pending_rebind_path = None;
+                        self.status = format!("PDF の名前変更を追跡しました: {}", path.display());
                     }
                     Ok(DocumentEvent::SavedAs(path)) => {
                         let original = self.tabs.tabs()[index].path().to_path_buf();
+                        // 先に別名版を新規タブとして残す。外部版の reload が失敗しても、
+                        // 成功した編集版の到達可能性を失ってはならない。
+                        saved_as_paths.push(path.clone());
                         self.documents[index].reload_in_flight =
                             self.documents[index].send(DocumentCommand::Reload(original));
                         if self.documents[index].reload_in_flight {
-                            self.documents[index].saved_as_path = Some(path);
                             self.status =
                                 "編集版を保存しました。外部版を再読み込みしています…".to_owned();
                         }
@@ -252,6 +247,12 @@ impl PrototypeApp {
                             })
                         }) {
                             self.annotation_editor = None;
+                        }
+                        if let Some(path) = tab.save_as_after_editor_commit.take()
+                            && tab.send(DocumentCommand::SaveAs(path.clone()))
+                        {
+                            self.status =
+                                "未確定の注釈を反映し、編集版を別名保存しています…".to_owned();
                         }
                     }
                     Ok(DocumentEvent::EditActionUndone(action)) => {
@@ -550,8 +551,16 @@ impl PrototypeApp {
                             }
                         } else if operation == "reload" {
                             self.documents[index].reload_in_flight = false;
+                            self.documents[index].failed_external_version = self.documents[index]
+                                .external_candidate
+                                .map(|(version, _)| version);
                         } else if operation == "save-as" {
-                            self.documents[index].saved_as_path = None;
+                            self.documents[index].save_as_after_editor_commit = None;
+                        } else if operation == "rename" {
+                            if let Some(previous) = self.documents[index].pending_rebind_path.take()
+                            {
+                                let _ = self.tabs.replace_path(index, previous);
+                            }
                         } else if operation == "open"
                             || operation == "resume"
                             || operation == "document-info"
@@ -601,18 +610,6 @@ impl PrototypeApp {
         // おそれがある。すべてのキューの後で遅延クローズを実行する。
         if let Some(path) = self.saved_tab_to_close.take() {
             self.close_tab_by_path(&path);
-        }
-        for index in 0..self.documents.len() {
-            if !self.documents[index].reload_in_flight
-                && self.documents[index].saved_as_path.is_some()
-                && self.documents[index]
-                    .info
-                    .as_ref()
-                    .is_some_and(|info| !info.dirty)
-                && let Some(path) = self.documents[index].saved_as_path.take()
-            {
-                saved_as_paths.push(path);
-            }
         }
         for path in saved_as_paths {
             self.open_document(path);

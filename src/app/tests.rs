@@ -45,6 +45,57 @@ fn runtime_tab_ids(count: usize) -> (tempfile::TempDir, Vec<TabId>) {
     (directory, ids)
 }
 
+#[test]
+fn rename_tracking_finds_the_original_identity_when_old_path_is_recreated() {
+    let directory = tempfile::tempdir().unwrap();
+    let old_path = directory.path().join("source.pdf");
+    let renamed_path = directory.path().join("renamed.pdf");
+    write_blank_pdf(&old_path);
+    let expected = read_document_version(&old_path).unwrap();
+    std::fs::rename(&old_path, &renamed_path).unwrap();
+    write_blank_pdf(&old_path);
+
+    assert_ne!(read_document_version(&old_path).unwrap(), expected);
+    assert_eq!(
+        find_same_folder_rename(&old_path, expected),
+        Some(renamed_path)
+    );
+}
+
+#[test]
+fn failed_external_version_is_not_retried_until_a_new_stable_version_arrives() {
+    let failed = DocumentVersion {
+        identity_primary: 1,
+        identity_secondary: 2,
+        length: 3,
+        modified: std::time::SystemTime::UNIX_EPOCH,
+    };
+    let next = DocumentVersion {
+        length: 4,
+        ..failed
+    };
+    assert!(!external_reload_is_ready(
+        Some((failed, 2)),
+        Some(failed),
+        false
+    ));
+    assert!(!external_reload_is_ready(
+        Some((next, 1)),
+        Some(failed),
+        false
+    ));
+    assert!(!external_reload_is_ready(
+        Some((next, 2)),
+        Some(failed),
+        true
+    ));
+    assert!(external_reload_is_ready(
+        Some((next, 2)),
+        Some(failed),
+        false
+    ));
+}
+
 fn finish_async_session_restore(app: &mut PrototypeApp) {
     let context = egui::Context::default();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

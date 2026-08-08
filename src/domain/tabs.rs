@@ -218,11 +218,17 @@ impl TabState {
     /// TabId と分割構成はパスではなくレジストリ順に結び付くため、ここで再作成してはならない。
     pub(crate) fn rebind_path(&mut self, index: usize, path: impl AsRef<Path>) -> io::Result<()> {
         let canonical_path = std::fs::canonicalize(path)?;
+        self.replace_path(index, canonical_path)
+    }
+
+    /// ファイルシステム上で消えた旧パスにも戻せるよう、予約済みのタブ経路を置換する。
+    /// 呼び出し側は候補を正規化してから予約し、失敗時は同じ API で以前の値へ戻す。
+    pub(crate) fn replace_path(&mut self, index: usize, path: PathBuf) -> io::Result<()> {
         if self
             .tabs
             .iter()
             .enumerate()
-            .any(|(other, tab)| other != index && tab.path == canonical_path)
+            .any(|(other, tab)| other != index && tab.path == path)
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -233,7 +239,7 @@ impl TabState {
             .tabs
             .get_mut(index)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tab index is unavailable"))?;
-        tab.path = canonical_path;
+        tab.path = path;
         Ok(())
     }
 
