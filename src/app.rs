@@ -43,7 +43,9 @@ use crate::domain::tabs::{
 use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService};
 use crate::persistence::session_store::SessionStore;
 #[cfg(windows)]
-use crate::platform::windows::default_apps::open_default_apps_settings;
+use crate::platform::windows::default_apps::{
+    DefaultAppState, default_app_menu_item, open_default_apps_settings, query_default_app_state,
+};
 use crate::render::cache::WeightedLruCache;
 use crate::render::layout::{ContinuousLayout, PAGE_GAP, PageAnchor};
 use crate::render::tiles::TileGrid;
@@ -172,6 +174,10 @@ pub(crate) struct PrototypeApp {
     viewports: HashMap<SplitSide, PageViewport>,
     status: String,
     error: Option<String>,
+    #[cfg(windows)]
+    default_apps_state: DefaultAppState,
+    #[cfg(windows)]
+    default_apps_menu_open: bool,
     close_confirmation: Option<CloseConfirmation>,
     approved_window_documents: HashSet<PathBuf>,
     allow_window_close: bool,
@@ -794,6 +800,10 @@ impl PrototypeApp {
             viewports,
             status: "Drop a PDF into the window to open it".to_owned(),
             error: session_load_error,
+            #[cfg(windows)]
+            default_apps_state: DefaultAppState::Unavailable("まだ照会していません".to_owned()),
+            #[cfg(windows)]
+            default_apps_menu_open: false,
             close_confirmation: None,
             approved_window_documents: HashSet::new(),
             allow_window_close: false,
@@ -826,6 +836,14 @@ impl PrototypeApp {
             app.open_document(path);
         }
         app
+    }
+
+    #[cfg(windows)]
+    fn refresh_default_apps_state(&mut self) {
+        self.default_apps_state = match query_default_app_state() {
+            Ok(state) => state,
+            Err(error) => DefaultAppState::Unavailable(error.to_string()),
+        };
     }
 
     fn open_document(&mut self, path: PathBuf) {
@@ -2697,7 +2715,11 @@ impl PrototypeApp {
 
         egui::Panel::top("menu-bar").show(root_ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("ファイル", |ui| {
+                let file_menu = ui.menu_button("ファイル", |ui| {
+                    #[cfg(windows)]
+                    if !self.default_apps_menu_open {
+                        self.refresh_default_apps_state();
+                    }
                     if ui.button("PDFを開く…").clicked() {
                         open_requested = true;
                         ui.close();
@@ -2742,9 +2764,16 @@ impl PrototypeApp {
                     ui.separator();
                     ui.checkbox(&mut self.restore_enabled, "前回のセッションを復元");
                     #[cfg(windows)]
-                    if ui.button("既定のPDFアプリを設定…").clicked() {
-                        default_apps_requested = true;
-                        ui.close();
+                    {
+                        if let DefaultAppState::Unavailable(error) = &self.default_apps_state {
+                            ui.label("既定のPDFアプリ状態を確認できませんでした。");
+                            ui.label(error);
+                        }
+                        let (label, enabled) = default_app_menu_item(&self.default_apps_state);
+                        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                            default_apps_requested = true;
+                            ui.close();
+                        }
                     }
                     ui.separator();
                     if ui.button("終了").clicked() {
@@ -2752,6 +2781,12 @@ impl PrototypeApp {
                         ui.close();
                     }
                 });
+                #[cfg(windows)]
+                {
+                    self.default_apps_menu_open = file_menu.inner.is_some();
+                }
+                #[cfg(not(windows))]
+                let _ = file_menu;
                 ui.menu_button("編集", |ui| {
                     if ui
                         .add_enabled(self.can_undo(), egui::Button::new("元に戻す    Ctrl+Z"))
