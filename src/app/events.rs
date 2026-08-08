@@ -96,6 +96,7 @@ impl PrototypeApp {
                             tab.search.completed_pages = 0;
                             tab.search.truncated = false;
                             tab.search.in_progress = false;
+                            tab.view.clamp_to_page_count(page_count);
                         }
                         tab.pending_rebind_path = None;
                         let changed_highlight_page = tab.pending_highlight_refresh_page.take();
@@ -147,6 +148,11 @@ impl PrototypeApp {
                         self.status = format!("PDF の名前変更を追跡しました: {}", path.display());
                     }
                     Ok(DocumentEvent::SavedAs(path)) => {
+                        if !matches!(self.documents[index].save_as, SaveAsState::Saving(ref expected) if expected == &path)
+                        {
+                            continue;
+                        }
+                        self.documents[index].save_as = SaveAsState::Idle;
                         let original = self.tabs.tabs()[index].path().to_path_buf();
                         // 先に別名版を新規タブとして残す。外部版の reload が失敗しても、
                         // 成功した編集版の到達可能性を失ってはならない。
@@ -268,11 +274,15 @@ impl PrototypeApp {
                         }) {
                             self.annotation_editor = None;
                         }
-                        if let Some(path) = tab.save_as_after_editor_commit.take()
-                            && tab.send(DocumentCommand::SaveAs(path.clone()))
-                        {
-                            self.status =
-                                "未確定の注釈を反映し、編集版を別名保存しています…".to_owned();
+                        if let SaveAsState::WaitingEditorCommit(path) = &tab.save_as {
+                            let path = path.clone();
+                            if tab.send(DocumentCommand::SaveAs(path.clone())) {
+                                tab.save_as = SaveAsState::Saving(path);
+                                self.status =
+                                    "未確定の注釈を反映し、編集版を別名保存しています…".to_owned();
+                            } else {
+                                tab.save_as = SaveAsState::Idle;
+                            }
                         }
                     }
                     Ok(DocumentEvent::EditActionUndone(action)) => {
@@ -575,7 +585,7 @@ impl PrototypeApp {
                                 .external_candidate
                                 .map(|(version, _)| version);
                         } else if operation == "save-as" {
-                            self.documents[index].save_as_after_editor_commit = None;
+                            self.documents[index].save_as = SaveAsState::Idle;
                         } else if operation == "rename" {
                             if let Some(previous) = self.documents[index].pending_rebind_path.take()
                             {

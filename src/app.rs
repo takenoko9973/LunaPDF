@@ -253,7 +253,7 @@ struct DocumentTab {
     external_candidate: Option<(DocumentVersion, u8)>,
     external_conflict_reported: bool,
     reload_in_flight: bool,
-    save_as_after_editor_commit: Option<PathBuf>,
+    save_as: SaveAsState,
     failed_external_version: Option<DocumentVersion>,
     pending_rebind_path: Option<PathBuf>,
 }
@@ -267,6 +267,14 @@ struct HighlightIndexState {
     refresh_page: Option<usize>,
     started: bool,
     error: Option<String>,
+}
+
+#[derive(Default)]
+enum SaveAsState {
+    #[default]
+    Idle,
+    WaitingEditorCommit(PathBuf),
+    Saving(PathBuf),
 }
 
 impl Default for HighlightIndexState {
@@ -882,33 +890,33 @@ impl PrototypeApp {
 
             // 旧パスへ別 PDF がすぐ再作成されても、先に元 identity の候補を探す。
             // これを後回しにすると、その新しい PDF を旧タブへ誤って reload してしまう。
-            if let Some(renamed) = find_same_folder_rename(&path, expected) {
-                if renamed != path {
-                    let collides = self
-                        .tabs
-                        .tabs()
-                        .iter()
-                        .enumerate()
-                        .any(|(other, tab)| other != index && tab.path() == renamed);
-                    if collides {
-                        self.documents[index].error = Some(
+            if let Some(renamed) =
+                find_same_folder_rename(&path, expected).filter(|renamed| renamed != &path)
+            {
+                let collides = self
+                    .tabs
+                    .tabs()
+                    .iter()
+                    .enumerate()
+                    .any(|(other, tab)| other != index && tab.path() == renamed);
+                if collides {
+                    self.documents[index].error = Some(
                             "名前変更先は既存タブで開かれているため、タブを統合せず追跡を停止しました。"
                                 .to_owned(),
                         );
-                    } else if self.tabs.rebind_path(index, &renamed).is_ok() {
-                        if self.documents[index].state == DocumentState::Suspended {
-                            if let Some(info) = self.documents[index].info.as_mut() {
-                                info.path = self.tabs.tabs()[index].path().to_path_buf();
-                            }
-                            self.status = "休止中のPDFの名前変更を追跡しました。".to_owned();
-                            continue;
+                } else if self.tabs.rebind_path(index, &renamed).is_ok() {
+                    if self.documents[index].state == DocumentState::Suspended {
+                        if let Some(info) = self.documents[index].info.as_mut() {
+                            info.path = self.tabs.tabs()[index].path().to_path_buf();
                         }
-                        if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
-                            self.documents[index].pending_rebind_path = Some(path);
-                            self.status = "PDF の名前変更を追跡しています…".to_owned();
-                        } else {
-                            let _ = self.tabs.replace_path(index, path);
-                        }
+                        self.status = "休止中のPDFの名前変更を追跡しました。".to_owned();
+                        continue;
+                    }
+                    if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
+                        self.documents[index].pending_rebind_path = Some(path);
+                        self.status = "PDF の名前変更を追跡しています…".to_owned();
+                    } else {
+                        let _ = self.tabs.replace_path(index, path);
                     }
                 }
                 continue;
@@ -960,6 +968,9 @@ impl PrototypeApp {
     }
 
     fn save_conflicted_document_as(&mut self, index: usize) {
+        if !matches!(self.documents[index].save_as, SaveAsState::Idle) {
+            return;
+        }
         let source = self.tabs.tabs()[index].path();
         let selected = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
@@ -986,7 +997,7 @@ impl PrototypeApp {
         if self.annotation_editor.as_ref().is_some_and(|editor| {
             editor.document_id == document_id && (editor.is_dirty() || editor.mutation_in_flight)
         }) {
-            self.documents[index].save_as_after_editor_commit = Some(path);
+            self.documents[index].save_as = SaveAsState::WaitingEditorCommit(path);
             if self
                 .annotation_editor
                 .as_ref()
@@ -997,6 +1008,7 @@ impl PrototypeApp {
             return;
         }
         if self.documents[index].send(DocumentCommand::SaveAs(path.clone())) {
+            self.documents[index].save_as = SaveAsState::Saving(path);
             self.status = "編集版を別名保存しています…".to_owned();
         }
     }
@@ -3503,7 +3515,11 @@ impl PrototypeApp {
         }
         let conflict_index = self.active_index().filter(|index| {
             self.documents[*index].external_conflict_reported
-                && self.documents[*index].has_unsaved_changes()
+                && (self.documents[*index].has_unsaved_changes()
+                    || self.annotation_editor.as_ref().is_some_and(|editor| {
+                        editor.document_id == self.documents[*index].document_id
+                            && (editor.is_dirty() || editor.mutation_in_flight)
+                    }))
         });
         egui::Panel::top("persistent-error-banner").show(root_ui, |ui| {
             if let Some(error) = app_error.as_deref() {
@@ -4832,7 +4848,7 @@ impl DocumentTab {
             external_candidate: None,
             external_conflict_reported: false,
             reload_in_flight: false,
-            save_as_after_editor_commit: None,
+            save_as: SaveAsState::Idle,
             failed_external_version: None,
             pending_rebind_path: None,
         }
