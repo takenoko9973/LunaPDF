@@ -883,7 +883,18 @@ impl PrototypeApp {
 
             if current.is_none() {
                 if let Some(renamed) = find_same_folder_rename(&path, expected) {
-                    if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
+                    let collides = self
+                        .tabs
+                        .tabs()
+                        .iter()
+                        .enumerate()
+                        .any(|(other, tab)| other != index && tab.path() == renamed);
+                    if collides {
+                        self.documents[index].error = Some(
+                            "名前変更先は既存タブで開かれているため、タブを統合せず追跡を停止しました。"
+                                .to_owned(),
+                        );
+                    } else if self.documents[index].send(DocumentCommand::RebindPath(renamed)) {
                         self.status = "PDF の名前変更を追跡しています…".to_owned();
                     }
                 }
@@ -5515,7 +5526,7 @@ fn find_same_folder_rename(path: &Path, expected: DocumentVersion) -> Option<Pat
             let version = read_document_version(&candidate).ok()?;
             (version.identity_primary == expected.identity_primary
                 && version.identity_secondary == expected.identity_secondary)
-                .then(|| candidate)
+                .then_some(candidate)
         })
 }
 

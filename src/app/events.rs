@@ -609,10 +609,9 @@ impl PrototypeApp {
                     .info
                     .as_ref()
                     .is_some_and(|info| !info.dirty)
+                && let Some(path) = self.documents[index].saved_as_path.take()
             {
-                if let Some(path) = self.documents[index].saved_as_path.take() {
-                    saved_as_paths.push(path);
-                }
+                saved_as_paths.push(path);
             }
         }
         for path in saved_as_paths {
