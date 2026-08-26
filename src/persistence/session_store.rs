@@ -27,6 +27,10 @@ impl SessionStore {
         Self { path }
     }
 
+    pub(crate) fn sibling_path(&self, file_name: &str) -> PathBuf {
+        self.path.with_file_name(file_name)
+    }
+
     /// セッションを読み込み、解析して検証する。まだ作成されていない場合は`None`を返し、
     /// 初回起動を通常の空セッションとして扱えるようにする。
     pub(crate) fn load(&self) -> Result<Option<SessionState>> {

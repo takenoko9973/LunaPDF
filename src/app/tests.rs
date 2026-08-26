@@ -4043,3 +4043,449 @@ fn highlight_index_replaces_repeated_pages_and_rejects_stale_batches() {
     ));
     assert_eq!(state.pages.len(), 1);
 }
+
+#[test]
+fn windows_wheel_calculation_uses_sumatra_base_and_safe_line_fallback() {
+    use crate::platform::windows::wheel::{
+        DEFAULT_WHEEL_SCROLL_LINES, calculate_line_scroll_speed, effective_wheel_lines,
+    };
+
+    assert_eq!(calculate_line_scroll_speed(3, 100), 48.0);
+    assert_eq!(calculate_line_scroll_speed(3, 50), 24.0);
+    assert_eq!(calculate_line_scroll_speed(5, 100), 80.0);
+    assert_eq!(calculate_line_scroll_speed(1, 200), 32.0);
+    assert_eq!(calculate_line_scroll_speed(3, 25), 12.0);
+    assert_eq!(calculate_line_scroll_speed(3, 300), 144.0);
+    assert_eq!(effective_wheel_lines(0), DEFAULT_WHEEL_SCROLL_LINES);
+    assert_eq!(effective_wheel_lines(u32::MAX), DEFAULT_WHEEL_SCROLL_LINES);
+    assert_eq!(effective_wheel_lines(1), 1);
+}
+
+#[test]
+fn wheel_settings_store_defaults_round_trips_and_stays_separate_from_session() {
+    use crate::domain::settings::{AppSettings, DEFAULT_WHEEL_SCROLL_SPEED_PERCENT};
+    use crate::persistence::settings_store::SettingsStore;
+
+    let directory = tempfile::tempdir().unwrap();
+    let settings_path = directory.path().join("settings.json");
+    let store = SettingsStore::new(settings_path.clone());
+
+    assert_eq!(store.load().unwrap(), AppSettings::default());
+    assert_eq!(
+        AppSettings::default().wheel_scroll_speed,
+        DEFAULT_WHEEL_SCROLL_SPEED_PERCENT
+    );
+
+    let settings = AppSettings {
+        wheel_scroll_speed: 175,
+    };
+    store.save(&settings).unwrap();
+    assert_eq!(store.load().unwrap(), settings);
+
+    let session_path = directory.path().join("session.json");
+    crate::persistence::session_store::SessionStore::new(session_path.clone())
+        .save(&crate::domain::session::SessionState::default())
+        .unwrap();
+    let session_json = std::fs::read_to_string(session_path).unwrap();
+    assert!(!session_json.contains("wheel_scroll_speed"));
+    assert!(settings_path.is_file());
+}
+
+#[test]
+fn invalid_wheel_settings_are_rejected_without_affecting_the_default() {
+    use crate::domain::settings::AppSettings;
+    use crate::persistence::settings_store::SettingsStore;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("settings.json");
+    let store = SettingsStore::new(path.clone());
+
+    std::fs::write(&path, "not json").unwrap();
+    assert!(store.load().is_err());
+
+    std::fs::write(&path, r#"{"wheel_scroll_speed": 24}"#).unwrap();
+    assert!(store.load().is_err());
+    std::fs::write(&path, r#"{"wheel_scroll_speed": 301}"#).unwrap();
+    assert!(store.load().is_err());
+    assert_eq!(AppSettings::default().wheel_scroll_speed, 100);
+}
+
+#[test]
+fn startup_applies_loaded_wheel_speed_and_ui_changes_apply_and_persist_immediately() {
+    use crate::domain::settings::AppSettings;
+    use crate::persistence::settings_store::SettingsStore;
+
+    let directory = tempfile::tempdir().unwrap();
+    let session_path = directory.path().join("session.json");
+    let settings_path = directory.path().join("settings.json");
+    SettingsStore::new(settings_path.clone())
+        .save(&AppSettings {
+            wheel_scroll_speed: 50,
+        })
+        .unwrap();
+
+    let context = egui::Context::default();
+    let creation_context = eframe::CreationContext::_new_kittest(context.clone());
+    let mut app = PrototypeApp::new(
+        &creation_context,
+        Vec::new(),
+        SessionStore::new(session_path),
+        crossbeam_channel::never(),
+    );
+
+    let initial_speed = context.memory(|memory| memory.options.input_options.line_scroll_speed);
+    if cfg!(windows) {
+        assert!(initial_speed.is_finite());
+        assert!(initial_speed > 0.0);
+    } else {
+        assert_eq!(initial_speed, 20.0);
+    }
+
+    app.set_wheel_scroll_speed(&context, 200);
+    let updated_speed = context.memory(|memory| memory.options.input_options.line_scroll_speed);
+    if cfg!(windows) {
+        assert_eq!(updated_speed, initial_speed * 4.0);
+    } else {
+        assert_eq!(updated_speed, 80.0);
+    }
+    assert_eq!(
+        SettingsStore::new(settings_path)
+            .load()
+            .unwrap()
+            .wheel_scroll_speed,
+        200
+    );
+}
+
+fn app_with_wheel_speed(percent: u16) -> (tempfile::TempDir, egui::Context, PrototypeApp) {
+    use crate::domain::settings::AppSettings;
+    use crate::persistence::settings_store::SettingsStore;
+
+    let directory = tempfile::tempdir().unwrap();
+    SettingsStore::new(directory.path().join("settings.json"))
+        .save(&AppSettings {
+            wheel_scroll_speed: percent,
+        })
+        .unwrap();
+    let context = egui::Context::default();
+    let creation_context = eframe::CreationContext::_new_kittest(context.clone());
+    let app = PrototypeApp::new(
+        &creation_context,
+        Vec::new(),
+        SessionStore::new(directory.path().join("session.json")),
+        crossbeam_channel::never(),
+    );
+    (directory, context, app)
+}
+
+fn wheel_input(unit: MouseWheelUnit, modifiers: Modifiers) -> egui::RawInput {
+    wheel_input_with_delta(unit, Vec2::new(0.0, -1.0), modifiers)
+}
+
+fn wheel_input_with_delta(
+    unit: MouseWheelUnit,
+    delta: Vec2,
+    modifiers: Modifiers,
+) -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+        events: vec![Event::MouseWheel {
+            unit,
+            delta,
+            phase: TouchPhase::Move,
+            modifiers,
+        }],
+        ..Default::default()
+    }
+}
+
+fn observed_scroll_delta(percent: u16, unit: MouseWheelUnit, modifiers: Modifiers) -> Vec2 {
+    let (_directory, context, _app) = app_with_wheel_speed(percent);
+    let mut observed = Vec2::ZERO;
+    let _output = context.run_ui(wheel_input(unit, modifiers), |ui| {
+        observed = ui.input(|input| input.smooth_scroll_delta());
+    });
+    observed
+}
+
+#[test]
+fn wheel_speed_changes_normal_line_scroll_without_changing_point_input() {
+    let line_deltas = [25, 100, 300]
+        .map(|percent| observed_scroll_delta(percent, MouseWheelUnit::Line, Modifiers::NONE));
+    let point_deltas = [25, 100, 300]
+        .map(|percent| observed_scroll_delta(percent, MouseWheelUnit::Point, Modifiers::NONE));
+
+    assert!(line_deltas[0].y.abs() < line_deltas[1].y.abs());
+    assert!(line_deltas[1].y.abs() < line_deltas[2].y.abs());
+    assert!((line_deltas[2].y / line_deltas[0].y - 12.0).abs() < 1e-5);
+    assert_eq!(point_deltas[0], point_deltas[1]);
+    assert_eq!(point_deltas[1], point_deltas[2]);
+}
+
+fn app_with_wheel_speed_and_pdf(percent: u16) -> (tempfile::TempDir, egui::Context, PrototypeApp) {
+    use crate::domain::settings::AppSettings;
+    use crate::persistence::settings_store::SettingsStore;
+
+    let directory = tempfile::tempdir().unwrap();
+    let pdf_path = directory.path().join("zoom.pdf");
+    write_blank_pdf(&pdf_path);
+    SettingsStore::new(directory.path().join("settings.json"))
+        .save(&AppSettings {
+            wheel_scroll_speed: percent,
+        })
+        .unwrap();
+    let context = egui::Context::default();
+    let creation_context = eframe::CreationContext::_new_kittest(context.clone());
+    let mut app = PrototypeApp::new(
+        &creation_context,
+        vec![pdf_path],
+        SessionStore::new(directory.path().join("session.json")),
+        crossbeam_channel::never(),
+    );
+    finish_async_document_open(&mut app);
+    app.documents[0].view.zoom_mode = ZoomMode::Fixed;
+    app.documents[0].view.zoom = 1.0;
+    (directory, context, app)
+}
+
+fn native_ctrl_line_zoom_delta() -> f32 {
+    let context = egui::Context::default();
+    let mut observed = 1.0;
+    let _output = context.run_ui(
+        wheel_input(MouseWheelUnit::Line, Modifiers::COMMAND),
+        |ui| {
+            observed = ui.input(|input| input.zoom_delta());
+        },
+    );
+    observed
+}
+
+fn native_ctrl_line_zoom_factors() -> Vec<f32> {
+    let context = egui::Context::default();
+    let mut observed = Vec::new();
+    for input in [
+        wheel_input(MouseWheelUnit::Line, Modifiers::COMMAND),
+        egui::RawInput::default(),
+        egui::RawInput::default(),
+        egui::RawInput::default(),
+        egui::RawInput::default(),
+    ] {
+        let _ = context.run_ui(input, |ui| {
+            observed.push(ui.input(|input| input.zoom_delta()));
+        });
+    }
+    observed
+}
+
+fn observed_ctrl_line_zoom_factors(percent: u16) -> Vec<f32> {
+    let (_directory, context, mut app) = app_with_wheel_speed_and_pdf(percent);
+    let mut observed = Vec::new();
+    for input in [
+        wheel_input(MouseWheelUnit::Line, Modifiers::COMMAND),
+        egui::RawInput::default(),
+        egui::RawInput::default(),
+        egui::RawInput::default(),
+        egui::RawInput::default(),
+    ] {
+        observed.push(observe_app_zoom_factor(&context, &mut app, input));
+    }
+    observed
+}
+
+fn observed_ctrl_line_zoom_factor(percent: u16) -> f32 {
+    observed_ctrl_line_zoom_factors(percent)[0]
+}
+
+fn observe_app_zoom_factor(
+    context: &egui::Context,
+    app: &mut PrototypeApp,
+    input: egui::RawInput,
+) -> f32 {
+    let before = app.documents[0].view.zoom;
+    let _output = context.run_ui(input, |ui| {
+        let tab_bar = app.tab_bar(ui);
+        app.central_panel(ui, tab_bar.as_ref());
+    });
+    app.documents[0].view.zoom / before
+}
+
+#[test]
+fn ctrl_line_zoom_stays_at_native_baseline_for_all_wheel_speed_settings() {
+    let native = native_ctrl_line_zoom_delta();
+
+    for percent in [25, 100, 300] {
+        let observed = observed_ctrl_line_zoom_factor(percent);
+        assert!(
+            (observed - native).abs() < 1e-6,
+            "{percent}% changed Ctrl+Line zoom from {native} to {observed}"
+        );
+    }
+}
+
+#[test]
+fn settings_save_failure_does_not_skip_writable_session_save() {
+    use crate::persistence::settings_store::SettingsStore;
+
+    let directory = tempfile::tempdir().unwrap();
+    let session_path = directory.path().join("session.json");
+    let mut app = PrototypeApp::from_startup(Vec::new(), SessionStore::new(session_path.clone()));
+    let blocked_settings_path = directory.path().join("settings-target");
+    std::fs::create_dir(&blocked_settings_path).unwrap();
+    app.settings_store = SettingsStore::new(blocked_settings_path);
+
+    app.finalize_session_and_close(&egui::Context::default());
+
+    assert!(SessionStore::new(session_path).load().unwrap().is_some());
+    assert!(
+        app.session_close_failure
+            .as_deref()
+            .is_some_and(|message| message.contains("設定を保存できませんでした"))
+    );
+}
+
+fn pointer_moved_input() -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+        events: vec![Event::PointerMoved(Pos2::new(400.0, 300.0))],
+        ..Default::default()
+    }
+}
+
+fn touch_input(events: Vec<Event>) -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+        events,
+        ..Default::default()
+    }
+}
+
+fn touch_event(id: u64, phase: TouchPhase, pos: Pos2) -> Event {
+    Event::Touch {
+        device_id: egui::TouchDeviceId(1),
+        id: egui::TouchId(id),
+        phase,
+        pos,
+        force: None,
+    }
+}
+
+fn observed_pinch_after_ctrl_line_residual(percent: u16) -> f32 {
+    let (_directory, context, mut app) = app_with_wheel_speed_and_pdf(percent);
+    observe_app_zoom_factor(&context, &mut app, pointer_moved_input());
+    observe_app_zoom_factor(
+        &context,
+        &mut app,
+        touch_input(vec![
+            touch_event(1, TouchPhase::Start, Pos2::new(300.0, 300.0)),
+            touch_event(2, TouchPhase::Start, Pos2::new(500.0, 300.0)),
+        ]),
+    );
+
+    observe_app_zoom_factor(
+        &context,
+        &mut app,
+        wheel_input(MouseWheelUnit::Line, Modifiers::COMMAND),
+    );
+    observe_app_zoom_factor(
+        &context,
+        &mut app,
+        touch_input(vec![
+            touch_event(1, TouchPhase::Move, Pos2::new(280.0, 300.0)),
+            touch_event(2, TouchPhase::Move, Pos2::new(520.0, 300.0)),
+        ]),
+    )
+}
+
+#[test]
+fn ctrl_line_residual_frames_keep_native_zoom_baseline() {
+    let native = native_ctrl_line_zoom_factors();
+
+    for percent in [25, 100, 300] {
+        let observed = observed_ctrl_line_zoom_factors(percent);
+
+        assert!(
+            observed
+                .iter()
+                .zip(&native)
+                .all(|(factor, native)| (factor - native).abs() < 1e-6),
+            "{percent}% changed a Ctrl+Line residual zoom frame: {observed:?}, native {native:?}"
+        );
+    }
+}
+
+#[test]
+fn non_line_zoom_sources_stop_line_correction_at_the_source_boundary() {
+    let transitions = [
+        (
+            "Ctrl+Point",
+            wheel_input_with_delta(
+                MouseWheelUnit::Point,
+                Vec2::new(0.0, -1.0),
+                Modifiers::COMMAND,
+            )
+            .events,
+        ),
+        (
+            "Page",
+            wheel_input_with_delta(
+                MouseWheelUnit::Page,
+                Vec2::new(0.0, -0.01),
+                Modifiers::COMMAND,
+            )
+            .events,
+        ),
+        ("Event::Zoom", vec![Event::Zoom(1.2)]),
+    ];
+
+    for (name, events) in transitions {
+        let (_directory, context, mut app) = app_with_wheel_speed(25);
+        let configured_line_scroll_speed =
+            context.memory(|memory| memory.options.input_options.line_scroll_speed);
+        let raw_zoom_delta = 0.8125;
+        app.ctrl_line_zoom_correction_active = true;
+
+        let observed = app.correct_ctrl_line_zoom_delta(
+            &events,
+            raw_zoom_delta,
+            false,
+            Modifiers::COMMAND,
+            configured_line_scroll_speed,
+        );
+
+        assert_eq!(observed, raw_zoom_delta, "{name} was transformed");
+        assert!(!app.ctrl_line_zoom_correction_active);
+    }
+}
+
+#[test]
+fn multi_touch_source_clears_line_correction_state() {
+    let (_directory, context, mut app) = app_with_wheel_speed(25);
+    let configured_line_scroll_speed =
+        context.memory(|memory| memory.options.input_options.line_scroll_speed);
+    let raw_zoom_delta = 1.2;
+    app.ctrl_line_zoom_correction_active = true;
+
+    let observed = app.correct_ctrl_line_zoom_delta(
+        &[],
+        raw_zoom_delta,
+        true,
+        Modifiers::COMMAND,
+        configured_line_scroll_speed,
+    );
+
+    assert_eq!(observed, raw_zoom_delta);
+    assert!(!app.ctrl_line_zoom_correction_active);
+}
+
+#[test]
+fn multi_touch_pinch_during_ctrl_line_residual_is_wheel_speed_independent() {
+    let observed = [25, 100, 300].map(observed_pinch_after_ctrl_line_residual);
+
+    assert!(
+        observed[1..]
+            .iter()
+            .all(|factor| (factor - observed[0]).abs() < 1e-6),
+        "pinch changed with wheel speed: {observed:?}"
+    );
+    assert!((observed[0] - 1.2).abs() < 1e-6);
+}

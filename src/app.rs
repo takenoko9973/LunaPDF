@@ -35,12 +35,17 @@ use crate::domain::session::{
     SessionView, SidebarTab as SessionSidebarTab, SplitDirection as SessionSplitDirection,
     ZoomMode as SessionZoomMode,
 };
+use crate::domain::settings::{
+    AppSettings, DEFAULT_WHEEL_SCROLL_SPEED_PERCENT, MAX_WHEEL_SCROLL_SPEED_PERCENT,
+    MIN_WHEEL_SCROLL_SPEED_PERCENT,
+};
 use crate::domain::tabs::{
     OpenTabResult, RestoredTabEntry, SplitDirection, SplitGroupId, SplitSide, TabEntry, TabId,
     TabState,
 };
 use crate::pdf::{DocumentCommand, DocumentEvent, DocumentService, read_document_version};
 use crate::persistence::session_store::SessionStore;
+use crate::persistence::settings_store::SettingsStore;
 #[cfg(windows)]
 use crate::platform::windows::default_apps::{
     DefaultAppState, default_app_menu_item, open_default_apps_settings, query_default_app_state,
@@ -186,7 +191,12 @@ pub(crate) struct PrototypeApp {
     close_all_pending: bool,
     session_close_failure: Option<String>,
     saved_tab_to_close: Option<PathBuf>,
+    settings: AppSettings,
+    settings_store: SettingsStore,
     session_store: SessionStore,
+    // egui の離散 Line zoom は複数フレームに平滑化されるため、入力イベント後の残りも
+    // native 基準へ戻し終えるまで Ctrl+Line 補正を有効にする。
+    ctrl_line_zoom_correction_active: bool,
     restore_enabled: bool,
     session_restore_progress: Option<SessionRestoreProgress>,
     external_open_events: Receiver<std::result::Result<Vec<PathBuf>, String>>,
@@ -832,10 +842,12 @@ impl PrototypeApp {
         egui_extras::install_image_loaders(&creation_context.egui_ctx);
         let mut app = Self::from_startup(paths, session_store);
         app.external_open_events = external_open_events;
+        app.apply_wheel_scroll_speed(&creation_context.egui_ctx);
         app
     }
 
     fn from_startup(paths: Vec<PathBuf>, session_store: SessionStore) -> Self {
+        let settings_store = SettingsStore::from_session_store(&session_store);
         let (saved_session, session_load_error) = match session_store.load() {
             Ok(session) => (session, None),
             Err(error) => (
@@ -844,6 +856,20 @@ impl PrototypeApp {
                     "前回のセッションを復元できませんでした。今回は復元を省略します。詳細: {error}"
                 )),
             ),
+        };
+        let (settings, settings_load_error) = match settings_store.load() {
+            Ok(settings) => (settings, None),
+            Err(error) => (
+                AppSettings::default(),
+                Some(format!(
+                    "マウスホイール設定を読み込めませんでした。既定値を使用します。詳細: {error}"
+                )),
+            ),
+        };
+        let startup_error = match (session_load_error, settings_load_error) {
+            (Some(session), Some(settings)) => Some(format!("{session}\n{settings}")),
+            (Some(error), None) | (None, Some(error)) => Some(error),
+            (None, None) => None,
         };
         let restore_enabled = saved_session
             .as_ref()
@@ -863,7 +889,7 @@ impl PrototypeApp {
             documents: Vec::new(),
             viewports,
             status: "Drop a PDF into the window to open it".to_owned(),
-            error: session_load_error,
+            error: startup_error,
             #[cfg(windows)]
             default_apps_state: DefaultAppState::Unavailable("まだ照会していません".to_owned()),
             #[cfg(windows)]
@@ -877,7 +903,10 @@ impl PrototypeApp {
             close_all_pending: false,
             session_close_failure: None,
             saved_tab_to_close: None,
+            settings,
+            settings_store,
             session_store,
+            ctrl_line_zoom_correction_active: false,
             restore_enabled,
             session_restore_progress: None,
             external_open_events: crossbeam_channel::never(),
@@ -905,6 +934,94 @@ impl PrototypeApp {
             app.open_document(path);
         }
         app
+    }
+
+    fn apply_wheel_scroll_speed(&self, context: &egui::Context) {
+        let line_scroll_speed =
+            crate::platform::line_scroll_speed(self.settings.wheel_scroll_speed);
+        context.memory_mut(|memory| {
+            memory.options.input_options.line_scroll_speed = line_scroll_speed;
+        });
+    }
+
+    fn set_wheel_scroll_speed(&mut self, context: &egui::Context, percent: u16) {
+        let settings = AppSettings {
+            wheel_scroll_speed: percent,
+        };
+        if let Err(error) = settings.validate() {
+            self.error = Some(format!("マウスホイール設定が不正です。詳細: {error}"));
+            return;
+        }
+
+        self.settings = settings;
+        self.ctrl_line_zoom_correction_active = false;
+        self.apply_wheel_scroll_speed(context);
+        if let Err(error) = self.settings_store.save(&self.settings) {
+            self.error = Some(format!(
+                "マウスホイール設定を保存できませんでした。詳細: {error}"
+            ));
+        }
+    }
+
+    fn correct_ctrl_line_zoom_delta(
+        &mut self,
+        raw_events: &[Event],
+        zoom_delta: f32,
+        multi_touch_active: bool,
+        zoom_modifier: Modifiers,
+        configured_line_scroll_speed: f32,
+    ) -> f32 {
+        if multi_touch_active {
+            // egui の公開APIでは、multi-touch中のzoom_deltaはwheelより優先されるため、
+            // 平滑化中のLine残差を推測で分解せず、Touchの値をそのまま採用する。
+            self.ctrl_line_zoom_correction_active = false;
+            return zoom_delta;
+        }
+
+        let mut has_ctrl_line = false;
+        let mut has_other_zoom_input = false;
+        for event in raw_events {
+            match event {
+                Event::MouseWheel {
+                    unit, modifiers, ..
+                } if modifiers.matches_any(zoom_modifier) => match unit {
+                    MouseWheelUnit::Line => has_ctrl_line = true,
+                    MouseWheelUnit::Point | MouseWheelUnit::Page => {
+                        has_other_zoom_input = true;
+                    }
+                },
+                Event::Zoom(_) => has_other_zoom_input = true,
+                _ => {}
+            }
+        }
+
+        if has_other_zoom_input {
+            // wheel残差と同フレームの非Line入力はegui内部で合成され、公開APIから分解
+            // できない。新しい入力へLine補正を掛けず、公開されたzoom値をそのまま使う。
+            self.ctrl_line_zoom_correction_active = false;
+            return zoom_delta;
+        }
+        if has_ctrl_line {
+            self.ctrl_line_zoom_correction_active = true;
+        }
+        if zoom_delta == 1.0 {
+            if !has_ctrl_line {
+                self.ctrl_line_zoom_correction_active = false;
+            }
+            return zoom_delta;
+        }
+        if !self.ctrl_line_zoom_correction_active
+            || !configured_line_scroll_speed.is_finite()
+            || configured_line_scroll_speed <= 0.0
+        {
+            return zoom_delta;
+        }
+
+        // egui が既に LineDelta を configured_line_scroll_speed で倍率化しているため、
+        // Ctrl+Line の zoom だけ native の line_scroll_speed 相当へ戻す。Point や
+        // pinch の入力を同じ指数で補正しないよう、上のイベント分類を通った場合に限る。
+        let native_line_scroll_speed = egui::InputOptions::default().line_scroll_speed;
+        zoom_delta.powf(native_line_scroll_speed / configured_line_scroll_speed)
     }
 
     #[cfg(windows)]
@@ -2172,12 +2289,22 @@ impl PrototypeApp {
     }
 
     fn finalize_session_and_close(&mut self, context: &egui::Context) {
+        let mut save_failures = Vec::new();
+        if let Err(error) = self.settings_store.save(&self.settings) {
+            save_failures.push(format!(
+                "設定を保存できませんでした。保存先の書き込み権限を確認してください。詳細: {error}"
+            ));
+        }
+
         let session = self.current_session();
         if let Err(error) = self.session_store.save(&session) {
-            self.session_close_failure = Some(format!(
+            save_failures.push(format!(
                 "セッションを保存できませんでした。保存先の書き込み権限を確認してください。詳細: {error}"
             ));
-            self.status = "セッションを保存できませんでした。終了方法を選択してください".to_owned();
+        }
+        if !save_failures.is_empty() {
+            self.session_close_failure = Some(save_failures.join("\n"));
+            self.status = "終了時の保存に失敗しました。終了方法を選択してください".to_owned();
             return;
         }
 
@@ -2397,7 +2524,7 @@ impl PrototypeApp {
             return;
         };
         let modal = egui::Modal::new(Id::new("session-save-close-failure")).show(context, |ui| {
-            ui.heading("セッションを保存できませんでした");
+            ui.heading("終了時の保存に失敗しました");
             ui.label(&message);
             ui.label("このエラーによってPDF文書は変更されていません。");
             ui.horizontal(|ui| {
@@ -2406,7 +2533,7 @@ impl PrototypeApp {
                     .clicked()
                     .then_some(SessionCloseDecision::Retry);
                 let exit = ui
-                    .button("セッションを保存せず終了")
+                    .button("保存せず終了")
                     .clicked()
                     .then_some(SessionCloseDecision::ExitWithoutSession);
                 let cancel = ui
@@ -2436,8 +2563,8 @@ impl PrototypeApp {
         match decision {
             SessionCloseDecision::Retry => self.prompt_next_window_document(context),
             SessionCloseDecision::ExitWithoutSession => {
-                // この明示的な選択だけが、通常のクローズで必要なアトミックなセッション更新なしに
-                // 終了できる経路である。
+                // この明示的な選択だけが、通常のクローズで必要なアトミックな保存なしに終了
+                // できる経路である。
                 self.allow_window_close = true;
                 self.window_close_pending = false;
                 self.close_confirmation = None;
@@ -3170,6 +3297,7 @@ impl PrototypeApp {
         let mut copy_requested = false;
         let mut highlight_requested = false;
         let mut undo_requested = false;
+        let mut wheel_speed_change = None;
         #[cfg(windows)]
         let mut default_apps_requested = false;
 
@@ -3319,6 +3447,27 @@ impl PrototypeApp {
                             ui.close();
                         }
                     }
+                    ui.separator();
+                    let mut wheel_scroll_speed = self.settings.wheel_scroll_speed;
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut wheel_scroll_speed,
+                                MIN_WHEEL_SCROLL_SPEED_PERCENT..=MAX_WHEEL_SCROLL_SPEED_PERCENT,
+                            )
+                            .text("マウスホイールのスクロール速度")
+                            .suffix("%"),
+                        )
+                        .changed()
+                    {
+                        wheel_speed_change = Some(wheel_scroll_speed);
+                    }
+                    if self.settings.wheel_scroll_speed != DEFAULT_WHEEL_SCROLL_SPEED_PERCENT
+                        && ui.button("既定値に戻す").clicked()
+                    {
+                        wheel_speed_change = Some(DEFAULT_WHEEL_SCROLL_SPEED_PERCENT);
+                        ui.close();
+                    }
                 });
             });
         });
@@ -3346,6 +3495,9 @@ impl PrototypeApp {
         }
         if undo_requested {
             self.undo();
+        }
+        if let Some(percent) = wheel_speed_change {
+            self.set_wheel_scroll_speed(root_ui.ctx(), percent);
         }
         #[cfg(windows)]
         if default_apps_requested && let Err(error) = open_default_apps_settings() {
@@ -4027,20 +4179,40 @@ impl PrototypeApp {
                 (vec![available], None)
             };
 
-            let (press_origin, hover_position, pointer_navigation, zoom_delta) =
-                ui.input(|input| {
-                    let wheel_input = input
-                        .events
-                        .iter()
-                        .any(|event| matches!(event, Event::MouseWheel { .. }));
-                    let zoom_delta = input.zoom_delta();
-                    (
-                        input.pointer.press_origin(),
-                        input.pointer.hover_pos(),
-                        wheel_input || (zoom_delta - 1.0).abs() > f32::EPSILON,
-                        zoom_delta,
-                    )
-                });
+            let (zoom_modifier, configured_line_scroll_speed) = ui.ctx().memory(|memory| {
+                let input_options = &memory.options.input_options;
+                (input_options.zoom_modifier, input_options.line_scroll_speed)
+            });
+            let (
+                press_origin,
+                hover_position,
+                pointer_navigation,
+                raw_events,
+                raw_zoom_delta,
+                multi_touch_active,
+            ) = ui.input(|input| {
+                let wheel_input = input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::MouseWheel { .. }));
+                let raw_events = input.raw.events.clone();
+                let raw_zoom_delta = input.zoom_delta();
+                (
+                    input.pointer.press_origin(),
+                    input.pointer.hover_pos(),
+                    wheel_input || (raw_zoom_delta - 1.0).abs() > f32::EPSILON,
+                    raw_events,
+                    raw_zoom_delta,
+                    input.multi_touch().is_some(),
+                )
+            });
+            let zoom_delta = self.correct_ctrl_line_zoom_delta(
+                &raw_events,
+                raw_zoom_delta,
+                multi_touch_active,
+                zoom_modifier,
+                configured_line_scroll_speed,
+            );
             let pointer =
                 press_origin.or_else(|| pointer_navigation.then_some(hover_position).flatten());
             let foreground_owns_pointer = pointer.is_some_and(|pointer| {
