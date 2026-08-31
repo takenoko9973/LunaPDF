@@ -171,6 +171,14 @@ status表示で直接読める値はアプリの表示値を使い、RSS・フ�
 
 `open`、`render`、`text`、`resident memory` は画面のstatus表示から直接読める。起動時間、初回ページ表示、可視タイル全体の完成、RSS、フレーム時間、検索入力遅延、cache plateauの判定は外部計測が必要である。
 
+## 長時間メモリ診断ログ（debugのみ）
+
+長時間の増加傾向を切り分けるときは、debug buildが既存app-data directory内の`diagnostics` subdirectoryへ、起動日時・プロセスID付きの`memory-diagnostics-*.tsv`を作成する。固定ヘッダの各行は`row_kind`（`event`/`sample`/`detail`）、`phase`（`startup`/`restore`/`display_pending`/`display`/`warmup`/`sampling`）、`event`で機械処理できる。`display`は初期表示の`display_stable`または`display_unavailable`イベント行にだけ使い、restore開始・完了も別イベントとして記録する。restore完了後、可視タイルの要求・結果を待つsampleの内部phaseは`display_pending`である。
+
+初期表示安定後に180秒の`warmup`を置き、その間もsampleを60秒ごとに1行記録する。以後は`sampling` phaseとして60秒ごとに1行記録し、RSSのhigh-waterから100 MiB増加した時だけdocument別の`detail`行を追加する。detailの閾値は更新後のhigh-waterを基準にし、RSS低下では繰り返さない。取得不能な値は空欄とし、path、PDF本文、検索語、注釈本文は出力しない。
+
+このログはdebug-onlyの診断用であり、release buildおよび通常のrelease測定とは別に扱う。長時間のRSS、GPU driver、MuPDF内部、数時間傾向そのものは実機試験で確認する。
+
 ## 結果表
 
 同じfixture・環境で複数回測定し、中央値と最大値を記録する。実測値がない欄は空欄のままにし、推測値で補完しない。

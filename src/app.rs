@@ -1,3 +1,5 @@
+#[cfg(debug_assertions)]
+mod diagnostics;
 mod events;
 mod navigation;
 mod rendering;
@@ -194,6 +196,8 @@ pub(crate) struct PrototypeApp {
     settings: AppSettings,
     settings_store: SettingsStore,
     session_store: SessionStore,
+    #[cfg(debug_assertions)]
+    diagnostics: diagnostics::Diagnostics,
     // egui の離散 Line zoom は複数フレームに平滑化されるため、入力イベント後の残りも
     // native 基準へ戻し終えるまで Ctrl+Line 補正を有効にする。
     ctrl_line_zoom_correction_active: bool,
@@ -261,6 +265,8 @@ struct DocumentTab {
     view: ViewState,
     #[cfg(debug_assertions)]
     render_performance: RenderPerformance,
+    #[cfg(debug_assertions)]
+    initial_display_render: diagnostics::DisplayRenderState,
     restoring_from_session: bool,
     external_candidate: Option<(DocumentVersion, u8)>,
     external_conflict: Option<ExternalConflict>,
@@ -874,6 +880,10 @@ impl PrototypeApp {
         let restore_enabled = saved_session
             .as_ref()
             .is_none_or(|session| session.restore_enabled);
+        #[cfg(debug_assertions)]
+        let restoring_session = restore_enabled && saved_session.is_some();
+        #[cfg(debug_assertions)]
+        let diagnostics = diagnostics::Diagnostics::start(&session_store);
         // 色設定はタブとは独立して復元し、コマンドライン指定の PDF を開いても
         // ユーザーの編集履歴を破棄しない。
         let recent_annotation_colors = saved_session
@@ -906,6 +916,8 @@ impl PrototypeApp {
             settings,
             settings_store,
             session_store,
+            #[cfg(debug_assertions)]
+            diagnostics,
             ctrl_line_zoom_correction_active: false,
             restore_enabled,
             session_restore_progress: None,
@@ -926,6 +938,10 @@ impl PrototypeApp {
             copy_shortcut_active: false,
             last_external_check: Instant::now(),
         };
+        #[cfg(debug_assertions)]
+        if restoring_session {
+            app.diagnostics.begin_restore(Instant::now());
+        }
         if restore_enabled && let Some(session) = saved_session {
             app.restore_session(session);
         }
@@ -933,7 +949,154 @@ impl PrototypeApp {
         for path in paths {
             app.open_document(path);
         }
+        #[cfg(debug_assertions)]
+        if let Some(error) = app.diagnostics.take_error() {
+            app.report_diagnostics_error(error);
+        }
         app
+    }
+
+    #[cfg(debug_assertions)]
+    fn collect_diagnostics_snapshot(&self) -> diagnostics::DiagnosticsSnapshot {
+        let visible_indices = self.visible_indices();
+        let active_index = self.active_index();
+        let documents = self
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(index, document)| {
+                let containers = diagnostics::ContainerCounts {
+                    tiles: document.tiles.len(),
+                    pending_tiles: document.pending_tiles.len(),
+                    wanted_tiles: document.wanted_tiles.len(),
+                    visible_tiles: document.visible_tiles.len(),
+                    thumbnails: document.thumbnails.len(),
+                    pending_thumbnails: document.pending_thumbnails.len(),
+                    text_snapshots: document.text_snapshots.len(),
+                    pending_text_snapshots: document.pending_text_snapshots.len(),
+                    annotation_pages: document.annotation_pages.len(),
+                    pending_annotation_pages: document.pending_annotation_pages.len(),
+                    highlight_index_pages: document.highlight_index.pages.len(),
+                    highlight_index_items: document
+                        .highlight_index
+                        .pages
+                        .values()
+                        .map(Vec::len)
+                        .sum(),
+                    search_pages: document.search.pages.len(),
+                    search_matches: document.search.pages.values().map(Vec::len).sum(),
+                };
+                let worker = document
+                    .service
+                    .as_ref()
+                    .map(DocumentService::diagnostics_snapshot)
+                    .unwrap_or_default();
+                diagnostics::DocumentDiagnosticsSnapshot {
+                    document_id: document.document_id,
+                    state: match document.state {
+                        DocumentState::Opening => "opening",
+                        DocumentState::ReadyClean => "ready_clean",
+                        DocumentState::ReadyDirty => "ready_dirty",
+                        DocumentState::Saving => "saving",
+                        DocumentState::Suspended => "suspended",
+                        DocumentState::Error => "error",
+                    },
+                    active: active_index == Some(index),
+                    visible: visible_indices.contains(&index),
+                    containers,
+                    worker,
+                }
+            })
+            .collect();
+        diagnostics::DiagnosticsSnapshot::from_documents(
+            // memory-stats の physical_mem は Linux/macOS では RSS、Windows では Working Set
+            // に対応するため、値の意味を変換せずそのまま記録する。
+            memory_stats::memory_stats().map(|memory| memory.physical_mem),
+            diagnostics::LruSnapshot {
+                count: self.gpu_lru.len(),
+                current_weight_bytes: self.gpu_lru.current_bytes(),
+                budget_bytes: self.gpu_lru.budget(),
+            },
+            diagnostics::LruSnapshot {
+                count: self.thumbnail_lru.len(),
+                current_weight_bytes: self.thumbnail_lru.current_bytes(),
+                budget_bytes: self.thumbnail_lru.budget(),
+            },
+            visible_indices.len(),
+            active_index.and_then(|index| {
+                self.documents
+                    .get(index)
+                    .map(|document| document.document_id)
+            }),
+            documents,
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    fn sample_diagnostics(&mut self) {
+        let now = Instant::now();
+        let phase = self.diagnostics.phase();
+        if matches!(
+            phase,
+            diagnostics::DiagnosticsPhase::Startup | diagnostics::DiagnosticsPhase::DisplayPending
+        ) {
+            let visible_indices = self.visible_indices();
+            let readiness = visible_indices
+                .into_iter()
+                .filter_map(|index| self.documents.get(index))
+                .map(|document| {
+                    let unavailable = matches!(
+                        document.state,
+                        DocumentState::Error | DocumentState::Suspended
+                    ) || document
+                        .info
+                        .as_ref()
+                        .is_some_and(|info| info.page_bounds.is_empty());
+                    let has_visible_request = !document.visible_tiles.is_empty();
+                    let has_pending_visible_request = document
+                        .visible_tiles
+                        .iter()
+                        .any(|key| document.pending_tiles.contains_key(key));
+                    let has_visible_result = !document.visible_tiles.is_empty()
+                        && document
+                            .visible_tiles
+                            .iter()
+                            .all(|key| document.tiles.contains_key(key));
+                    diagnostics::DisplayReadiness {
+                        unavailable,
+                        render: document.initial_display_render,
+                        has_visible_request,
+                        has_pending_visible_request,
+                        has_visible_result,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let allow_empty =
+                phase == diagnostics::DiagnosticsPhase::DisplayPending && self.documents.is_empty();
+            if diagnostics::display_is_stable(&readiness) {
+                // UI 側の既存 visible tile 要求と結果を境界に使い、イベント処理中へ同期書き込みを
+                // 挟まず、restore完了と表示到達点を別イベントとして記録する。
+                self.diagnostics.display_stable(now);
+            } else if diagnostics::display_is_unavailable(&readiness, allow_empty) {
+                // 描画失敗や表示不能文書は表示安定とは区別するが、診断の観測自体は継続する。
+                self.diagnostics.display_unavailable(now);
+            }
+        }
+        if self.diagnostics.sample_due(now) {
+            let snapshot = self.collect_diagnostics_snapshot();
+            self.diagnostics.sample(now, &snapshot);
+        }
+        if let Some(error) = self.diagnostics.take_error() {
+            self.report_diagnostics_error(error);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn report_diagnostics_error(&mut self, error: String) {
+        self.error = Some(match self.error.take() {
+            Some(existing) => format!("{existing}\n{error}"),
+            None => error,
+        });
     }
 
     fn apply_wheel_scroll_speed(&self, context: &egui::Context) {
@@ -1450,6 +1613,9 @@ impl PrototypeApp {
         self.status = progress.status();
         if progress.pending > 0 {
             self.session_restore_progress = Some(progress);
+        } else {
+            #[cfg(debug_assertions)]
+            self.diagnostics.restore_complete(Instant::now());
         }
     }
 
@@ -2324,6 +2490,8 @@ impl PrototypeApp {
         self.status = progress.status();
         if finished {
             self.session_restore_progress = None;
+            #[cfg(debug_assertions)]
+            self.diagnostics.restore_complete(Instant::now());
         }
     }
 
@@ -5342,6 +5510,8 @@ impl DocumentTab {
             view: restored_view.map_or_else(ViewState::new, ViewState::from_session),
             #[cfg(debug_assertions)]
             render_performance: RenderPerformance::default(),
+            #[cfg(debug_assertions)]
+            initial_display_render: diagnostics::DisplayRenderState::Pending,
             restoring_from_session,
             external_candidate: None,
             external_conflict: None,
@@ -5594,6 +5764,10 @@ impl DocumentTab {
 
     fn invalidate_rendering(&mut self) -> usize {
         self.view.generation = self.view.generation.wrapping_add(1);
+        #[cfg(debug_assertions)]
+        {
+            self.initial_display_render = diagnostics::DisplayRenderState::Pending;
+        }
         self.cancel_rendering_requests()
     }
 
@@ -5889,6 +6063,15 @@ impl DocumentTab {
                 cache_hit,
                 prefetch_used,
             );
+            if !self.visible_tiles.is_empty()
+                && self
+                    .visible_tiles
+                    .iter()
+                    .all(|key| self.tiles.contains_key(key))
+                && self.initial_display_render == diagnostics::DisplayRenderState::Pending
+            {
+                self.initial_display_render = diagnostics::DisplayRenderState::Succeeded;
+            }
         }
 
         for request in requests {
@@ -6045,6 +6228,8 @@ impl eframe::App for PrototypeApp {
         self.handle_dropped_files(context);
         self.handle_shortcuts(context);
         self.handle_window_close(context, external_request_received);
+        #[cfg(debug_assertions)]
+        self.sample_diagnostics();
         context.request_repaint_after(Duration::from_millis(33));
     }
 

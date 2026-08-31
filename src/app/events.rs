@@ -1,6 +1,35 @@
 use super::*;
 
 impl PrototypeApp {
+    #[cfg(debug_assertions)]
+    fn receive_render_failure(&mut self, index: usize, request: TileRequest) {
+        let is_visible = self.is_visible_index(index);
+        let document_id = self.documents[index].document_id;
+        let key = TileCacheKey::from_request(document_id, &request);
+        let tab = &mut self.documents[index];
+        let matches_pending = tab.pending_tiles.get(&key).is_some_and(|pending| {
+            pending.page_index == request.page_index
+                && pending.zoom.to_bits() == request.zoom.to_bits()
+                && pending.pixels_per_point.to_bits() == request.pixels_per_point.to_bits()
+                && pending.scale.to_bits() == request.scale.to_bits()
+                && pending.generation == request.generation
+                && pending.expected_revision == request.expected_revision
+                && pending.spec == request.spec
+                && pending.priority == request.priority
+        });
+        if !matches_pending {
+            return;
+        }
+        tab.pending_tiles.remove(&key);
+        if is_visible
+            && request.priority == RenderPriority::Visible
+            && tab.visible_tiles.contains(&key)
+        {
+            // いずれかの可視要求が失敗した状態は、同じ表示試行の成功結果で上書きしない。
+            tab.initial_display_render = diagnostics::DisplayRenderState::Failed;
+        }
+    }
+
     pub(super) fn receive_document_events(&mut self, context: &egui::Context) {
         let mut failed_restored_paths = Vec::new();
         let mut saved_as_paths = Vec::new();
@@ -31,6 +60,11 @@ impl PrototypeApp {
                         } else {
                             DocumentState::ReadyClean
                         };
+                        #[cfg(debug_assertions)]
+                        {
+                            self.documents[index].initial_display_render =
+                                diagnostics::DisplayRenderState::Pending;
+                        }
                         self.documents[index].error = None;
                         self.documents[index].external_candidate = None;
                         self.documents[index].external_conflict = None;
@@ -222,6 +256,11 @@ impl PrototypeApp {
                             && tile.page_pixel_height > 0
                             && bounds_match;
                         if !payload_is_valid {
+                            #[cfg(debug_assertions)]
+                            if is_visible && tab.visible_tiles.contains(&key) {
+                                tab.initial_display_render =
+                                    diagnostics::DisplayRenderState::Failed;
+                            }
                             tab.error = Some(
                                 "ページを表示できませんでした。PDFを開き直してください。詳細: 描画データが不正です。"
                                     .to_owned(),
@@ -266,6 +305,16 @@ impl PrototypeApp {
                             self.documents[index].tiles.remove(&key);
                         }
                         self.remove_evicted_gpu_tiles(outcome.evicted);
+                        #[cfg(debug_assertions)]
+                        if outcome.inserted
+                            && self.documents[index].initial_display_render
+                                == diagnostics::DisplayRenderState::Pending
+                            && self.documents[index].visible_tiles.contains(&key)
+                            && self.documents[index].tiles.contains_key(&key)
+                        {
+                            self.documents[index].initial_display_render =
+                                diagnostics::DisplayRenderState::Succeeded;
+                        }
                     }
                     Ok(DocumentEvent::SelectionReady(selection)) => {
                         let tab = &mut self.documents[index];
@@ -555,7 +604,18 @@ impl PrototypeApp {
                     Ok(DocumentEvent::Status(status)) => {
                         self.status = status;
                     }
-                    Ok(DocumentEvent::Failed { operation, message }) => {
+                    Ok(DocumentEvent::Failed {
+                        operation,
+                        message,
+                        #[cfg(debug_assertions)]
+                        render_request,
+                    }) => {
+                        #[cfg(debug_assertions)]
+                        if operation == "render"
+                            && let Some(request) = render_request
+                        {
+                            self.receive_render_failure(index, request);
+                        }
                         if self.is_visible_index(index) {
                             self.documents[index].view.stop_autoscroll();
                             self.cancel_viewport_for_index(index);

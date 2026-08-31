@@ -113,6 +113,8 @@ pub(crate) enum DocumentEvent {
     Failed {
         operation: &'static str,
         message: String,
+        #[cfg(debug_assertions)]
+        render_request: Option<TileRequest>,
     },
 }
 
@@ -127,6 +129,37 @@ pub(crate) struct DocumentService {
     scheduled_text_snapshots: Arc<Mutex<HashMap<WorkerTextKey, TextSnapshotRequest>>>,
     active_highlight_index_generation: Arc<AtomicU64>,
     event_receiver: Receiver<DocumentEvent>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WorkerQueueSnapshot {
+    pub(crate) foreground: usize,
+    pub(crate) current_viewport: usize,
+    pub(crate) next_viewport: usize,
+    pub(crate) previous_viewport: usize,
+    pub(crate) background: usize,
+    pub(crate) event: usize,
+    pub(crate) scheduled_tiles: usize,
+    pub(crate) scheduled_text_snapshots: usize,
+}
+
+#[cfg(debug_assertions)]
+impl WorkerQueueSnapshot {
+    pub(crate) fn add_assign(&mut self, other: Self) {
+        self.foreground = self.foreground.saturating_add(other.foreground);
+        self.current_viewport = self.current_viewport.saturating_add(other.current_viewport);
+        self.next_viewport = self.next_viewport.saturating_add(other.next_viewport);
+        self.previous_viewport = self
+            .previous_viewport
+            .saturating_add(other.previous_viewport);
+        self.background = self.background.saturating_add(other.background);
+        self.event = self.event.saturating_add(other.event);
+        self.scheduled_tiles = self.scheduled_tiles.saturating_add(other.scheduled_tiles);
+        self.scheduled_text_snapshots = self
+            .scheduled_text_snapshots
+            .saturating_add(other.scheduled_text_snapshots);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -291,6 +324,32 @@ impl DocumentService {
         cancel_scheduled_text_snapshot(&self.scheduled_text_snapshots, request);
     }
 
+    /// 既存の所有物から取得する、診断用の瞬間的なキュー件数。
+    ///
+    /// チャネルにはキャンセル済み要求が墓標として残ることがあるため、ここで返す値は
+    /// 厳密な未処理作業量ではなく、時間変化を比較するための兆候値として扱う。
+    #[cfg(debug_assertions)]
+    pub(crate) fn diagnostics_snapshot(&self) -> WorkerQueueSnapshot {
+        WorkerQueueSnapshot {
+            foreground: self.foreground_sender.len(),
+            current_viewport: self.current_viewport_sender.len(),
+            next_viewport: self.next_viewport_sender.len(),
+            previous_viewport: self.previous_viewport_sender.len(),
+            background: self.background_sender.len(),
+            event: self.event_receiver.len(),
+            scheduled_tiles: self
+                .scheduled_tiles
+                .lock()
+                .expect("render scheduler mutex poisoned")
+                .len(),
+            scheduled_text_snapshots: self
+                .scheduled_text_snapshots
+                .lock()
+                .expect("text snapshot scheduler mutex poisoned")
+                .len(),
+        }
+    }
+
     fn queue_text_snapshot(&self, request: TextSnapshotRequest) -> bool {
         let key = WorkerTextKey::from_request(&request);
         self.scheduled_text_snapshots
@@ -393,7 +452,7 @@ fn run_worker(
                         let _ = event_sender.send(DocumentEvent::TileRendered(tile));
                     }
                     Ok(None) => {}
-                    Err(error) => send_failure(&event_sender, "render", error),
+                    Err(error) => send_render_failure(&event_sender, request, error),
                 }
             }
             DocumentCommand::Select {
@@ -737,6 +796,8 @@ fn send_opened_info(
             let _ = event_sender.send(DocumentEvent::Failed {
                 operation: "resume",
                 message: "the PDF changed outside LunaPDF while its tab was suspended".to_owned(),
+                #[cfg(debug_assertions)]
+                render_request: None,
             });
             false
         }
@@ -775,7 +836,31 @@ fn send_failure(
     let _ = event_sender.send(DocumentEvent::Failed {
         operation,
         message: format!("{error:#}"),
+        #[cfg(debug_assertions)]
+        render_request: None,
     });
+}
+
+#[cfg(debug_assertions)]
+fn send_render_failure(
+    event_sender: &Sender<DocumentEvent>,
+    request: TileRequest,
+    error: anyhow::Error,
+) {
+    let _ = event_sender.send(DocumentEvent::Failed {
+        operation: "render",
+        message: format!("{error:#}"),
+        render_request: Some(request),
+    });
+}
+
+#[cfg(not(debug_assertions))]
+fn send_render_failure(
+    event_sender: &Sender<DocumentEvent>,
+    _request: TileRequest,
+    error: anyhow::Error,
+) {
+    send_failure(event_sender, "render", error);
 }
 
 #[cfg(test)]
@@ -1287,5 +1372,85 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn diagnostics_snapshot_reports_channel_and_scheduler_lengths() {
+        let (foreground_sender, foreground_receiver) = unbounded();
+        let (current_sender, current_receiver) = unbounded();
+        let (next_sender, next_receiver) = unbounded();
+        let (previous_sender, previous_receiver) = unbounded();
+        let (background_sender, background_receiver) = unbounded();
+        let (wake_sender, wake_receiver) = bounded(1);
+        let (event_sender, event_receiver) = bounded(BUFFERED_EVENT_CAPACITY);
+        let scheduled_tiles = Arc::new(Mutex::new(HashMap::new()));
+        let scheduled_text_snapshots = Arc::new(Mutex::new(HashMap::new()));
+        let tile = tile_request(RenderPriority::Visible);
+        let text = TextSnapshotRequest {
+            page_index: 2,
+            expected_revision: 3,
+        };
+        scheduled_tiles
+            .lock()
+            .unwrap()
+            .insert(WorkerTileKey::from_request(&tile), RenderPriority::Visible);
+        scheduled_text_snapshots
+            .lock()
+            .unwrap()
+            .insert(WorkerTextKey::from_request(&text), text);
+        foreground_sender
+            .send(prefetch_tile(RenderPriority::Visible))
+            .unwrap();
+        current_sender
+            .send(prefetch_tile(RenderPriority::CurrentViewport))
+            .unwrap();
+        next_sender
+            .send(prefetch_tile(RenderPriority::NextViewport))
+            .unwrap();
+        previous_sender
+            .send(prefetch_tile(RenderPriority::PreviousViewport))
+            .unwrap();
+        background_sender
+            .send(DocumentCommand::SearchPage {
+                page_index: 0,
+                query: Arc::from("needle"),
+                generation: 1,
+            })
+            .unwrap();
+        wake_sender.send(()).unwrap();
+        event_sender
+            .send(DocumentEvent::Status("test".to_owned()))
+            .unwrap();
+
+        let service = DocumentService {
+            foreground_sender,
+            current_viewport_sender: current_sender,
+            next_viewport_sender: next_sender,
+            previous_viewport_sender: previous_sender,
+            background_sender,
+            text_snapshot_wake_sender: wake_sender,
+            scheduled_tiles,
+            scheduled_text_snapshots,
+            active_highlight_index_generation: Arc::new(AtomicU64::new(0)),
+            event_receiver,
+        };
+        let snapshot = service.diagnostics_snapshot();
+
+        assert_eq!(snapshot.foreground, 1);
+        assert_eq!(snapshot.current_viewport, 1);
+        assert_eq!(snapshot.next_viewport, 1);
+        assert_eq!(snapshot.previous_viewport, 1);
+        assert_eq!(snapshot.background, 1);
+        assert_eq!(snapshot.event, 1);
+        assert_eq!(snapshot.scheduled_tiles, 1);
+        assert_eq!(snapshot.scheduled_text_snapshots, 1);
+        drop((
+            foreground_receiver,
+            current_receiver,
+            next_receiver,
+            previous_receiver,
+        ));
+        drop((background_receiver, wake_receiver));
     }
 }

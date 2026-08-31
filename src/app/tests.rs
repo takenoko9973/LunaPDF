@@ -192,6 +192,112 @@ fn finish_async_document_opens(app: &mut PrototypeApp) {
     assert!(app.documents.iter().all(|document| document.info.is_some()));
 }
 
+#[cfg(debug_assertions)]
+fn diagnostics_tile_request(
+    app: &PrototypeApp,
+    page_index: usize,
+    spec: TileSpec,
+    priority: RenderPriority,
+    generation: u64,
+) -> TileRequest {
+    let tab = &app.documents[0];
+    TileRequest {
+        page_index,
+        zoom: 1.0,
+        pixels_per_point: 1.0,
+        scale: 1.0,
+        generation,
+        expected_revision: tab.info.as_ref().unwrap().revision,
+        spec,
+        priority,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn install_pending_tile(
+    app: &mut PrototypeApp,
+    request: TileRequest,
+    visible: bool,
+) -> TileCacheKey {
+    let tab = &mut app.documents[0];
+    let key = TileCacheKey::from_request(tab.document_id, &request);
+    tab.wanted_tiles.insert(key);
+    if visible {
+        tab.visible_tiles.insert(key);
+    }
+    tab.pending_tiles.insert(key, request);
+    key
+}
+
+#[cfg(debug_assertions)]
+fn pending_visible_tile_request(app: &mut PrototypeApp) -> TileRequest {
+    let generation = app.documents[0].view.generation;
+    let request = diagnostics_tile_request(
+        app,
+        0,
+        TileSpec {
+            pixel_x: 0,
+            pixel_y: 0,
+            pixel_width: 512,
+            pixel_height: 512,
+        },
+        RenderPriority::Visible,
+        generation,
+    );
+    install_pending_tile(app, request, true);
+    request
+}
+
+#[cfg(debug_assertions)]
+fn receive_until_document_error(app: &mut PrototypeApp) {
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.documents[0].error.is_none() && std::time::Instant::now() < deadline {
+        app.receive_document_events(&context);
+        if app.documents[0].error.is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(app.documents[0].error.is_some());
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_worker_events(app: &PrototypeApp, baseline: usize, additional: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.documents[0]
+        .service
+        .as_ref()
+        .unwrap()
+        .diagnostics_snapshot()
+        .event
+        < baseline.saturating_add(additional)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        app.documents[0]
+            .service
+            .as_ref()
+            .unwrap()
+            .diagnostics_snapshot()
+            .event
+            >= baseline.saturating_add(additional)
+    );
+}
+
+#[cfg(debug_assertions)]
+fn diagnostics_file_contents(directory: &tempfile::TempDir) -> String {
+    let diagnostics_directory = directory.path().join("diagnostics");
+    let path = std::fs::read_dir(diagnostics_directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::read_to_string(path).unwrap()
+}
+
 fn create_dirty_external_conflict(app: &mut PrototypeApp, path: &Path) -> DocumentVersion {
     let quad = PageQuad {
         upper_left: PagePoint::new(20.0, 20.0),
@@ -438,7 +544,11 @@ fn external_resume_opened_event_rebuilds_suspended_document_state() {
     assert!(!same_file_identity(current, expected));
 
     let tab = &mut app.documents[0];
-    tab.outline = Some(Vec::new());
+    tab.outline = Some(vec![OutlineItem {
+        title: "old outline sentinel".to_owned(),
+        page_index: Some(0),
+        children: Vec::new(),
+    }]);
     tab.outline_requested = true;
     tab.selection = Some(SelectionSnapshot {
         page_index: 0,
@@ -499,7 +609,11 @@ fn external_resume_opened_event_rebuilds_suspended_document_state() {
     assert_eq!(tab.info.as_ref().unwrap().version, current);
     assert_eq!(tab.view.current_page, 0);
     assert_eq!(tab.view.scroll_to_page, Some(0));
-    assert!(tab.outline.is_none());
+    assert!(tab.outline.as_ref().is_none_or(|outline| {
+        outline
+            .iter()
+            .all(|item| item.title != "old outline sentinel")
+    }));
     assert!(tab.selection.is_none());
     assert!(tab.annotation_pages.is_empty());
     assert!(tab.search.pages.is_empty());
@@ -4488,4 +4602,551 @@ fn multi_touch_pinch_during_ctrl_line_residual_is_wheel_speed_independent() {
         "pinch changed with wheel speed: {observed:?}"
     );
     assert!((observed[0] - 1.2).abs() < 1e-6);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_rows_map_every_metric_to_its_header() {
+    use crate::app::diagnostics::{
+        ContainerCounts, DiagnosticsSnapshot, DocumentDiagnosticsSnapshot, LruSnapshot,
+        header_line, render_detail_line, render_sample_line,
+    };
+    use crate::pdf::WorkerQueueSnapshot;
+
+    let document = DocumentDiagnosticsSnapshot {
+        document_id: 2001,
+        state: "sentinel_state",
+        active: true,
+        visible: false,
+        containers: ContainerCounts {
+            tiles: 2011,
+            pending_tiles: 2012,
+            wanted_tiles: 2013,
+            visible_tiles: 2014,
+            thumbnails: 2015,
+            pending_thumbnails: 2016,
+            text_snapshots: 2017,
+            pending_text_snapshots: 2018,
+            annotation_pages: 2019,
+            pending_annotation_pages: 2020,
+            highlight_index_pages: 2021,
+            highlight_index_items: 2022,
+            search_pages: 2023,
+            search_matches: 2024,
+        },
+        worker: WorkerQueueSnapshot {
+            foreground: 2025,
+            current_viewport: 2026,
+            next_viewport: 2027,
+            previous_viewport: 2028,
+            background: 2029,
+            event: 2030,
+            scheduled_tiles: 2031,
+            scheduled_text_snapshots: 2032,
+        },
+    };
+    let snapshot = DiagnosticsSnapshot {
+        physical_mem_bytes: Some(1001),
+        gpu_tile_lru: LruSnapshot {
+            count: 1002,
+            current_weight_bytes: 1003,
+            budget_bytes: 1004,
+        },
+        thumbnail_lru: LruSnapshot {
+            count: 1005,
+            current_weight_bytes: 1006,
+            budget_bytes: 1007,
+        },
+        tab_count: 1008,
+        visible_tab_count: 1009,
+        active_document_id: Some(1010),
+        containers: ContainerCounts {
+            tiles: 1011,
+            pending_tiles: 1012,
+            wanted_tiles: 1013,
+            visible_tiles: 1014,
+            thumbnails: 1015,
+            pending_thumbnails: 1016,
+            text_snapshots: 1017,
+            pending_text_snapshots: 1018,
+            annotation_pages: 1019,
+            pending_annotation_pages: 1020,
+            highlight_index_pages: 1021,
+            highlight_index_items: 1022,
+            search_pages: 1023,
+            search_matches: 1024,
+        },
+        worker: WorkerQueueSnapshot {
+            foreground: 1025,
+            current_viewport: 1026,
+            next_viewport: 1027,
+            previous_viewport: 1028,
+            background: 1029,
+            event: 1030,
+            scheduled_tiles: 1031,
+            scheduled_text_snapshots: 1032,
+        },
+        documents: vec![document.clone()],
+    };
+
+    let header = header_line();
+    let headers = header.split('\t').collect::<Vec<_>>();
+    let sample = render_sample_line("sample_phase", "sample_event", 12.345, &snapshot);
+    let detail = render_detail_line("detail_phase", "detail_event", 67.89, &snapshot, &document);
+    let assert_values = |line: &str, expected: &[(&str, &str)]| {
+        let values = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(values.len(), headers.len());
+        for (name, expected) in expected {
+            let index = headers
+                .iter()
+                .position(|header| header == name)
+                .unwrap_or_else(|| panic!("missing header {name}"));
+            assert_eq!(values[index], *expected, "wrong value for {name}");
+        }
+    };
+
+    assert_values(
+        &sample,
+        &[
+            ("row_kind", "sample"),
+            ("phase", "sample_phase"),
+            ("event", "sample_event"),
+            ("elapsed_s", "12.345"),
+            ("physical_mem_bytes", "1001"),
+            ("gpu_tile_lru_count", "1002"),
+            ("gpu_tile_lru_current_weight_bytes", "1003"),
+            ("gpu_tile_lru_budget_bytes", "1004"),
+            ("thumbnail_lru_count", "1005"),
+            ("thumbnail_lru_current_weight_bytes", "1006"),
+            ("thumbnail_lru_budget_bytes", "1007"),
+            ("tab_count", "1008"),
+            ("visible_tab_count", "1009"),
+            ("active_document_id", "1010"),
+            ("tiles", "1011"),
+            ("pending_tiles", "1012"),
+            ("wanted_tiles", "1013"),
+            ("visible_tiles", "1014"),
+            ("thumbnails", "1015"),
+            ("pending_thumbnails", "1016"),
+            ("text_snapshots", "1017"),
+            ("pending_text_snapshots", "1018"),
+            ("annotation_pages", "1019"),
+            ("pending_annotation_pages", "1020"),
+            ("highlight_index_pages", "1021"),
+            ("highlight_index_items", "1022"),
+            ("search_pages", "1023"),
+            ("search_matches", "1024"),
+            ("foreground_queue", "1025"),
+            ("current_viewport_queue", "1026"),
+            ("next_viewport_queue", "1027"),
+            ("previous_viewport_queue", "1028"),
+            ("background_queue", "1029"),
+            ("event_queue", "1030"),
+            ("scheduled_tiles", "1031"),
+            ("scheduled_text_snapshots", "1032"),
+        ],
+    );
+    assert_values(
+        &detail,
+        &[
+            ("row_kind", "detail"),
+            ("phase", "detail_phase"),
+            ("event", "detail_event"),
+            ("elapsed_s", "67.890"),
+            ("document_id", "2001"),
+            ("document_state", "sentinel_state"),
+            ("document_active", "true"),
+            ("document_visible", "false"),
+            ("document_tiles", "2011"),
+            ("document_pending_tiles", "2012"),
+            ("document_wanted_tiles", "2013"),
+            ("document_visible_tiles", "2014"),
+            ("document_thumbnails", "2015"),
+            ("document_pending_thumbnails", "2016"),
+            ("document_text_snapshots", "2017"),
+            ("document_pending_text_snapshots", "2018"),
+            ("document_annotation_pages", "2019"),
+            ("document_pending_annotation_pages", "2020"),
+            ("document_highlight_index_pages", "2021"),
+            ("document_highlight_index_items", "2022"),
+            ("document_search_pages", "2023"),
+            ("document_search_matches", "2024"),
+            ("document_foreground_queue", "2025"),
+            ("document_current_viewport_queue", "2026"),
+            ("document_next_viewport_queue", "2027"),
+            ("document_previous_viewport_queue", "2028"),
+            ("document_background_queue", "2029"),
+            ("document_event_queue", "2030"),
+            ("document_scheduled_tiles", "2031"),
+            ("document_scheduled_text_snapshots", "2032"),
+        ],
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_phase_transition_and_cadence_are_deterministic() {
+    use crate::app::diagnostics::{
+        DiagnosticsPhase, DiagnosticsSnapshot, SAMPLE_INTERVAL, SamplingState, WARMUP_DURATION,
+    };
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let mut state = SamplingState::new(started);
+    assert_eq!(state.phase(), DiagnosticsPhase::Startup);
+    assert!(state.begin_restore(started));
+    assert_eq!(state.phase(), DiagnosticsPhase::Restore);
+    assert!(state.restore_complete(started));
+    assert_eq!(state.phase(), DiagnosticsPhase::DisplayPending);
+    assert!(state.tick(started, None).is_none());
+    assert!(state.display_stable(started));
+    assert_eq!(state.phase(), DiagnosticsPhase::Warmup);
+
+    let snapshot = DiagnosticsSnapshot::default();
+    let first = state.tick(started, snapshot.physical_mem_bytes).unwrap();
+    assert_eq!(first.phase, DiagnosticsPhase::Warmup);
+    assert!(
+        state
+            .tick(started + SAMPLE_INTERVAL - Duration::from_millis(1), None)
+            .is_none()
+    );
+    let second = state.tick(started + SAMPLE_INTERVAL, None).unwrap();
+    assert_eq!(second.phase, DiagnosticsPhase::Warmup);
+    assert!(!second.sampling_started);
+    assert!(
+        state
+            .tick(
+                started + SAMPLE_INTERVAL * 2 - Duration::from_millis(1),
+                None
+            )
+            .is_none()
+    );
+
+    let normal = state.tick(started + WARMUP_DURATION, None).unwrap();
+    assert_eq!(normal.phase, DiagnosticsPhase::Sampling);
+    assert!(normal.sampling_started);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_waits_for_first_manual_open_before_warmup() {
+    use crate::app::diagnostics::DiagnosticsPhase;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = PrototypeApp::from_startup(
+        Vec::new(),
+        SessionStore::new(directory.path().join("session.json")),
+    );
+
+    assert_eq!(app.diagnostics.phase(), DiagnosticsPhase::Startup);
+    app.sample_diagnostics();
+    assert_eq!(app.diagnostics.phase(), DiagnosticsPhase::Startup);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_waits_for_visible_render_after_annotation_failure() {
+    use crate::app::diagnostics::DiagnosticsPhase;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("annotation-failure.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let _visible_request = pending_visible_tile_request(&mut app);
+
+    let revision = app.documents[0].info.as_ref().unwrap().revision;
+    let request = AnnotationPageRequest {
+        page_index: app.documents[0].info.as_ref().unwrap().page_bounds.len(),
+        expected_revision: revision,
+    };
+    app.documents[0].wanted_annotation_pages.insert(request);
+    app.documents[0].pending_annotation_pages.insert(request);
+    assert!(app.documents[0].send(DocumentCommand::LoadAnnotations(request)));
+
+    // 実際のワーカーから届いた AnnotationsFailed がタブの汎用 error を設定しても、
+    // 可視タイルが保留中である間は表示安定点にしてはならない。
+    receive_until_document_error(&mut app);
+    assert!(
+        app.documents[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("注釈情報を読み取れませんでした"))
+    );
+    app.sample_diagnostics();
+
+    assert_eq!(app.diagnostics.phase(), DiagnosticsPhase::Startup);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_records_unavailable_and_continues_after_visible_render_failure() {
+    use crate::app::diagnostics::DiagnosticsPhase;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("render-failure.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+
+    let mut request = pending_visible_tile_request(&mut app);
+    request.page_index = app.documents[0].info.as_ref().unwrap().page_bounds.len();
+    let old_key = app.documents[0]
+        .visible_tiles
+        .iter()
+        .next()
+        .copied()
+        .unwrap();
+    let tab = &mut app.documents[0];
+    let new_key = TileCacheKey::from_request(tab.document_id, &request);
+    tab.wanted_tiles.remove(&old_key);
+    tab.visible_tiles.remove(&old_key);
+    tab.pending_tiles.remove(&old_key);
+    tab.wanted_tiles.insert(new_key);
+    tab.visible_tiles.insert(new_key);
+    tab.pending_tiles.insert(new_key, request);
+    assert!(tab.send(DocumentCommand::RenderTile(request)));
+
+    // 不正なページ要求を実際のワーカーへ送り、render 失敗イベントを受け取る。
+    receive_until_document_error(&mut app);
+    assert!(
+        app.documents[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("ページを表示できませんでした"))
+    );
+    app.sample_diagnostics();
+
+    assert_eq!(app.diagnostics.phase(), DiagnosticsPhase::Warmup);
+    let log = diagnostics_file_contents(&directory);
+    assert!(
+        log.lines()
+            .any(|line| { line.split('\t').nth(2) == Some("display_unavailable") })
+    );
+    assert!(
+        !log.lines()
+            .any(|line| line.split('\t').nth(2) == Some("display_stable"))
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_keeps_visible_render_failure_when_two_results_are_drained_together() {
+    use crate::app::diagnostics::{DiagnosticsPhase, DisplayRenderState};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("two-tile-render-failure.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let context = egui::Context::default();
+    app.receive_document_events(&context);
+    let baseline = app.documents[0]
+        .service
+        .as_ref()
+        .unwrap()
+        .diagnostics_snapshot()
+        .event;
+    let generation = app.documents[0].view.generation;
+    let bounds = app.documents[0].info.as_ref().unwrap().page_bounds[0];
+    let spec = TileSpec {
+        pixel_x: 0,
+        pixel_y: 0,
+        pixel_width: (bounds.x1 - bounds.x0).round() as u32,
+        pixel_height: (bounds.y1 - bounds.y0).round() as u32,
+    };
+    let failed_request = diagnostics_tile_request(
+        &app,
+        app.documents[0].info.as_ref().unwrap().page_bounds.len(),
+        spec,
+        RenderPriority::Visible,
+        generation,
+    );
+    let successful_request =
+        diagnostics_tile_request(&app, 0, spec, RenderPriority::Visible, generation);
+    let failed_key = install_pending_tile(&mut app, failed_request, true);
+    let successful_key = install_pending_tile(&mut app, successful_request, true);
+    assert_ne!(failed_key, successful_key);
+    assert!(app.documents[0].send(DocumentCommand::RenderTile(failed_request)));
+    assert!(app.documents[0].send(DocumentCommand::RenderTile(successful_request)));
+
+    wait_for_worker_events(&app, baseline, 2);
+    // 失敗→成功を同じイベント drain で処理しても、失敗状態を成功で上書きしない。
+    app.receive_document_events(&context);
+
+    assert!(app.documents[0].tiles.contains_key(&successful_key));
+    assert!(app.documents[0].pending_tiles.is_empty());
+    assert_eq!(
+        app.documents[0].initial_display_render,
+        DisplayRenderState::Failed
+    );
+    app.sample_diagnostics();
+    assert_eq!(app.diagnostics.phase(), DiagnosticsPhase::Warmup);
+    let log = diagnostics_file_contents(&directory);
+    assert!(
+        log.lines()
+            .any(|line| { line.split('\t').nth(2) == Some("display_unavailable") })
+    );
+    assert!(
+        !log.lines()
+            .any(|line| line.split('\t').nth(2) == Some("display_stable"))
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_ignores_stale_prefetch_failure_for_a_current_visible_request() {
+    use crate::app::diagnostics::{DiagnosticsPhase, DisplayRenderState};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("stale-prefetch-failure.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let context = egui::Context::default();
+    app.receive_document_events(&context);
+    let baseline = app.documents[0]
+        .service
+        .as_ref()
+        .unwrap()
+        .diagnostics_snapshot()
+        .event;
+    let generation = app.documents[0].view.generation;
+    let bounds = app.documents[0].info.as_ref().unwrap().page_bounds[0];
+    let spec = TileSpec {
+        pixel_x: 0,
+        pixel_y: 0,
+        pixel_width: (bounds.x1 - bounds.x0).round() as u32,
+        pixel_height: (bounds.y1 - bounds.y0).round() as u32,
+    };
+    let stale_prefetch = diagnostics_tile_request(
+        &app,
+        app.documents[0].info.as_ref().unwrap().page_bounds.len(),
+        spec,
+        RenderPriority::CurrentViewport,
+        generation.wrapping_sub(1),
+    );
+    let current_visible =
+        diagnostics_tile_request(&app, 0, spec, RenderPriority::Visible, generation);
+    let stale_key = install_pending_tile(&mut app, stale_prefetch, false);
+    let current_key = install_pending_tile(&mut app, current_visible, true);
+    assert!(app.documents[0].send(DocumentCommand::RenderTile(stale_prefetch)));
+
+    wait_for_worker_events(&app, baseline, 1);
+    app.receive_document_events(&context);
+
+    assert!(app.documents[0].error.is_some());
+    assert!(app.documents[0].pending_tiles.contains_key(&current_key));
+    assert!(!app.documents[0].pending_tiles.contains_key(&stale_key));
+    assert_eq!(
+        app.documents[0].initial_display_render,
+        DisplayRenderState::Pending
+    );
+    app.sample_diagnostics();
+    assert_eq!(app.diagnostics.phase(), DiagnosticsPhase::Startup);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_display_stability_requires_a_visible_tile_signal() {
+    use crate::app::diagnostics::{
+        DisplayReadiness, DisplayRenderState, display_is_stable, display_is_unavailable,
+    };
+
+    let requested = DisplayReadiness {
+        has_visible_request: true,
+        ..DisplayReadiness::default()
+    };
+    assert!(!display_is_stable(&[requested]));
+
+    let pending = DisplayReadiness {
+        has_visible_request: true,
+        has_pending_visible_request: true,
+        ..DisplayReadiness::default()
+    };
+    assert!(!display_is_stable(&[pending]));
+
+    let rendered = DisplayReadiness {
+        render: DisplayRenderState::Succeeded,
+        has_visible_request: true,
+        has_visible_result: true,
+        ..DisplayReadiness::default()
+    };
+    assert!(display_is_stable(&[rendered]));
+
+    let failed = DisplayReadiness {
+        unavailable: true,
+        ..DisplayReadiness::default()
+    };
+    assert!(!display_is_stable(&[failed]));
+    assert!(display_is_unavailable(&[failed], false));
+    assert!(!display_is_stable(&[]));
+    assert!(display_is_unavailable(&[], true));
+    assert!(!display_is_unavailable(&[], false));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_rss_high_water_detail_is_single_shot_until_next_threshold() {
+    use crate::app::diagnostics::{RSS_DETAIL_THRESHOLD_BYTES, SAMPLE_INTERVAL, SamplingState};
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let mut state = SamplingState::new(started);
+    state.display_stable(started);
+    assert!(!state.tick(started, Some(0)).unwrap().detail_due);
+
+    let threshold = RSS_DETAIL_THRESHOLD_BYTES;
+    let first_threshold = started + SAMPLE_INTERVAL;
+    assert!(
+        state
+            .tick(first_threshold, Some(threshold))
+            .unwrap()
+            .detail_due
+    );
+    assert!(
+        !state
+            .tick(first_threshold + SAMPLE_INTERVAL, Some(threshold - 1))
+            .unwrap()
+            .detail_due
+    );
+    assert!(
+        state
+            .tick(
+                first_threshold + SAMPLE_INTERVAL * 2,
+                Some(threshold + RSS_DETAIL_THRESHOLD_BYTES),
+            )
+            .unwrap()
+            .detail_due
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_write_error_preserves_existing_app_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = PrototypeApp::from_startup(
+        Vec::new(),
+        SessionStore::new(directory.path().join("session.json")),
+    );
+
+    app.error = Some("既存のPDFエラー".to_owned());
+    app.report_diagnostics_error("診断ログのエラー".to_owned());
+
+    assert_eq!(
+        app.error.as_deref(),
+        Some("既存のPDFエラー\n診断ログのエラー")
+    );
 }
