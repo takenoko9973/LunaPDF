@@ -8,7 +8,7 @@ mod search;
 mod tests;
 mod workspace;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -174,6 +174,10 @@ const ZOOM_INPUT_GROUP_IDLE_SECONDS: f64 = 0.250;
 // 許可し、通常のタブ切り替えでは文書を保持する。
 const RESIDENT_MEMORY_SUSPEND_THRESHOLD_BYTES: usize = 512 * 1_024 * 1_024;
 
+const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(33);
+const EXTERNAL_WAIT_REPAINT_DELAY: Duration = Duration::from_millis(300);
+const IDLE_REPAINT_DELAY: Duration = Duration::from_secs(1);
+
 pub(crate) struct PrototypeApp {
     tabs: TabState,
     documents: Vec<DocumentTab>,
@@ -234,6 +238,7 @@ struct DocumentTab {
     error: Option<String>,
     outline: Option<Vec<OutlineItem>>,
     outline_requested: bool,
+    outline_in_flight: bool,
     tiles: HashMap<TileCacheKey, CachedTile>,
     pending_tiles: HashMap<TileCacheKey, TileRequest>,
     wanted_tiles: HashSet<TileCacheKey>,
@@ -250,6 +255,8 @@ struct DocumentTab {
     pending_highlight_refresh_page: Option<usize>,
     selection: Option<SelectionSnapshot>,
     selection_generation: u64,
+    selection_requests_in_flight: VecDeque<u64>,
+    invalidated_selection_requests: VecDeque<u64>,
     pending_edits: usize,
     edit_history: Vec<EditAction>,
     undo_in_flight: bool,
@@ -954,6 +961,33 @@ impl PrototypeApp {
             app.report_diagnostics_error(error);
         }
         app
+    }
+
+    fn request_repaint_after(&self, context: &egui::Context) {
+        context.request_repaint_after(repaint_delay(
+            self.has_active_work(),
+            self.has_external_wait(),
+        ));
+    }
+
+    fn has_active_work(&self) -> bool {
+        self.ctrl_line_zoom_correction_active
+            || self.session_restore_progress.is_some()
+            || self.tab_drag.is_some()
+            || self
+                .annotation_editor
+                .as_ref()
+                .is_some_and(|editor| editor.mutation_in_flight)
+            || self.viewports.values().any(|viewport| {
+                viewport.primary_interaction_in_progress() || viewport.blank_pan_in_progress()
+            })
+            || self.documents.iter().any(DocumentTab::has_active_work)
+    }
+
+    fn has_external_wait(&self) -> bool {
+        self.documents
+            .iter()
+            .any(|document| document.external_candidate.is_some() || document.rename_scan_in_flight)
     }
 
     #[cfg(debug_assertions)]
@@ -5479,6 +5513,7 @@ impl DocumentTab {
             error: None,
             outline: None,
             outline_requested: false,
+            outline_in_flight: false,
             tiles: HashMap::new(),
             pending_tiles: HashMap::new(),
             wanted_tiles: HashSet::new(),
@@ -5495,6 +5530,8 @@ impl DocumentTab {
             pending_highlight_refresh_page: None,
             selection: None,
             selection_generation: 0,
+            selection_requests_in_flight: VecDeque::new(),
+            invalidated_selection_requests: VecDeque::new(),
             pending_edits: 0,
             edit_history: Vec::new(),
             undo_in_flight: false,
@@ -5531,6 +5568,101 @@ impl DocumentTab {
             .is_some_and(|service| service.send(command))
     }
 
+    fn request_outline(&mut self) -> bool {
+        if self.outline_requested {
+            return false;
+        }
+        if self.send(DocumentCommand::LoadOutline) {
+            self.outline_requested = true;
+            self.outline_in_flight = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn outline_request_completed(&mut self) {
+        self.outline_in_flight = false;
+    }
+
+    fn outline_request_failed(&mut self) {
+        self.outline_in_flight = false;
+    }
+
+    fn cancel_outline_request(&mut self) {
+        if self.outline_in_flight {
+            self.outline_requested = false;
+        }
+        self.outline_in_flight = false;
+    }
+
+    fn invalidate_outline_request(&mut self) {
+        self.outline = None;
+        self.outline_requested = false;
+        self.outline_in_flight = false;
+    }
+
+    fn has_active_selection_request(&self) -> bool {
+        !self.selection_requests_in_flight.is_empty()
+    }
+
+    fn selection_request_completed(&mut self, generation: u64) {
+        if let Some(position) = self
+            .selection_requests_in_flight
+            .iter()
+            .position(|request| *request == generation)
+        {
+            self.selection_requests_in_flight.remove(position);
+        } else if let Some(position) = self
+            .invalidated_selection_requests
+            .iter()
+            .position(|request| *request == generation)
+        {
+            self.invalidated_selection_requests.remove(position);
+        }
+    }
+
+    fn selection_request_failed(&mut self) {
+        // Failed("selection") は generation を持たないため、先に無効化済み要求を消費する。
+        // 現行要求は FIFO で保ち、複数要求の古い失敗が新しい要求を解除しないようにする。
+        if self.invalidated_selection_requests.pop_front().is_none() {
+            self.selection_requests_in_flight.pop_front();
+        }
+    }
+
+    fn invalidate_selection_requests(&mut self) {
+        self.invalidated_selection_requests
+            .append(&mut self.selection_requests_in_flight);
+    }
+
+    fn clear_selection_tracking(&mut self) {
+        self.selection_requests_in_flight.clear();
+        self.invalidated_selection_requests.clear();
+    }
+
+    fn has_active_work(&self) -> bool {
+        self.state == DocumentState::Opening
+            || self.state == DocumentState::Saving
+            || !self.pending_tiles.is_empty()
+            || !self.pending_text_snapshots.is_empty()
+            || !self.pending_annotation_pages.is_empty()
+            || self.highlight_index.in_flight.is_some()
+            || (self.highlight_index.refresh_page.is_some() && self.highlight_index.error.is_none())
+            || self.pending_highlight_refresh_page.is_some()
+            || self.has_active_selection_request()
+            || self.outline_in_flight
+            || self.view.autoscroll.is_some()
+            || !self.pending_thumbnails.is_empty()
+            || self.search.in_progress
+            || self.pending_edits > 0
+            || self.undo_in_flight
+            || self.save_in_flight
+            || !matches!(self.save_as, SaveAsState::Idle)
+            || self.print_in_flight
+            || self.reload_in_flight
+            || self.pending_rebind_path.is_some()
+    }
+
     fn cancel_render(&self, request: &TileRequest) {
         if let Some(service) = &self.service {
             service.cancel_render(request);
@@ -5560,13 +5692,25 @@ impl DocumentTab {
         // チャネル切断後に完了イベントは届かない。応答待ちのフラグをすべて解除し、
         // クローズと復旧操作を利用可能にする。
         self.cancel_highlight_index_work();
+        self.pending_highlight_refresh_page = None;
+        self.pending_tiles.clear();
+        self.wanted_tiles.clear();
+        self.visible_tiles.clear();
+        self.pending_text_snapshots.clear();
+        self.wanted_text_snapshots.clear();
         self.pending_edits = 0;
         self.pending_annotation_pages.clear();
+        self.pending_thumbnails.clear();
+        self.search.in_progress = false;
+        self.outline_request_failed();
+        self.clear_selection_tracking();
         self.undo_in_flight = false;
         self.save_in_flight = false;
         self.print_in_flight = false;
         self.reload_in_flight = false;
         self.save_as = SaveAsState::Idle;
+        self.external_resume_in_flight = false;
+        self.pending_rebind_path = None;
         self.rename_scan_in_flight = false;
         if self.state != DocumentState::Error {
             self.error = Some(
@@ -5588,6 +5732,9 @@ impl DocumentTab {
 
     fn suspend(&mut self) {
         self.cancel_highlight_index_work();
+        self.pending_highlight_refresh_page = None;
+        self.cancel_outline_request();
+        self.clear_selection_tracking();
         self.invalidate_rendering();
         self.invalidate_text_snapshots();
         self.invalidate_annotation_pages();
@@ -5808,8 +5955,8 @@ impl DocumentTab {
         self.external_conflict = None;
         self.reload_in_flight = false;
         self.failed_external_version = None;
-        self.outline = None;
-        self.outline_requested = false;
+        self.external_resume_in_flight = false;
+        self.invalidate_outline_request();
         self.clear_selection();
         self.search.generation = self.search.generation.wrapping_add(1);
         self.search.pages.clear();
@@ -5901,6 +6048,7 @@ impl DocumentTab {
     }
 
     fn cancel_highlight_index_work(&mut self) {
+        self.highlight_index.refresh_page = None;
         if !self.highlight_index.started {
             return;
         }
@@ -5934,6 +6082,7 @@ impl DocumentTab {
         if self.send(DocumentCommand::LoadHighlightIndexBatch(request)) {
             self.highlight_index.in_flight = Some(request);
         } else {
+            self.highlight_index.refresh_page = None;
             self.highlight_index.error = Some("ハイライト一覧を読み込めませんでした。".to_owned());
         }
     }
@@ -6095,18 +6244,24 @@ impl DocumentTab {
 
     fn request_selection(&mut self, page_index: usize, start: PagePoint, end: PagePoint) {
         self.selection_generation = self.selection_generation.wrapping_add(1);
-        let _queued = self.send(DocumentCommand::Select {
+        let generation = self.selection_generation;
+        let queued = self.send(DocumentCommand::Select {
             page_index,
-            generation: self.selection_generation,
+            generation,
             start,
             end,
         });
+        if queued {
+            self.selection_requests_in_flight.push_back(generation);
+        }
     }
 
     fn clear_selection(&mut self) {
         // generation を進め、以前のドラッグに対するワーカー結果が明示的なクリック消去後に
-        // 選択を復元するのを防ぐ。
+        // 選択を復元するのを防ぐ。選択要求をキャンセルする worker API はないため、古い
+        // 応答の FIFO accounting だけを残し、無効化済み要求は active work に数えない。
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.invalidate_selection_requests();
         self.selection = None;
     }
 }
@@ -6230,7 +6385,6 @@ impl eframe::App for PrototypeApp {
         self.handle_window_close(context, external_request_received);
         #[cfg(debug_assertions)]
         self.sample_diagnostics();
-        context.request_repaint_after(Duration::from_millis(33));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -6245,6 +6399,7 @@ impl eframe::App for PrototypeApp {
         self.annotation_editor_overlay(ui.ctx(), central_rect);
         self.close_confirmation_dialog(ui.ctx());
         self.session_close_failure_dialog(ui.ctx());
+        self.request_repaint_after(ui.ctx());
     }
 }
 
@@ -6291,6 +6446,16 @@ fn document_failure_message(operation: &str, detail: &str) -> String {
         _ => "PDFの処理に失敗しました。タブを開き直してください。",
     };
     format!("{guidance} 詳細: {detail}")
+}
+
+fn repaint_delay(active_work: bool, external_wait: bool) -> Duration {
+    if active_work {
+        ACTIVE_REPAINT_DELAY
+    } else if external_wait {
+        EXTERNAL_WAIT_REPAINT_DELAY
+    } else {
+        IDLE_REPAINT_DELAY
+    }
 }
 
 fn document_save_blocks_close(save_in_flight: bool) -> bool {

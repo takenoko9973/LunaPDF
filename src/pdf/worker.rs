@@ -113,7 +113,7 @@ pub(crate) enum DocumentEvent {
     Failed {
         operation: &'static str,
         message: String,
-        #[cfg(debug_assertions)]
+        /// 描画失敗でも保留中の要求を特定して解放するため、全ビルドで保持する。
         render_request: Option<TileRequest>,
     },
 }
@@ -796,7 +796,6 @@ fn send_opened_info(
             let _ = event_sender.send(DocumentEvent::Failed {
                 operation: "resume",
                 message: "the PDF changed outside LunaPDF while its tab was suspended".to_owned(),
-                #[cfg(debug_assertions)]
                 render_request: None,
             });
             false
@@ -836,12 +835,10 @@ fn send_failure(
     let _ = event_sender.send(DocumentEvent::Failed {
         operation,
         message: format!("{error:#}"),
-        #[cfg(debug_assertions)]
         render_request: None,
     });
 }
 
-#[cfg(debug_assertions)]
 fn send_render_failure(
     event_sender: &Sender<DocumentEvent>,
     request: TileRequest,
@@ -852,15 +849,6 @@ fn send_render_failure(
         message: format!("{error:#}"),
         render_request: Some(request),
     });
-}
-
-#[cfg(not(debug_assertions))]
-fn send_render_failure(
-    event_sender: &Sender<DocumentEvent>,
-    _request: TileRequest,
-    error: anyhow::Error,
-) {
-    send_failure(event_sender, "render", error);
 }
 
 #[cfg(test)]

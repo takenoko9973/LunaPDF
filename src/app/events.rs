@@ -1,8 +1,8 @@
 use super::*;
 
 impl PrototypeApp {
-    #[cfg(debug_assertions)]
-    fn receive_render_failure(&mut self, index: usize, request: TileRequest) {
+    pub(super) fn receive_render_failure(&mut self, index: usize, request: TileRequest) {
+        #[cfg(debug_assertions)]
         let is_visible = self.is_visible_index(index);
         let document_id = self.documents[index].document_id;
         let key = TileCacheKey::from_request(document_id, &request);
@@ -21,6 +21,7 @@ impl PrototypeApp {
             return;
         }
         tab.pending_tiles.remove(&key);
+        #[cfg(debug_assertions)]
         if is_visible
             && request.priority == RenderPriority::Visible
             && tab.visible_tiles.contains(&key)
@@ -92,11 +93,7 @@ impl PrototypeApp {
                         } else if !external_resume {
                             self.documents[index].reconnect_highlight_index();
                         }
-                        if !self.documents[index].outline_requested
-                            && self.documents[index].send(DocumentCommand::LoadOutline)
-                        {
-                            self.documents[index].outline_requested = true;
-                        }
+                        let _ = self.documents[index].request_outline();
                         if self.active_index() == Some(index)
                             && !self.documents[index].search.query.trim().is_empty()
                         {
@@ -185,11 +182,8 @@ impl PrototypeApp {
                         if restart_search {
                             self.begin_search(index);
                         }
-                        if external_reload
-                            && !self.documents[index].outline_requested
-                            && self.documents[index].send(DocumentCommand::LoadOutline)
-                        {
-                            self.documents[index].outline_requested = true;
+                        if external_reload {
+                            let _ = self.documents[index].request_outline();
                         }
                     }
                     Ok(DocumentEvent::PathRebound { path, info }) => {
@@ -318,6 +312,7 @@ impl PrototypeApp {
                     }
                     Ok(DocumentEvent::SelectionReady(selection)) => {
                         let tab = &mut self.documents[index];
+                        tab.selection_request_completed(selection.generation);
                         if selection.generation == tab.selection_generation {
                             tab.selection = Some(selection);
                             self.status = "Selection Quad baseline updated".to_owned();
@@ -497,6 +492,7 @@ impl PrototypeApp {
                             && tab.highlight_index.generation == request.generation
                         {
                             tab.highlight_index.in_flight = None;
+                            tab.highlight_index.refresh_page = None;
                             tab.highlight_index.error = Some(
                                 "文書が更新されたため、ハイライト一覧の読み込みを中止しました。"
                                     .to_owned(),
@@ -509,13 +505,16 @@ impl PrototypeApp {
                             && tab.highlight_index.generation == request.generation
                         {
                             tab.highlight_index.in_flight = None;
+                            tab.highlight_index.refresh_page = None;
                             tab.highlight_index.error = Some(format!(
                                 "ハイライト一覧を読み込めませんでした。詳細: {message}"
                             ));
                         }
                     }
                     Ok(DocumentEvent::OutlineReady(outline)) => {
-                        self.documents[index].outline = Some(outline);
+                        let tab = &mut self.documents[index];
+                        tab.outline_request_completed();
+                        tab.outline = Some(outline);
                     }
                     Ok(DocumentEvent::SearchPageReady(result)) => {
                         self.receive_search_page(index, result);
@@ -607,14 +606,18 @@ impl PrototypeApp {
                     Ok(DocumentEvent::Failed {
                         operation,
                         message,
-                        #[cfg(debug_assertions)]
                         render_request,
                     }) => {
-                        #[cfg(debug_assertions)]
                         if operation == "render"
                             && let Some(request) = render_request
                         {
                             self.receive_render_failure(index, request);
+                        }
+                        if operation == "resume"
+                            || (operation == "open"
+                                && self.documents[index].resume_expected_version.is_some())
+                        {
+                            self.documents[index].external_resume_in_flight = false;
                         }
                         if self.is_visible_index(index) {
                             self.documents[index].view.stop_autoscroll();
@@ -652,9 +655,16 @@ impl PrototypeApp {
                         if operation == "highlight-state" {
                             let tab = &mut self.documents[index];
                             tab.pending_edits = tab.pending_edits.saturating_sub(1);
+                            tab.pending_highlight_refresh_page = None;
                             // MuPDF はすでに注釈を作成しており、後続スナップショットだけが
                             // 失敗したため、`dirty` のままにする。
                             tab.state = DocumentState::ReadyDirty;
+                        }
+                        if matches!(
+                            operation,
+                            "annotation-update-state" | "annotation-delete-state" | "undo-state"
+                        ) {
+                            self.documents[index].pending_highlight_refresh_page = None;
                         }
                         if operation == "annotation-update" || operation == "annotation-delete" {
                             let document_id = self.documents[index].document_id;
@@ -685,6 +695,12 @@ impl PrototypeApp {
                             // ページエラーは通常、キューに入った全ページで繰り返される。
                             // generation を進めて残りの処理を止め、同じ失敗で UI を埋めない。
                             self.cancel_search(index);
+                        }
+                        if operation == "selection" {
+                            self.documents[index].selection_request_failed();
+                        }
+                        if operation == "outline" {
+                            self.documents[index].outline_request_failed();
                         }
                         if operation == "undo" {
                             self.documents[index].undo_in_flight = false;

@@ -4,6 +4,210 @@ use crate::domain::selection::PageQuad;
 use mupdf::Size;
 use mupdf::pdf::PdfDocument;
 
+#[test]
+fn repaint_delay_policy_returns_to_idle_after_work_completes() {
+    assert_eq!(repaint_delay(false, false), Duration::from_secs(1));
+
+    let mut external_wait = true;
+    assert_eq!(
+        repaint_delay(false, external_wait),
+        Duration::from_millis(300)
+    );
+
+    let mut active_work = true;
+    assert_eq!(
+        repaint_delay(active_work, external_wait),
+        Duration::from_millis(33)
+    );
+
+    active_work = false;
+    external_wait = false;
+    assert_eq!(
+        repaint_delay(active_work, external_wait),
+        Duration::from_secs(1)
+    );
+}
+
+#[test]
+fn selection_tracking_requires_a_queued_request_and_preserves_newer_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selection-tracking.pdf");
+    write_blank_pdf(&path);
+    let mut tab = DocumentTab::new(1, path.clone(), 0, None);
+
+    tab.service = None;
+    tab.request_selection(0, PagePoint::new(0.0, 0.0), PagePoint::new(1.0, 1.0));
+    assert!(!tab.has_active_selection_request());
+
+    tab.service = Some(DocumentService::spawn(path));
+    tab.request_selection(0, PagePoint::new(0.0, 0.0), PagePoint::new(1.0, 1.0));
+    tab.request_selection(0, PagePoint::new(0.1, 0.1), PagePoint::new(0.9, 0.9));
+    assert!(tab.has_active_selection_request());
+
+    tab.selection_request_completed(2);
+    assert!(tab.has_active_selection_request());
+    tab.selection_request_failed();
+    assert!(!tab.has_active_selection_request());
+}
+
+#[test]
+fn selection_tracking_keeps_new_work_after_invalidation_and_clears_on_disconnect() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selection-invalidation.pdf");
+    write_blank_pdf(&path);
+    let mut tab = DocumentTab::new(2, path, 0, None);
+
+    tab.request_selection(0, PagePoint::new(0.0, 0.0), PagePoint::new(1.0, 1.0));
+    tab.clear_selection();
+    assert!(!tab.has_active_selection_request());
+    tab.request_selection(0, PagePoint::new(0.2, 0.2), PagePoint::new(0.8, 0.8));
+    assert!(tab.has_active_selection_request());
+
+    tab.selection_request_failed();
+    assert!(tab.has_active_selection_request());
+    tab.selection_request_completed(3);
+    assert!(!tab.has_active_selection_request());
+
+    tab.request_selection(0, PagePoint::new(0.3, 0.3), PagePoint::new(0.7, 0.7));
+    tab.mark_worker_disconnected();
+    assert!(!tab.has_active_selection_request());
+}
+
+#[test]
+fn outline_tracking_counts_only_successful_queue_until_terminal_event() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("outline-tracking.pdf");
+    write_blank_pdf(&path);
+
+    let mut unavailable = DocumentTab::new(3, path.clone(), 0, None);
+    unavailable.service = None;
+    assert!(!unavailable.request_outline());
+    assert!(!unavailable.outline_in_flight);
+
+    let mut completed = DocumentTab::new(4, path.clone(), 0, None);
+    assert!(completed.request_outline());
+    assert!(completed.outline_in_flight);
+    completed.outline_request_completed();
+    assert!(!completed.outline_in_flight);
+
+    let mut failed = DocumentTab::new(5, path.clone(), 0, None);
+    assert!(failed.request_outline());
+    failed.outline_request_failed();
+    assert!(!failed.outline_in_flight);
+    assert!(failed.outline_requested);
+    assert!(!failed.request_outline());
+
+    let mut invalidated = DocumentTab::new(6, path, 0, None);
+    assert!(invalidated.request_outline());
+    invalidated.invalidate_outline_request();
+    assert!(!invalidated.outline_in_flight);
+    assert!(!invalidated.outline_requested);
+
+    let mut canceled = DocumentTab::new(7, directory.path().join("outline-cancel.pdf"), 0, None);
+    assert!(canceled.request_outline());
+    canceled.cancel_outline_request();
+    assert!(!canceled.outline_in_flight);
+    assert!(!canceled.outline_requested);
+}
+
+#[test]
+fn render_failure_clears_only_matching_pending_tile_in_all_builds() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("render-failure-tracking.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+
+    let tab = &mut app.documents[0];
+    tab.service = None;
+    tab.state = DocumentState::ReadyClean;
+    tab.outline_in_flight = false;
+    let revision = tab.info.as_ref().unwrap().revision;
+    let spec = TileSpec {
+        pixel_x: 0,
+        pixel_y: 0,
+        pixel_width: 32,
+        pixel_height: 32,
+    };
+    let failed_request = TileRequest {
+        page_index: 0,
+        zoom: 1.0,
+        pixels_per_point: 1.0,
+        scale: 1.0,
+        generation: tab.view.generation,
+        expected_revision: revision,
+        spec,
+        priority: RenderPriority::Visible,
+    };
+    let other_request = TileRequest {
+        page_index: 0,
+        zoom: 1.1,
+        ..failed_request
+    };
+    let failed_key = TileCacheKey::from_request(tab.document_id, &failed_request);
+    let other_key = TileCacheKey::from_request(tab.document_id, &other_request);
+    tab.pending_tiles.insert(failed_key, failed_request);
+    tab.pending_tiles.insert(other_key, other_request);
+    assert!(tab.has_active_work());
+
+    app.receive_render_failure(0, failed_request);
+    assert!(!app.documents[0].pending_tiles.contains_key(&failed_key));
+    assert!(app.documents[0].pending_tiles.contains_key(&other_key));
+    assert!(app.documents[0].has_active_work());
+
+    app.receive_render_failure(0, other_request);
+    assert!(app.documents[0].pending_tiles.is_empty());
+    assert!(!app.documents[0].has_active_work());
+}
+
+#[test]
+fn hidden_suspended_resume_candidate_is_not_active_until_reopened() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("hidden-resume.pdf");
+    let second_path = directory.path().join("visible-resume.pdf");
+    write_blank_pdf(&first_path);
+    write_blank_pdf(&second_path);
+    let mut app = PrototypeApp::from_startup(
+        vec![first_path.clone(), second_path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_opens(&mut app);
+    for tab in &mut app.documents {
+        tab.outline_in_flight = false;
+    }
+
+    let expected = app.documents[0].info.as_ref().unwrap().version;
+    let candidate = DocumentVersion {
+        length: expected.length + 1,
+        ..expected
+    };
+    app.documents[0].suspend();
+    app.select_tab(1);
+    assert!(!app.is_visible_index(0));
+
+    app.apply_external_poll_action(0, first_path, ExternalPollAction::Resume((candidate, 2)));
+    assert_eq!(app.documents[0].state, DocumentState::Suspended);
+    assert!(app.documents[0].external_resume_in_flight);
+    assert!(!app.documents[0].has_active_work());
+    assert!(!app.has_active_work());
+    assert_eq!(
+        repaint_delay(app.has_active_work(), app.has_external_wait()),
+        Duration::from_millis(300)
+    );
+
+    app.select_tab(0);
+    assert_eq!(app.documents[0].state, DocumentState::Opening);
+    assert!(app.documents[0].has_active_work());
+    assert_eq!(
+        repaint_delay(app.has_active_work(), app.has_external_wait()),
+        ACTIVE_REPAINT_DELAY
+    );
+    finish_async_resume_failure(&mut app);
+}
+
 fn write_blank_pdf(path: &Path) {
     let path_text = path.to_str().unwrap();
     let mut document = PdfDocument::new();
