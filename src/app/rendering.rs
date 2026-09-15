@@ -326,52 +326,19 @@ pub(super) fn tile_priority(tile_rect: Rect, visible_viewport: Rect) -> RenderPr
     }
 }
 
-/// 文書、ページ、revision、回転を正確に保ったまま、現在のズームに最も近い
-/// キャッシュ済みラスターの同一性を 1 つ選ぶ。
+/// 最後に可視領域を完成させた同一性から、現在もキャッシュに残るタイルだけを選ぶ。
+///
+/// 中間倍率の部分的なキャッシュは、より現在倍率に近くても遷移の土台にしない。欠けた
+/// 領域が背景へ抜けるため、最後に成立した表示を優先する。
 pub(super) fn closest_provisional_tile_keys(
-    keys: impl Iterator<Item = TileCacheKey>,
-    document_id: u64,
-    page_index: usize,
-    revision: u64,
-    rotation_quarter_turns: u8,
-    current_zoom: f32,
-    current_pixels_per_point_bits: u32,
+    complete_identity: Option<TileRenderIdentity>,
+    cached_keys: impl Iterator<Item = TileCacheKey>,
 ) -> Vec<TileCacheKey> {
-    let current_identity = (current_zoom.to_bits(), current_pixels_per_point_bits);
-    let candidates = keys
-        .filter(|key| {
-            key.document_id == document_id
-                && key.page_index == page_index
-                && key.revision == revision
-                && key.rotation_quarter_turns == rotation_quarter_turns
-                && (key.zoom_bits, key.pixels_per_point_bits) != current_identity
-        })
-        .collect::<Vec<_>>();
-    let current_pixels_per_point = f32::from_bits(current_pixels_per_point_bits);
-    let best_identity = candidates
-        .iter()
-        .map(|key| (key.zoom_bits, key.pixels_per_point_bits))
-        .min_by(|left, right| {
-            let left_zoom = f32::from_bits(left.0);
-            let right_zoom = f32::from_bits(right.0);
-            let left_density = f32::from_bits(left.1);
-            let right_density = f32::from_bits(right.1);
-            // 対数比により半分と 2 倍の倍率を等距離にする。ズームを主に一致させ、
-            // 論理対応が安全なため密度で同率を決める。
-            let left_zoom_distance = (left_zoom / current_zoom).ln().abs();
-            let right_zoom_distance = (right_zoom / current_zoom).ln().abs();
-            let left_density_distance = (left_density / current_pixels_per_point).ln().abs();
-            let right_density_distance = (right_density / current_pixels_per_point).ln().abs();
-            left_zoom_distance
-                .total_cmp(&right_zoom_distance)
-                .then_with(|| left_density_distance.total_cmp(&right_density_distance))
-        });
-    let Some(best_identity) = best_identity else {
+    let Some(complete_identity) = complete_identity else {
         return Vec::new();
     };
-    let mut selected = candidates
-        .into_iter()
-        .filter(|key| (key.zoom_bits, key.pixels_per_point_bits) == best_identity)
+    let mut selected = cached_keys
+        .filter(|key| complete_identity.matches(*key))
         .collect::<Vec<_>>();
     selected.sort_by_key(|key| (key.spec.pixel_y, key.spec.pixel_x));
     selected
@@ -404,8 +371,7 @@ pub(super) fn paint_page_tiles(
         tab.info
             .as_ref()
             .map(|info| info.revision)
-            .zip(tab.view.render_pixels_per_point_bits)
-            .map(|(revision, pixels_per_point_bits)| {
+            .map(|revision| {
                 let clip_rect = ui.clip_rect();
                 let visible_cached_keys = tab.tiles.iter().filter_map(|(key, cached)| {
                     screen_rect_for_tile(screen_rect, &cached.tile)
@@ -413,13 +379,11 @@ pub(super) fn paint_page_tiles(
                         .then_some(*key)
                 });
                 closest_provisional_tile_keys(
+                    tab.last_complete_tile_identities
+                        .get(&page_index)
+                        .copied()
+                        .filter(|identity| identity.revision == revision),
                     visible_cached_keys,
-                    tab.document_id,
-                    page_index,
-                    revision,
-                    0,
-                    tab.view.zoom,
-                    pixels_per_point_bits,
                 )
             })
             .unwrap_or_default()

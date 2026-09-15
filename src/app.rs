@@ -100,6 +100,10 @@ const MAX_ZOOM: f32 = 4.0;
 // 0.1% 未満の差を無視し、見た目が同じ連続フレームで全ページを無効化しない。
 const ZOOM_CHANGE_EPSILON: f32 = 0.001;
 
+// Fit 表示のgeometryは即時更新するが、連続リサイズ中の中間倍率を MuPDF へ渡さない。
+// 125 ms は操作終了後の鮮明化を遅らせず、一般的なリサイズの連続フレームをまとめられる。
+const FIT_RENDER_DEBOUNCE_DELAY: Duration = Duration::from_millis(125);
+
 // egui の操作領域の最小高さ 18 ポイントを保ち、24 ポイントの閉じる操作領域と
 // 最小幅でも読めるタイトル領域を確保し、従来無制限だったファイル名を
 // 一般的なデスクトップのタブ幅に収める。
@@ -243,6 +247,8 @@ struct DocumentTab {
     pending_tiles: HashMap<TileCacheKey, TileRequest>,
     wanted_tiles: HashSet<TileCacheKey>,
     visible_tiles: HashSet<TileCacheKey>,
+    last_complete_tile_identities: HashMap<usize, TileRenderIdentity>,
+    fit_render_deadline: Option<Instant>,
     text_snapshots: HashMap<TextSnapshotKey, TextPageSnapshot>,
     pending_text_snapshots: HashSet<TextSnapshotKey>,
     failed_text_snapshots: HashSet<TextSnapshotKey>,
@@ -470,6 +476,34 @@ struct TileCacheKey {
     rotation_quarter_turns: u8,
     spec: TileSpec,
     revision: u64,
+}
+
+/// タイル座標を除いた、同じラスターとして暫定表示できる恒久的な同一性。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TileRenderIdentity {
+    document_id: u64,
+    page_index: usize,
+    zoom_bits: u32,
+    pixels_per_point_bits: u32,
+    rotation_quarter_turns: u8,
+    revision: u64,
+}
+
+impl TileRenderIdentity {
+    fn from_key(key: TileCacheKey) -> Self {
+        Self {
+            document_id: key.document_id,
+            page_index: key.page_index,
+            zoom_bits: key.zoom_bits,
+            pixels_per_point_bits: key.pixels_per_point_bits,
+            rotation_quarter_turns: key.rotation_quarter_turns,
+            revision: key.revision,
+        }
+    }
+
+    fn matches(self, key: TileCacheKey) -> bool {
+        self == Self::from_key(key)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -964,10 +998,15 @@ impl PrototypeApp {
     }
 
     fn request_repaint_after(&self, context: &egui::Context) {
-        context.request_repaint_after(repaint_delay(
-            self.has_active_work(),
-            self.has_external_wait(),
-        ));
+        let mut delay = repaint_delay(self.has_active_work(), self.has_external_wait());
+        let now = Instant::now();
+        let visible_indices = self.visible_indices();
+        if let Some(deadline) =
+            earliest_visible_fit_render_deadline(&self.documents, &visible_indices)
+        {
+            delay = delay.min(deadline.saturating_duration_since(now));
+        }
+        context.request_repaint_after(delay);
     }
 
     fn has_active_work(&self) -> bool {
@@ -2060,6 +2099,7 @@ impl PrototypeApp {
             // ペイン内選択が変わって画面から外れた文書だけを取り消す。フォーカスだけが
             // 変わった反対側ペインの可視要求は残す。
             self.documents[previous_visible].cancel_rendering_requests();
+            self.documents[previous_visible].fit_render_deadline = None;
             self.documents[previous_visible].invalidate_text_snapshots();
             self.documents[previous_visible].invalidate_annotation_pages();
             self.documents[previous_visible].search.generation = self.documents[previous_visible]
@@ -5018,10 +5058,12 @@ impl PrototypeApp {
             return;
         };
 
+        let now = Instant::now();
         if (tab.view.zoom - desired).abs() > ZOOM_CHANGE_EPSILON {
             let mode = tab.view.zoom_mode;
-            tab.set_zoom(desired, mode);
+            tab.defer_fit_render(desired, mode, now);
         }
+        tab.commit_deferred_fit_render(now);
     }
 
     /// 現在のビューポートから Fit ズームを計算し、リサイズ時の無効化をテスト可能にする。
@@ -5146,7 +5188,9 @@ impl PrototypeApp {
                 };
                 requests.append(&mut page_requests);
             }
-            tab.prepare_tiles(requests);
+            if !tab.fit_render_is_debounced() {
+                tab.prepare_tiles(requests);
+            }
 
             for page_index in wanted_pages {
                 let Some(placement) = layout.placement(page_index) else {
@@ -5348,7 +5392,9 @@ impl PrototypeApp {
                 viewport_size,
                 pixels_per_point,
             );
-            tab.prepare_tiles(requests);
+            if !tab.fit_render_is_debounced() {
+                tab.prepare_tiles(requests);
+            }
             paint_page_tiles(ui, screen_rect, page_index, tab, gpu_lru);
             if let Some(matches) = tab.search.pages.get(&page_index) {
                 let selected_match = tab
@@ -5518,6 +5564,8 @@ impl DocumentTab {
             pending_tiles: HashMap::new(),
             wanted_tiles: HashSet::new(),
             visible_tiles: HashSet::new(),
+            last_complete_tile_identities: HashMap::new(),
+            fit_render_deadline: None,
             text_snapshots: HashMap::new(),
             pending_text_snapshots: HashSet::new(),
             failed_text_snapshots: HashSet::new(),
@@ -5769,6 +5817,7 @@ impl DocumentTab {
     }
 
     fn set_zoom(&mut self, zoom: f32, mode: ZoomMode) {
+        self.fit_render_deadline = None;
         let scale_changed = self.view.zoom.to_bits() != zoom.to_bits();
         if !scale_changed {
             self.view.zoom_mode = mode;
@@ -5789,6 +5838,42 @@ impl DocumentTab {
         #[cfg(debug_assertions)]
         self.render_performance
             .begin_zoom(zoom, canceled_requests, Instant::now());
+    }
+
+    fn defer_fit_render(&mut self, zoom: f32, mode: ZoomMode, now: Instant) {
+        debug_assert!(matches!(mode, ZoomMode::FitWidth | ZoomMode::FitPage));
+        match self.view.display_mode {
+            DisplayMode::Continuous => self.view.restore_anchor = self.view.center_anchor,
+            DisplayMode::SinglePage => {
+                self.view.restore_single_anchor = self.view.single_center_anchor
+            }
+        }
+        self.view.zoom = zoom;
+        self.view.zoom_mode = mode;
+        // generation は確定した最後のtargetだけを区別する。ここで要求対象を空にして
+        // 既に走っている中間倍率の結果を texture/LRU へ受け入れない。
+        self.cancel_rendering_requests();
+        self.fit_render_deadline = Some(now + FIT_RENDER_DEBOUNCE_DELAY);
+    }
+
+    fn commit_deferred_fit_render(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.fit_render_deadline else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        self.fit_render_deadline = None;
+        self.invalidate_rendering();
+        true
+    }
+
+    fn fit_render_is_debounced(&self) -> bool {
+        self.fit_render_deadline.is_some()
+    }
+
+    fn fit_render_deadline(&self) -> Option<Instant> {
+        self.fit_render_deadline
     }
 
     fn set_display_mode(&mut self, mode: DisplayMode) {
@@ -5910,6 +5995,7 @@ impl DocumentTab {
     }
 
     fn invalidate_rendering(&mut self) -> usize {
+        self.fit_render_deadline = None;
         self.view.generation = self.view.generation.wrapping_add(1);
         #[cfg(debug_assertions)]
         {
@@ -6195,6 +6281,7 @@ impl DocumentTab {
         }
         self.wanted_tiles = wanted_tiles;
         self.visible_tiles = visible_tiles;
+        self.remember_complete_visible_tiles();
 
         #[cfg(debug_assertions)]
         {
@@ -6238,6 +6325,20 @@ impl DocumentTab {
             let queued = self.send(DocumentCommand::RenderTile(request));
             if queued {
                 self.pending_tiles.insert(key, request);
+            }
+        }
+    }
+
+    fn remember_complete_visible_tiles(&mut self) {
+        if !self.visible_tiles.is_empty()
+            && self
+                .visible_tiles
+                .iter()
+                .all(|key| self.tiles.contains_key(key))
+        {
+            for key in &self.visible_tiles {
+                self.last_complete_tile_identities
+                    .insert(key.page_index, TileRenderIdentity::from_key(*key));
             }
         }
     }
@@ -6456,6 +6557,17 @@ fn repaint_delay(active_work: bool, external_wait: bool) -> Duration {
     } else {
         IDLE_REPAINT_DELAY
     }
+}
+
+fn earliest_visible_fit_render_deadline(
+    documents: &[DocumentTab],
+    visible_indices: &[usize],
+) -> Option<Instant> {
+    visible_indices
+        .iter()
+        .filter_map(|index| documents.get(*index))
+        .filter_map(DocumentTab::fit_render_deadline)
+        .min()
 }
 
 fn document_save_blocks_close(save_in_flight: bool) -> bool {

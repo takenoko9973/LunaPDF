@@ -299,6 +299,7 @@ impl PrototypeApp {
                             self.documents[index].tiles.remove(&key);
                         }
                         self.remove_evicted_gpu_tiles(outcome.evicted);
+                        self.documents[index].remember_complete_visible_tiles();
                         #[cfg(debug_assertions)]
                         if outcome.inserted
                             && self.documents[index].initial_display_render

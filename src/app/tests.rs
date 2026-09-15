@@ -29,6 +29,24 @@ fn repaint_delay_policy_returns_to_idle_after_work_completes() {
 }
 
 #[test]
+fn hidden_fit_render_deadline_does_not_schedule_repaints() {
+    let now = Instant::now();
+    let mut documents = vec![
+        DocumentTab::new(1, PathBuf::from("hidden.pdf"), 0, None),
+        DocumentTab::new(2, PathBuf::from("visible.pdf"), 0, None),
+    ];
+    documents[0].fit_render_deadline = Some(now);
+
+    assert_eq!(earliest_visible_fit_render_deadline(&documents, &[1]), None);
+
+    documents[1].fit_render_deadline = Some(now + Duration::from_millis(125));
+    assert_eq!(
+        earliest_visible_fit_render_deadline(&documents, &[1]),
+        Some(now + Duration::from_millis(125))
+    );
+}
+
+#[test]
 fn selection_tracking_requires_a_queued_request_and_preserves_newer_work() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("selection-tracking.pdf");
@@ -2396,7 +2414,7 @@ fn display_density_invalidates_only_after_the_recorded_value_changes() {
 }
 
 #[test]
-fn provisional_tiles_use_the_closest_zoom_from_the_current_revision() {
+fn provisional_tiles_keep_the_last_complete_identity_over_a_nearer_partial_identity() {
     let spec = TileSpec {
         pixel_x: 0,
         pixel_y: 0,
@@ -2412,12 +2430,30 @@ fn provisional_tiles_use_the_closest_zoom_from_the_current_revision() {
         spec,
         revision: 4,
     };
-    let keys = vec![
-        base,
-        TileCacheKey {
-            zoom_bits: 1.4_f32.to_bits(),
-            ..base
+    let complete_identity = TileRenderIdentity::from_key(base);
+    let complete_second_tile = TileCacheKey {
+        spec: TileSpec {
+            pixel_x: 512,
+            ..spec
         },
+        ..base
+    };
+    let prefetched_tile = TileCacheKey {
+        spec: TileSpec {
+            pixel_x: 1024,
+            ..spec
+        },
+        ..base
+    };
+    let nearer_partial_key = TileCacheKey {
+        zoom_bits: 1.4_f32.to_bits(),
+        ..base
+    };
+    let cached_keys = vec![
+        base,
+        complete_second_tile,
+        prefetched_tile,
+        nearer_partial_key,
         TileCacheKey {
             zoom_bits: 1.4_f32.to_bits(),
             spec: TileSpec {
@@ -2433,15 +2469,45 @@ fn provisional_tiles_use_the_closest_zoom_from_the_current_revision() {
         },
     ];
 
-    let selected =
-        closest_provisional_tile_keys(keys.into_iter(), 1, 2, 4, 0, 1.5, 1.0_f32.to_bits());
+    let selected = closest_provisional_tile_keys(Some(complete_identity), cached_keys.into_iter());
 
-    assert_eq!(selected.len(), 2);
+    assert_eq!(selected.len(), 3);
     assert!(
         selected
             .iter()
-            .all(|key| key.zoom_bits == 1.4_f32.to_bits() && key.revision == 4)
+            .all(|key| key.zoom_bits == 1.0_f32.to_bits() && key.revision == 4)
     );
+    assert!(selected.contains(&prefetched_tile));
+}
+
+#[test]
+fn provisional_tiles_accept_an_old_density_but_reject_an_old_revision() {
+    let spec = TileSpec {
+        pixel_x: 0,
+        pixel_y: 0,
+        pixel_width: 512,
+        pixel_height: 512,
+    };
+    let old_density = TileCacheKey {
+        document_id: 1,
+        page_index: 2,
+        zoom_bits: 1.0_f32.to_bits(),
+        pixels_per_point_bits: 1.25_f32.to_bits(),
+        rotation_quarter_turns: 0,
+        spec,
+        revision: 4,
+    };
+    let old_revision = TileCacheKey {
+        revision: 3,
+        ..old_density
+    };
+
+    let selected = closest_provisional_tile_keys(
+        Some(TileRenderIdentity::from_key(old_density)),
+        vec![old_density, old_revision].into_iter(),
+    );
+
+    assert_eq!(selected, vec![old_density]);
 }
 
 #[cfg(debug_assertions)]
@@ -2742,6 +2808,84 @@ fn fit_page_zoom_recalculates_after_window_resize() {
     assert_eq!(wide, (1_000.0 - PAGE_GAP * 2.0) / bounds.width());
     assert_eq!(narrow, (800.0 - PAGE_GAP * 2.0) / bounds.width());
     assert!(narrow < wide);
+}
+
+#[test]
+fn fit_resize_coalesces_to_the_latest_zoom_before_advancing_generation() {
+    let now = Instant::now();
+    let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None);
+    let generation = tab.view.generation;
+
+    tab.defer_fit_render(1.1, ZoomMode::FitWidth, now);
+    assert_eq!(tab.view.zoom, 1.1);
+    assert_eq!(tab.view.generation, generation);
+    assert!(tab.fit_render_is_debounced());
+    assert!(!tab.commit_deferred_fit_render(now + Duration::from_millis(124)));
+
+    tab.defer_fit_render(1.2, ZoomMode::FitWidth, now + Duration::from_millis(50));
+    assert_eq!(tab.view.zoom, 1.2);
+    assert_eq!(tab.view.generation, generation);
+    assert!(!tab.commit_deferred_fit_render(now + Duration::from_millis(174)));
+    assert!(tab.commit_deferred_fit_render(now + Duration::from_millis(175)));
+    assert_eq!(tab.view.generation, generation.wrapping_add(1));
+    assert!(!tab.fit_render_is_debounced());
+}
+
+#[test]
+fn fit_resize_rejects_the_canceled_intermediate_tile_before_texture_upload() {
+    let now = Instant::now();
+    let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None);
+    let request = TileRequest {
+        page_index: 0,
+        zoom: 1.0,
+        pixels_per_point: 1.0,
+        scale: 1.0,
+        generation: tab.view.generation,
+        expected_revision: 4,
+        spec: TileSpec {
+            pixel_x: 0,
+            pixel_y: 0,
+            pixel_width: 512,
+            pixel_height: 512,
+        },
+        priority: RenderPriority::Visible,
+    };
+    let key = TileCacheKey::from_request(tab.document_id, &request);
+    tab.pending_tiles.insert(key, request);
+    tab.wanted_tiles.insert(key);
+    tab.visible_tiles.insert(key);
+
+    tab.defer_fit_render(1.1, ZoomMode::FitWidth, now);
+
+    assert!(tab.pending_tiles.is_empty());
+    assert!(tab.wanted_tiles.is_empty());
+    assert!(tab.visible_tiles.is_empty());
+    assert!(!tile_result_is_current(
+        true,
+        key,
+        request.generation,
+        tab.view.generation,
+        Some(request.expected_revision),
+        &tab.wanted_tiles,
+    ));
+}
+
+#[test]
+fn fixed_zoom_resize_does_not_schedule_a_fit_render_invalidation() {
+    let tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None);
+    let generation = tab.view.generation;
+    let bounds = crate::domain::document::PageRect {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 1_280.0,
+        y1: 720.0,
+    };
+
+    assert!(
+        PrototypeApp::fit_zoom_for_page(bounds, Vec2::new(800.0, 600.0), ZoomMode::Fixed).is_none()
+    );
+    assert_eq!(tab.view.generation, generation);
+    assert!(!tab.fit_render_is_debounced());
 }
 
 #[test]
