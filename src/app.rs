@@ -4331,7 +4331,7 @@ impl PrototypeApp {
             }
             if let Some(index) = conflict_index {
                 ui.colored_label(
-                    Color32::YELLOW,
+                    ui.visuals().warn_fg_color,
                     "外部でPDFが更新されました。未保存の編集を保護するため自動再読み込みを停止しています。",
                 );
                 if ui.button("編集版を別名保存して外部版を読み込む").clicked() {

@@ -3862,6 +3862,50 @@ fn error_banner_dismisses_app_and_active_document_errors_independently() {
 }
 
 #[test]
+fn external_conflict_warning_uses_theme_warning_foreground() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("external-conflict-warning.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    app.select_tab(0);
+    app.documents[0].external_conflict = Some(ExternalConflict {
+        version: DocumentVersion {
+            identity_primary: 1,
+            identity_secondary: 2,
+            length: 3,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+        },
+    });
+
+    for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+        let context = egui::Context::default();
+        context.set_visuals(visuals.clone());
+        let _ = context.run_ui(egui::RawInput::default(), |ui| app.error_banner(ui));
+        let output = context.run_ui(egui::RawInput::default(), |ui| app.error_banner(ui));
+        let warning = output
+            .shapes
+            .iter()
+            .find_map(|clipped_shape| match &clipped_shape.shape {
+                egui::Shape::Text(text)
+                    if text.galley.text().starts_with("外部でPDFが更新されました") =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("external conflict warning should be rendered");
+
+        assert_eq!(
+            warning.galley.job.sections[0].format.color,
+            visuals.warn_fg_color
+        );
+    }
+}
+
+#[test]
 fn queued_save_blocks_close_until_document_returns_clean() {
     let after_highlight_event = state_after_document_info(DocumentState::Saving, true);
     let save_in_flight = true;
