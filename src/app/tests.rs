@@ -3771,6 +3771,97 @@ fn worker_errors_have_japanese_guidance_and_keep_diagnostic_detail() {
 }
 
 #[test]
+fn error_banner_dismisses_app_and_active_document_errors_independently() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("error-banner.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    app.select_tab(0);
+    assert_eq!(app.active_index(), Some(0));
+    app.documents[0].state = DocumentState::Error;
+    app.error = Some("app failure".to_owned());
+    app.documents[0].error = Some("document failure".to_owned());
+
+    let context = egui::Context::default();
+    let run_frame = |app: &mut PrototypeApp, events| {
+        context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| app.error_banner(ui),
+        )
+    };
+    let close_positions = |output: &egui::FullOutput| {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped_shape| match &clipped_shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "×" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let click = |app: &mut PrototypeApp, position: Pos2| {
+        for pressed in [true, false] {
+            run_frame(
+                app,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    };
+
+    let _ = run_frame(&mut app, Vec::new());
+    let output = run_frame(&mut app, Vec::new());
+    let mut positions = close_positions(&output);
+    assert_eq!(positions.len(), 2);
+    positions.sort_by(|left, right| left.y.total_cmp(&right.y));
+
+    click(&mut app, positions[0]);
+
+    assert!(app.error.is_none());
+    assert_eq!(app.documents[0].error.as_deref(), Some("document failure"));
+    assert_eq!(app.documents[0].state, DocumentState::Error);
+
+    app.error = Some("app failure after dismissal".to_owned());
+    let _ = run_frame(&mut app, Vec::new());
+    let output = run_frame(&mut app, Vec::new());
+    let mut positions = close_positions(&output);
+    assert_eq!(positions.len(), 2);
+    positions.sort_by(|left, right| left.y.total_cmp(&right.y));
+
+    click(&mut app, positions[1]);
+
+    assert_eq!(app.error.as_deref(), Some("app failure after dismissal"));
+    assert!(app.documents[0].error.is_none());
+    assert_eq!(app.documents[0].state, DocumentState::Error);
+
+    let _ = run_frame(&mut app, Vec::new());
+    let output = run_frame(&mut app, Vec::new());
+    let positions = close_positions(&output);
+    assert_eq!(positions.len(), 1);
+    click(&mut app, positions[0]);
+
+    assert!(app.error.is_none());
+    assert!(app.documents[0].error.is_none());
+    assert_eq!(app.documents[0].state, DocumentState::Error);
+}
+
+#[test]
 fn queued_save_blocks_close_until_document_returns_clean() {
     let after_highlight_event = state_after_document_info(DocumentState::Saving, true);
     let save_in_flight = true;

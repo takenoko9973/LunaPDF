@@ -4287,16 +4287,13 @@ impl PrototypeApp {
     }
 
     fn error_banner(&mut self, root_ui: &mut egui::Ui) {
+        let active_index = self.active_index();
         let app_error = self.error.clone();
-        let document_error = self
-            .active_index()
-            .and_then(|index| self.documents[index].error.clone());
-        let page_input_error = self
-            .active_index()
-            .and_then(|index| self.documents[index].page_input_error.clone());
-        let conflict_index = self
-            .active_index()
-            .filter(|index| self.documents[*index].external_conflict.is_some());
+        let document_error = active_index.and_then(|index| self.documents[index].error.clone());
+        let page_input_error =
+            active_index.and_then(|index| self.documents[index].page_input_error.clone());
+        let conflict_index =
+            active_index.filter(|index| self.documents[*index].external_conflict.is_some());
         if app_error.is_none()
             && document_error.is_none()
             && page_input_error.is_none()
@@ -4306,10 +4303,28 @@ impl PrototypeApp {
         }
         egui::Panel::top("persistent-error-banner").show(root_ui, |ui| {
             if let Some(error) = app_error.as_deref() {
-                ui.colored_label(Color32::LIGHT_RED, error);
+                ui.horizontal(|ui| {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("エラーを閉じる")
+                        .clicked()
+                    {
+                        self.error = None;
+                    }
+                });
             }
-            if let Some(error) = document_error.as_deref() {
-                ui.colored_label(Color32::LIGHT_RED, error);
+            if let (Some(index), Some(error)) = (active_index, document_error.as_deref()) {
+                ui.horizontal(|ui| {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("エラーを閉じる")
+                        .clicked()
+                    {
+                        self.documents[index].error = None;
+                    }
+                });
             }
             if let Some(error) = page_input_error.as_deref() {
                 ui.colored_label(Color32::LIGHT_RED, error);
