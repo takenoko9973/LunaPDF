@@ -15,3 +15,9 @@
 - Cross-compile Windows GNU release builds in the Dev Container with:
   `docker compose -f .devcontainer/compose.base.yml exec workspace sh -c "cargo build --release --target=x86_64-pc-windows-gnu && install -D target/x86_64-pc-windows-gnu/release/lunapdf.exe /workspace/dist/lunapdf-release.exe"`
 - Keep container and Windows build outputs separate.
+
+## Versioning
+
+- バージョンはリリースに合わせて更新し、唯一の管理元は `Cargo.toml` の `[package].version` とする。通常の機能追加・修正では、リリースまたは version 更新の明示的な指示がない限り、実装者は version を上げない。
+- About、Windows EXE、installer、portable の version は package version を参照し、固定値を重複して持たせない。version を更新した場合は `Cargo.toml` を変更し、必要なら Cargo で `Cargo.lock` を更新する。
+- リリース時は、About 表示および Windows EXE、installer、portable の各配布物が同じ package version を使うことを確認する。
