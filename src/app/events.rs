@@ -116,6 +116,24 @@ impl PrototypeApp {
                         let page_count = info.page_bounds.len();
                         let saved_path = (!info.dirty).then(|| info.path.clone());
                         let document_id = self.documents[index].document_id;
+                        let discard_external_reload =
+                            external_reload && self.documents[index].discard_reload_in_flight;
+                        if discard_external_reload {
+                            if self
+                                .annotation_editor
+                                .as_ref()
+                                .is_some_and(|editor| editor.document_id == document_id)
+                            {
+                                self.annotation_editor = None;
+                            }
+                            if self
+                                .annotation_picker
+                                .as_ref()
+                                .is_some_and(|picker| picker.document_id == document_id)
+                            {
+                                self.annotation_picker = None;
+                            }
+                        }
                         if !external_reload
                             && !info.dirty
                             && self
@@ -720,6 +738,7 @@ impl PrototypeApp {
                             }
                         } else if operation == "reload" {
                             self.documents[index].reload_in_flight = false;
+                            self.documents[index].discard_reload_in_flight = false;
                             self.documents[index].failed_external_version = self.documents[index]
                                 .external_candidate
                                 .map(|(version, _)| version);

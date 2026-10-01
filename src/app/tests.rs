@@ -571,6 +571,288 @@ fn create_dirty_external_conflict(app: &mut PrototypeApp, path: &Path) -> Docume
     current
 }
 
+fn install_annotation_editor_draft(app: &mut PrototypeApp, text: &str) {
+    let document_id = app.documents[0].document_id;
+    let annotation = AnnotationSummary {
+        id: AnnotationId {
+            page_index: 0,
+            xref: 1,
+        },
+        kind: AnnotationKind::Highlight,
+        contents: "original editor text".to_owned(),
+        color: None,
+        can_edit_contents: true,
+        can_edit_color: true,
+        can_delete: true,
+    };
+    let mut editor = AnnotationEditorState::from_summary(
+        document_id,
+        app.documents[0].info.as_ref().unwrap().revision,
+        &annotation,
+    );
+    editor.buffer.contents = text.to_owned();
+    app.annotation_editor = Some(editor);
+}
+
+#[test]
+fn conflicted_reload_cancel_preserves_unsaved_edits_and_editor_draft() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("conflicted-reload-cancel.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let conflict_version = create_dirty_external_conflict(&mut app, &path);
+    install_annotation_editor_draft(&mut app, "preserved editor draft");
+    let document_id = app.documents[0].document_id;
+    let original_version = app.documents[0].info.as_ref().unwrap().version;
+    let edit_count = app.documents[0].edit_history.len();
+
+    app.request_conflicted_document_reload_confirmation(document_id);
+    assert_eq!(app.discard_reload_confirmation, Some(document_id));
+    app.cancel_conflicted_document_reload();
+
+    assert!(app.discard_reload_confirmation.is_none());
+    assert!(!app.documents[0].reload_in_flight);
+    assert_eq!(app.documents[0].state, DocumentState::ReadyDirty);
+    assert_eq!(
+        app.documents[0].info.as_ref().unwrap().version,
+        original_version
+    );
+    assert_eq!(app.documents[0].edit_history.len(), edit_count);
+    assert_eq!(
+        app.documents[0].external_conflict,
+        Some(ExternalConflict {
+            version: conflict_version
+        })
+    );
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .map(|editor| editor.buffer.contents.as_str()),
+        Some("preserved editor draft")
+    );
+}
+
+#[test]
+fn conflicted_reload_holds_edits_until_latest_external_version_loads() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("conflicted-reload-success.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let conflict_version = create_dirty_external_conflict(&mut app, &path);
+    install_annotation_editor_draft(&mut app, "discard after successful reload");
+    let document_id = app.documents[0].document_id;
+    let original_version = app.documents[0].info.as_ref().unwrap().version;
+    let edit_count = app.documents[0].edit_history.len();
+    app.annotation_picker = Some(AnnotationPickerState {
+        document_id,
+        revision: app.documents[0].info.as_ref().unwrap().revision,
+        candidates: Vec::new(),
+    });
+
+    app.request_conflicted_document_reload_confirmation(document_id);
+    let newest_replacement = path.with_file_name("conflicted-reload-newest.pdf");
+    overwrite_with_blank_pdf(&path, &newest_replacement);
+    let newest_version = read_document_version(&path).unwrap();
+    assert_ne!(newest_version, conflict_version);
+    app.confirm_conflicted_document_reload();
+
+    assert!(app.documents[0].reload_in_flight);
+    assert_eq!(app.documents[0].state, DocumentState::ReadyDirty);
+    assert_eq!(
+        app.documents[0].info.as_ref().unwrap().version,
+        original_version
+    );
+    assert_eq!(app.documents[0].edit_history.len(), edit_count);
+    assert_eq!(
+        app.documents[0].external_conflict,
+        Some(ExternalConflict {
+            version: conflict_version
+        })
+    );
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .map(|editor| editor.buffer.contents.as_str()),
+        Some("discard after successful reload")
+    );
+    assert!(app.annotation_picker.is_some());
+
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.documents[0].reload_in_flight && std::time::Instant::now() < deadline {
+        app.receive_document_events(&context);
+        if app.documents[0].reload_in_flight {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(!app.documents[0].reload_in_flight);
+    assert_eq!(app.documents[0].state, DocumentState::ReadyClean);
+    assert_eq!(
+        app.documents[0].info.as_ref().unwrap().version,
+        newest_version
+    );
+    assert!(app.documents[0].edit_history.is_empty());
+    assert!(app.documents[0].external_conflict.is_none());
+    assert!(app.annotation_editor.is_none());
+    assert!(app.annotation_picker.is_none());
+}
+
+#[test]
+fn conflicted_reload_failure_keeps_unsaved_edits_and_both_editor_states() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("conflicted-reload-failure.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let conflict_version = create_dirty_external_conflict(&mut app, &path);
+    install_annotation_editor_draft(&mut app, "retain after reload failure");
+    let document_id = app.documents[0].document_id;
+    let original_version = app.documents[0].info.as_ref().unwrap().version;
+    let edit_count = app.documents[0].edit_history.len();
+    app.annotation_picker = Some(AnnotationPickerState {
+        document_id,
+        revision: app.documents[0].info.as_ref().unwrap().revision,
+        candidates: Vec::new(),
+    });
+    std::fs::remove_file(&path).unwrap();
+
+    app.request_conflicted_document_reload_confirmation(document_id);
+    app.confirm_conflicted_document_reload();
+    assert!(app.documents[0].reload_in_flight);
+
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.documents[0].reload_in_flight && std::time::Instant::now() < deadline {
+        app.receive_document_events(&context);
+        if app.documents[0].reload_in_flight {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(!app.documents[0].reload_in_flight);
+    assert!(app.documents[0].error.is_some());
+    assert_eq!(app.documents[0].state, DocumentState::ReadyDirty);
+    assert_eq!(
+        app.documents[0].info.as_ref().unwrap().version,
+        original_version
+    );
+    assert_eq!(app.documents[0].edit_history.len(), edit_count);
+    assert_eq!(
+        app.documents[0].external_conflict,
+        Some(ExternalConflict {
+            version: conflict_version
+        })
+    );
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .map(|editor| editor.buffer.contents.as_str()),
+        Some("retain after reload failure")
+    );
+    assert!(app.annotation_picker.is_some());
+}
+
+#[test]
+fn conflicted_reload_revalidates_the_target_before_sending() {
+    let directory = tempfile::tempdir().unwrap();
+    let conflicted_path = directory.path().join("conflicted-reload-target.pdf");
+    let other_path = directory.path().join("conflicted-reload-other.pdf");
+    write_blank_pdf(&conflicted_path);
+    write_blank_pdf(&other_path);
+    let mut app = PrototypeApp::from_startup(
+        vec![conflicted_path.clone(), other_path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_opens(&mut app);
+    app.select_tab(0);
+    create_dirty_external_conflict(&mut app, &conflicted_path);
+    let target_id = app.documents[0].document_id;
+    let other_id = app.documents[1].document_id;
+
+    app.request_conflicted_document_reload_confirmation(target_id);
+    app.select_tab(1);
+    app.confirm_conflicted_document_reload();
+
+    assert_eq!(app.active_index(), Some(1));
+    assert!(app.documents[0].reload_in_flight);
+    assert_eq!(app.documents[0].document_id, target_id);
+    assert_eq!(app.documents[1].document_id, other_id);
+    assert!(!app.documents[1].reload_in_flight);
+}
+
+#[test]
+fn conflicted_reload_does_not_target_another_document_after_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let conflicted_path = directory.path().join("conflicted-reload-closed.pdf");
+    let other_path = directory.path().join("conflicted-reload-survivor.pdf");
+    write_blank_pdf(&conflicted_path);
+    write_blank_pdf(&other_path);
+    let mut app = PrototypeApp::from_startup(
+        vec![conflicted_path.clone(), other_path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_opens(&mut app);
+    app.select_tab(0);
+    create_dirty_external_conflict(&mut app, &conflicted_path);
+    let closed_id = app.documents[0].document_id;
+    let remaining_id = app.documents[1].document_id;
+
+    app.request_conflicted_document_reload_confirmation(closed_id);
+    app.remove_tab_now(0);
+    app.confirm_conflicted_document_reload();
+
+    assert!(app.discard_reload_confirmation.is_none());
+    assert_eq!(app.documents.len(), 1);
+    assert_eq!(app.documents[0].document_id, remaining_id);
+    assert!(!app.documents[0].reload_in_flight);
+    assert!(app.documents[0].external_conflict.is_none());
+}
+
+#[test]
+fn conflicted_reload_waits_for_an_in_flight_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("conflicted-reload-saving.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    let conflict_version = create_dirty_external_conflict(&mut app, &path);
+    install_annotation_editor_draft(&mut app, "preserved during save");
+    let document_id = app.documents[0].document_id;
+
+    app.request_conflicted_document_reload_confirmation(document_id);
+    app.documents[0].save_in_flight = true;
+    app.confirm_conflicted_document_reload();
+
+    assert!(!app.documents[0].reload_in_flight);
+    assert_eq!(app.documents[0].state, DocumentState::ReadyDirty);
+    assert_eq!(
+        app.documents[0].external_conflict,
+        Some(ExternalConflict {
+            version: conflict_version
+        })
+    );
+    assert_eq!(
+        app.annotation_editor
+            .as_ref()
+            .map(|editor| editor.buffer.contents.as_str()),
+        Some("preserved during save")
+    );
+    assert!(app.documents[0].error.is_some());
+}
+
 fn receive_rename_scan_result(
     app: &mut PrototypeApp,
     path: &Path,
@@ -3897,6 +4179,11 @@ fn external_conflict_warning_uses_theme_warning_foreground() {
                 _ => None,
             })
             .expect("external conflict warning should be rendered");
+
+        assert!(output.shapes.iter().any(|clipped_shape| matches!(
+            &clipped_shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "保存しないで更新"
+        )));
 
         assert_eq!(
             warning.galley.job.sections[0].format.color,

@@ -195,6 +195,7 @@ pub(crate) struct PrototypeApp {
     #[cfg(windows)]
     auto_rotate_print: bool,
     close_confirmation: Option<CloseConfirmation>,
+    discard_reload_confirmation: Option<u64>,
     closed_tabs: Vec<ClosedTab>,
     approved_window_documents: HashSet<PathBuf>,
     allow_window_close: bool,
@@ -286,6 +287,7 @@ struct DocumentTab {
     external_candidate: Option<(DocumentVersion, u8)>,
     external_conflict: Option<ExternalConflict>,
     reload_in_flight: bool,
+    discard_reload_in_flight: bool,
     save_as: SaveAsState,
     failed_external_version: Option<DocumentVersion>,
     resume_expected_version: Option<DocumentVersion>,
@@ -956,6 +958,7 @@ impl PrototypeApp {
             #[cfg(windows)]
             auto_rotate_print: true,
             close_confirmation: None,
+            discard_reload_confirmation: None,
             closed_tabs: Vec::new(),
             approved_window_documents: HashSet::new(),
             allow_window_close: false,
@@ -1532,6 +1535,118 @@ impl PrototypeApp {
             )
             .save_file();
         self.begin_conflicted_document_save_as(index, selected);
+    }
+
+    fn request_conflicted_document_reload_confirmation(&mut self, document_id: u64) {
+        if self.documents.iter().any(|document| {
+            document.document_id == document_id && document.external_conflict.is_some()
+        }) {
+            self.discard_reload_confirmation = Some(document_id);
+        }
+    }
+
+    fn cancel_conflicted_document_reload(&mut self) {
+        self.discard_reload_confirmation = None;
+    }
+
+    fn confirm_conflicted_document_reload(&mut self) {
+        let Some(document_id) = self.discard_reload_confirmation.take() else {
+            return;
+        };
+        let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.document_id == document_id)
+        else {
+            return;
+        };
+        if self.documents[index].external_conflict.is_none() {
+            return;
+        }
+
+        let tab = &self.documents[index];
+        if tab.is_saving()
+            || tab.reload_in_flight
+            || tab.external_resume_in_flight
+            || tab.rename_scan_in_flight
+            || tab.state == DocumentState::Suspended
+        {
+            self.documents[index].error = Some(document_failure_message(
+                "reload",
+                "a save, rename, or reload is already in progress",
+            ));
+            return;
+        }
+
+        let Some(path) = self
+            .tabs
+            .tabs()
+            .get(index)
+            .map(|tab| tab.path().to_path_buf())
+        else {
+            return;
+        };
+        if !self.documents[index].send(DocumentCommand::Reload(path)) {
+            self.documents[index].error = Some(document_failure_message(
+                "reload",
+                "the document worker is unavailable",
+            ));
+            return;
+        }
+
+        self.documents[index].reload_in_flight = true;
+        self.documents[index].discard_reload_in_flight = true;
+        self.status = "外部版を再読み込みしています…".to_owned();
+    }
+
+    fn discard_reload_confirmation_dialog(&mut self, context: &egui::Context) {
+        let Some(document_id) = self.discard_reload_confirmation else {
+            return;
+        };
+        let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.document_id == document_id)
+        else {
+            self.discard_reload_confirmation = None;
+            return;
+        };
+        let file_name = self
+            .tabs
+            .tabs()
+            .get(index)
+            .map(|tab| {
+                tab.path()
+                    .file_name()
+                    .unwrap_or(tab.path().as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default();
+
+        let modal = egui::Modal::new(Id::new(("discard-external-conflict-reload", document_id)))
+            .show(context, |ui| {
+                ui.heading("未保存の編集を破棄しますか");
+                ui.label(format!(
+                    "{file_name} の未保存の編集と注釈の下書きを破棄し、外部版を読み込みます。"
+                ));
+                ui.horizontal(|ui| {
+                    let reload = ui.button("保存しないで更新").clicked().then_some(true);
+                    let cancel = ui.button("キャンセル").clicked().then_some(false);
+                    reload.or(cancel)
+                })
+                .inner
+            });
+
+        if let Some(confirm) = modal.inner {
+            if confirm {
+                self.confirm_conflicted_document_reload();
+            } else {
+                self.cancel_conflicted_document_reload();
+            }
+        } else if modal.should_close() {
+            self.cancel_conflicted_document_reload();
+        }
     }
 
     fn begin_conflicted_document_save_as(&mut self, index: usize, selected: Option<PathBuf>) {
@@ -4337,6 +4452,10 @@ impl PrototypeApp {
                 if ui.button("編集版を別名保存して外部版を読み込む").clicked() {
                     self.save_conflicted_document_as(index);
                 }
+                let document_id = self.documents[index].document_id;
+                if ui.button("保存しないで更新").clicked() {
+                    self.request_conflicted_document_reload_confirmation(document_id);
+                }
             }
         });
     }
@@ -5703,6 +5822,7 @@ impl DocumentTab {
             external_candidate: None,
             external_conflict: None,
             reload_in_flight: false,
+            discard_reload_in_flight: false,
             save_as: SaveAsState::Idle,
             failed_external_version: None,
             resume_expected_version: None,
@@ -5858,6 +5978,7 @@ impl DocumentTab {
         self.save_in_flight = false;
         self.print_in_flight = false;
         self.reload_in_flight = false;
+        self.discard_reload_in_flight = false;
         self.save_as = SaveAsState::Idle;
         self.external_resume_in_flight = false;
         self.pending_rebind_path = None;
@@ -6142,6 +6263,7 @@ impl DocumentTab {
         self.external_candidate = None;
         self.external_conflict = None;
         self.reload_in_flight = false;
+        self.discard_reload_in_flight = false;
         self.failed_external_version = None;
         self.external_resume_in_flight = false;
         self.invalidate_outline_request();
@@ -6572,7 +6694,9 @@ impl eframe::App for PrototypeApp {
             self.cancel_all_viewport_interactions();
             self.copy_shortcut_active = false;
         }
-        let modal_open = self.close_confirmation.is_some() || self.session_close_failure.is_some();
+        let modal_open = self.close_confirmation.is_some()
+            || self.discard_reload_confirmation.is_some()
+            || self.session_close_failure.is_some();
         if modal_open {
             // モーダルが閉じるまでポインターの意図を所有する。背景の autoscroll アンカーを
             // 保持するとダイアログの下で文書が動いてしまう。
@@ -6601,6 +6725,7 @@ impl eframe::App for PrototypeApp {
         self.annotation_candidate_picker(ui.ctx());
         self.annotation_editor_overlay(ui.ctx(), central_rect);
         self.close_confirmation_dialog(ui.ctx());
+        self.discard_reload_confirmation_dialog(ui.ctx());
         self.session_close_failure_dialog(ui.ctx());
         self.request_repaint_after(ui.ctx());
     }
