@@ -223,6 +223,7 @@ pub(crate) struct PrototypeApp {
     tab_drag: Option<TabDragState>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
+    about_open: bool,
     gpu_lru: WeightedLruCache<TileCacheKey, ()>,
     thumbnail_lru: WeightedLruCache<ThumbnailCacheKey, ()>,
     annotation_editor: Option<AnnotationEditorState>,
@@ -979,6 +980,7 @@ impl PrototypeApp {
             tab_drag: None,
             sidebar_open: false,
             sidebar_tab: SidebarTab::Outline,
+            about_open: false,
             gpu_lru: WeightedLruCache::new(GPU_TILE_BUDGET_BYTES),
             thumbnail_lru: WeightedLruCache::new(THUMBNAIL_BUDGET_BYTES),
             annotation_editor: None,
@@ -3588,6 +3590,7 @@ impl PrototypeApp {
         let mut close_all_requested = false;
         let mut restore_closed_requested = false;
         let mut exit_requested = false;
+        let mut about_requested = false;
         let mut copy_requested = false;
         let mut highlight_requested = false;
         let mut undo_requested = false;
@@ -3773,6 +3776,12 @@ impl PrototypeApp {
                         ui.close();
                     }
                 });
+                ui.menu_button("ヘルプ", |ui| {
+                    if ui.button("LunaPDFについて").clicked() {
+                        about_requested = true;
+                        ui.close();
+                    }
+                });
             });
         });
 
@@ -3793,6 +3802,19 @@ impl PrototypeApp {
         }
         if exit_requested {
             root_ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+        }
+        if about_requested {
+            self.about_open = true;
+        }
+        if self.about_open {
+            egui::Window::new("LunaPDFについて")
+                .open(&mut self.about_open)
+                .collapsible(false)
+                .resizable(false)
+                .show(root_ui.ctx(), |ui| {
+                    ui.heading("LunaPDF");
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                });
         }
         if copy_requested {
             self.copy_selection(root_ui.ctx());
