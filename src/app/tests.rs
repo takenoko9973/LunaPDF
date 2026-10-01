@@ -877,12 +877,13 @@ fn receive_rename_scan_result(
 #[test]
 fn rename_scan_miss_adopts_atomic_replacement_after_two_stable_results() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("atomic-source.pdf");
-    let replacement = directory.path().join("atomic-replacement.pdf");
+    let directory_path = std::fs::canonicalize(directory.path()).unwrap();
+    let path = directory_path.join("atomic-source.pdf");
+    let replacement = directory_path.join("atomic-replacement.pdf");
     write_blank_pdf(&path);
     let mut app = PrototypeApp::from_startup(
         vec![path.clone()],
-        SessionStore::new(directory.path().join("session.json")),
+        SessionStore::new(directory_path.join("session.json")),
     );
     finish_async_document_open(&mut app);
     let expected = app.documents[0].info.as_ref().unwrap().version;
@@ -904,11 +905,12 @@ fn rename_scan_miss_adopts_atomic_replacement_after_two_stable_results() {
 #[test]
 fn rename_scan_waits_through_delete_and_recreate_before_reload() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("delete-recreate.pdf");
+    let directory_path = std::fs::canonicalize(directory.path()).unwrap();
+    let path = directory_path.join("delete-recreate.pdf");
     write_blank_pdf(&path);
     let mut app = PrototypeApp::from_startup(
         vec![path.clone()],
-        SessionStore::new(directory.path().join("session.json")),
+        SessionStore::new(directory_path.join("session.json")),
     );
     finish_async_document_open(&mut app);
     let expected = app.documents[0].info.as_ref().unwrap().version;
@@ -930,13 +932,14 @@ fn rename_scan_waits_through_delete_and_recreate_before_reload() {
 #[test]
 fn stale_rename_scan_result_is_discarded_and_new_version_starts_over() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("stale-scan.pdf");
-    let first_replacement = directory.path().join("stale-first.pdf");
-    let second_replacement = directory.path().join("stale-second.pdf");
+    let directory_path = std::fs::canonicalize(directory.path()).unwrap();
+    let path = directory_path.join("stale-scan.pdf");
+    let first_replacement = directory_path.join("stale-first.pdf");
+    let second_replacement = directory_path.join("stale-second.pdf");
     write_blank_pdf(&path);
     let mut app = PrototypeApp::from_startup(
         vec![path.clone()],
-        SessionStore::new(directory.path().join("session.json")),
+        SessionStore::new(directory_path.join("session.json")),
     );
     finish_async_document_open(&mut app);
     let expected = app.documents[0].info.as_ref().unwrap().version;
@@ -960,12 +963,13 @@ fn stale_rename_scan_result_is_discarded_and_new_version_starts_over() {
 #[test]
 fn rename_candidate_wins_over_replacement_version_in_scan_result() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("rename-source.pdf");
-    let renamed = directory.path().join("rename-target.pdf");
+    let directory_path = std::fs::canonicalize(directory.path()).unwrap();
+    let path = directory_path.join("rename-source.pdf");
+    let renamed = directory_path.join("rename-target.pdf");
     write_blank_pdf(&path);
     let mut app = PrototypeApp::from_startup(
         vec![path.clone()],
-        SessionStore::new(directory.path().join("session.json")),
+        SessionStore::new(directory_path.join("session.json")),
     );
     finish_async_document_open(&mut app);
     let expected = app.documents[0].info.as_ref().unwrap().version;
@@ -987,13 +991,14 @@ fn rename_candidate_wins_over_replacement_version_in_scan_result() {
 #[test]
 fn rename_scan_result_routes_dirty_conflict_and_recovers_failed_visible_suspended_tab() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("conflict-resume.pdf");
-    let first_replacement = directory.path().join("conflict-replacement.pdf");
-    let second_replacement = directory.path().join("resume-replacement.pdf");
+    let directory_path = std::fs::canonicalize(directory.path()).unwrap();
+    let path = directory_path.join("conflict-resume.pdf");
+    let first_replacement = directory_path.join("conflict-replacement.pdf");
+    let second_replacement = directory_path.join("resume-replacement.pdf");
     write_blank_pdf(&path);
     let mut app = PrototypeApp::from_startup(
         vec![path.clone()],
-        SessionStore::new(directory.path().join("session.json")),
+        SessionStore::new(directory_path.join("session.json")),
     );
     finish_async_document_open(&mut app);
     let expected = app.documents[0].info.as_ref().unwrap().version;
@@ -1139,12 +1144,13 @@ fn external_resume_opened_event_rebuilds_suspended_document_state() {
 #[test]
 fn saved_as_completion_keeps_edit_copy_and_external_source_reachable() {
     let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("saved-as-source.pdf");
-    let copy = directory.path().join("saved-as-copy.pdf");
+    let directory_path = std::fs::canonicalize(directory.path()).unwrap();
+    let source = directory_path.join("saved-as-source.pdf");
+    let copy = directory_path.join("saved-as-copy.pdf");
     write_blank_pdf(&source);
     let mut app = PrototypeApp::from_startup(
         vec![source.clone()],
-        SessionStore::new(directory.path().join("session.json")),
+        SessionStore::new(directory_path.join("session.json")),
     );
     finish_async_document_open(&mut app);
     let external_version = create_dirty_external_conflict(&mut app, &source);
@@ -1255,21 +1261,19 @@ fn cancelled_conflicted_save_as_leaves_state_untouched_without_a_command() {
 #[test]
 fn reload_in_flight_close_does_not_mix_delayed_event_into_remaining_tab() {
     let directory = tempfile::tempdir().unwrap();
-    let first = directory.path().join("reload-close-first.pdf");
-    let second = directory.path().join("reload-close-second.pdf");
+    let directory_path = std::fs::canonicalize(directory.path()).unwrap();
+    let first = directory_path.join("reload-close-first.pdf");
+    let second = directory_path.join("reload-close-second.pdf");
     write_blank_pdf(&first);
     write_blank_pdf(&second);
     let mut app = PrototypeApp::from_startup(
         vec![first.clone(), second.clone()],
-        SessionStore::new(directory.path().join("session.json")),
+        SessionStore::new(directory_path.join("session.json")),
     );
     finish_async_document_opens(&mut app);
     let remaining_id = app.documents[1].document_id;
     let remaining_version = app.documents[1].info.as_ref().unwrap().version;
-    overwrite_with_blank_pdf(
-        &first,
-        &directory.path().join("reload-close-replacement.pdf"),
-    );
+    overwrite_with_blank_pdf(&first, &directory_path.join("reload-close-replacement.pdf"));
 
     for _ in 0..2 {
         app.last_external_check = Instant::now() - Duration::from_secs(1);
