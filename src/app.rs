@@ -195,6 +195,7 @@ pub(crate) struct PrototypeApp {
     #[cfg(windows)]
     auto_rotate_print: bool,
     close_confirmation: Option<CloseConfirmation>,
+    closed_tabs: Vec<ClosedTab>,
     approved_window_documents: HashSet<PathBuf>,
     allow_window_close: bool,
     window_close_pending: bool,
@@ -536,6 +537,12 @@ enum SessionCloseDecision {
 enum OpenIntent {
     User,
     Restored { view: SessionView },
+    Reopened { view: SessionView },
+}
+
+struct ClosedTab {
+    path: PathBuf,
+    view: SessionView,
 }
 
 #[derive(Clone, Copy)]
@@ -948,6 +955,7 @@ impl PrototypeApp {
             #[cfg(windows)]
             auto_rotate_print: true,
             close_confirmation: None,
+            closed_tabs: Vec::new(),
             approved_window_documents: HashSet::new(),
             allow_window_close: false,
             window_close_pending: false,
@@ -1697,10 +1705,11 @@ impl PrototypeApp {
         path: PathBuf,
         intent: OpenIntent,
     ) -> Option<OpenDocumentResult> {
-        let report_to_user = matches!(&intent, OpenIntent::User);
+        let report_to_user = !matches!(&intent, OpenIntent::Restored { .. });
+        let restoring_from_session = matches!(&intent, OpenIntent::Restored { .. });
         let restored_view = match intent {
             OpenIntent::User => None,
-            OpenIntent::Restored { view } => Some(view),
+            OpenIntent::Restored { view } | OpenIntent::Reopened { view } => Some(view),
         };
         if !is_pdf_path(&path) {
             if report_to_user {
@@ -1723,12 +1732,14 @@ impl PrototypeApp {
                     .checked_add(1)
                     .expect("document IDs cannot exhaust u64");
                 let activity_sequence = self.next_activity_sequence();
-                self.documents.push(DocumentTab::new(
+                let mut document = DocumentTab::new(
                     document_id,
                     canonical_path,
                     activity_sequence,
                     restored_view,
-                ));
+                );
+                document.restoring_from_session = restoring_from_session;
+                self.documents.push(document);
                 self.activate_document(index, previously_active, &previously_visible);
                 if report_to_user {
                     self.status = format!("Opening {}…", path.display());
@@ -1919,6 +1930,11 @@ impl PrototypeApp {
         let close_flow_active = self.window_close_pending
             || self.close_all_pending
             || self.close_confirmation.is_some();
+        let reopen_closed_tab_pressed = context
+            .input_mut(|input| input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::T));
+        if reopen_closed_tab_pressed && self.can_restore_closed_tab() {
+            self.restore_closed_tab();
+        }
         let save_pressed = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::S));
         if save_pressed && !close_flow_active {
             let annotation_editor_can_save = self.active_index().is_some_and(|index| {
@@ -2332,7 +2348,7 @@ impl PrototypeApp {
         }
 
         while !self.documents.is_empty() {
-            self.remove_tab_now(self.documents.len() - 1);
+            self.close_tab_now(self.documents.len() - 1);
         }
         self.approved_window_documents.clear();
         self.close_all_pending = false;
@@ -2340,9 +2356,44 @@ impl PrototypeApp {
     }
 
     fn close_tab_now(&mut self, index: usize) {
+        let closed_tab = self
+            .tabs
+            .tabs()
+            .get(index)
+            .zip(self.documents.get(index))
+            .map(|(tab, document)| ClosedTab {
+                path: tab.path().to_path_buf(),
+                view: document.view.to_session(),
+            });
+        let Some(closed_tab) = closed_tab else {
+            return;
+        };
         if self.remove_tab_now(index) {
+            self.closed_tabs.push(closed_tab);
             self.status = "Tab closed".to_owned();
         }
+    }
+
+    fn restore_closed_tab(&mut self) {
+        if !self.can_restore_closed_tab() {
+            return;
+        }
+        let Some(closed_tab) = self.closed_tabs.pop() else {
+            return;
+        };
+        let _ = self.open_document_with_intent(
+            closed_tab.path,
+            OpenIntent::Reopened {
+                view: closed_tab.view,
+            },
+        );
+    }
+
+    fn can_restore_closed_tab(&self) -> bool {
+        !self.closed_tabs.is_empty()
+            && !self.window_close_pending
+            && !self.close_all_pending
+            && self.close_confirmation.is_none()
     }
 
     fn remove_tab_now(&mut self, index: usize) -> bool {
@@ -3535,6 +3586,7 @@ impl PrototypeApp {
         let mut print_requested = false;
         let mut close_current_requested = false;
         let mut close_all_requested = false;
+        let mut restore_closed_requested = false;
         let mut exit_requested = false;
         let mut copy_requested = false;
         let mut highlight_requested = false;
@@ -3594,6 +3646,16 @@ impl PrototypeApp {
                         ui.close();
                     }
                     ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.can_restore_closed_tab(),
+                            egui::Button::new("閉じたタブを開く    Ctrl+Shift+T"),
+                        )
+                        .clicked()
+                    {
+                        restore_closed_requested = true;
+                        ui.close();
+                    }
                     ui.checkbox(&mut self.restore_enabled, "前回のセッションを復元");
                     #[cfg(windows)]
                     {
@@ -3719,6 +3781,9 @@ impl PrototypeApp {
         }
         if print_requested {
             self.print();
+        }
+        if restore_closed_requested {
+            self.restore_closed_tab();
         }
         if close_current_requested && let Some(index) = self.active_index() {
             self.close_tab(index);

@@ -2332,6 +2332,27 @@ fn h_key_input() -> egui::RawInput {
     }
 }
 
+fn reopen_tab_shortcut_input() -> egui::RawInput {
+    tab_t_shortcut_input(Modifiers::CTRL | Modifiers::SHIFT)
+}
+
+fn ctrl_t_shortcut_input() -> egui::RawInput {
+    tab_t_shortcut_input(Modifiers::CTRL)
+}
+
+fn tab_t_shortcut_input(modifiers: Modifiers) -> egui::RawInput {
+    egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: Key::T,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        ..Default::default()
+    }
+}
+
 fn copy_event_input() -> egui::RawInput {
     egui::RawInput {
         events: vec![egui::Event::Copy],
@@ -4197,6 +4218,233 @@ fn closing_restored_tab_consumes_pending_restore_result() {
         Some(1)
     );
     finish_async_session_restore(&mut app);
+}
+
+#[test]
+fn closed_tabs_reopen_in_lifo_order_with_saved_view_and_shortcut() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.pdf");
+    let second = directory.path().join("second.pdf");
+    write_blank_pdf(&first);
+    write_blank_pdf(&second);
+    let mut app = PrototypeApp::from_startup(
+        vec![first.clone(), second.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_opens(&mut app);
+
+    let first_view = SessionView {
+        page_index: 0,
+        page_x: 0.2,
+        page_y: 0.7,
+        display: SessionDisplayMode::SinglePage,
+        zoom_mode: SessionZoomMode::Fixed,
+        zoom: 1.5,
+    };
+    let second_view = SessionView {
+        page_index: 0,
+        page_x: 0.8,
+        page_y: 0.3,
+        display: SessionDisplayMode::Continuous,
+        zoom_mode: SessionZoomMode::FitPage,
+        zoom: 0.75,
+    };
+    app.documents[0].view = ViewState::from_session(first_view.clone());
+    app.documents[1].view = ViewState::from_session(second_view.clone());
+    app.close_tab(0);
+    app.close_tab(0);
+
+    let context = egui::Context::default();
+    let _ = context.run_ui(ctrl_t_shortcut_input(), |ui| {
+        app.handle_shortcuts(ui.ctx());
+    });
+    assert!(app.documents.is_empty());
+
+    let _ = context.run_ui(reopen_tab_shortcut_input(), |ui| {
+        app.handle_shortcuts(ui.ctx());
+    });
+    assert_eq!(
+        app.tabs.tabs()[0].path(),
+        std::fs::canonicalize(second).unwrap()
+    );
+    assert_eq!(app.documents[0].view.to_session(), second_view);
+    assert!(!app.documents[0].restoring_from_session);
+    assert!(app.session_restore_progress.is_none());
+
+    let _ = context.run_ui(reopen_tab_shortcut_input(), |ui| {
+        app.handle_shortcuts(ui.ctx());
+    });
+    assert_eq!(
+        app.tabs.tabs()[1].path(),
+        std::fs::canonicalize(first).unwrap()
+    );
+    assert_eq!(app.documents[1].view.to_session(), first_view);
+    assert!(!app.documents[1].restoring_from_session);
+
+    let _ = context.run_ui(reopen_tab_shortcut_input(), |ui| {
+        app.handle_shortcuts(ui.ctx());
+    });
+    assert_eq!(app.documents.len(), 2);
+}
+
+#[test]
+fn closed_tab_reopen_selects_existing_pdf_without_overwriting_its_view() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("existing.pdf");
+    let other_path = directory.path().join("other.pdf");
+    write_blank_pdf(&path);
+    write_blank_pdf(&other_path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone(), other_path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_opens(&mut app);
+    let saved_view = SessionView {
+        page_index: 0,
+        page_x: 0.3,
+        page_y: 0.6,
+        display: SessionDisplayMode::SinglePage,
+        zoom_mode: SessionZoomMode::FitWidth,
+        zoom: 1.25,
+    };
+    let current_view = SessionView {
+        page_index: 0,
+        page_x: 0.8,
+        page_y: 0.4,
+        display: SessionDisplayMode::Continuous,
+        zoom_mode: SessionZoomMode::Fixed,
+        zoom: 1.75,
+    };
+    app.documents[0].view = ViewState::from_session(saved_view);
+    app.select_tab(0);
+    app.close_tab(0);
+    app.open_document(path.clone());
+    finish_async_document_opens(&mut app);
+    assert_eq!(app.documents.len(), 2);
+    app.documents[1].view = ViewState::from_session(current_view.clone());
+    app.select_tab(0);
+
+    let context = egui::Context::default();
+    let _ = context.run_ui(reopen_tab_shortcut_input(), |ui| {
+        app.handle_shortcuts(ui.ctx());
+    });
+
+    assert_eq!(app.documents.len(), 2);
+    assert_eq!(
+        app.tabs.tabs()[0].path(),
+        std::fs::canonicalize(other_path).unwrap()
+    );
+    assert_eq!(app.active_index(), Some(1));
+    assert_eq!(app.documents[1].view.to_session(), current_view);
+    assert!(!app.documents[1].restoring_from_session);
+}
+
+#[test]
+fn reopening_a_tab_is_blocked_during_a_pending_close_flow() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pending-close.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    app.close_tab(0);
+    app.close_all_pending = true;
+
+    app.restore_closed_tab();
+
+    assert!(app.documents.is_empty());
+    app.close_all_pending = false;
+    app.restore_closed_tab();
+    assert_eq!(app.documents.len(), 1);
+    assert_eq!(
+        app.tabs.tabs()[0].path(),
+        std::fs::canonicalize(path).unwrap()
+    );
+}
+
+#[test]
+fn close_all_tabs_records_user_closed_tabs_for_reopening() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.pdf");
+    let second = directory.path().join("second.pdf");
+    write_blank_pdf(&first);
+    write_blank_pdf(&second);
+    let mut app = PrototypeApp::from_startup(
+        vec![first.clone(), second],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_opens(&mut app);
+    let first_view = SessionView {
+        page_index: 0,
+        page_x: 0.25,
+        page_y: 0.75,
+        display: SessionDisplayMode::Continuous,
+        zoom_mode: SessionZoomMode::FitWidth,
+        zoom: 1.0,
+    };
+    app.documents[0].view = ViewState::from_session(first_view.clone());
+    app.request_close_all();
+    assert!(app.documents.is_empty());
+
+    let context = egui::Context::default();
+    let _ = context.run_ui(reopen_tab_shortcut_input(), |ui| {
+        app.handle_shortcuts(ui.ctx());
+    });
+
+    assert_eq!(app.documents.len(), 1);
+    assert_eq!(
+        app.tabs.tabs()[0].path(),
+        std::fs::canonicalize(first).unwrap()
+    );
+    assert_eq!(app.documents[0].view.to_session(), first_view);
+}
+
+#[test]
+fn internal_tab_removal_does_not_add_a_reopenable_tab() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("internal-removal.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    assert!(app.remove_tab_now(0));
+
+    let context = egui::Context::default();
+    let _ = context.run_ui(reopen_tab_shortcut_input(), |ui| {
+        app.handle_shortcuts(ui.ctx());
+    });
+
+    assert!(app.documents.is_empty());
+}
+
+#[test]
+fn failed_closed_tab_reopen_reports_an_open_error_and_consumes_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("missing-then-restored.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_open(&mut app);
+    app.close_tab(0);
+    std::fs::remove_file(&path).unwrap();
+
+    let context = egui::Context::default();
+    let _ = context.run_ui(reopen_tab_shortcut_input(), |ui| {
+        app.handle_shortcuts(ui.ctx());
+    });
+    assert!(app.error.is_some());
+    assert!(app.documents.is_empty());
+
+    write_blank_pdf(&path);
+    let _ = context.run_ui(reopen_tab_shortcut_input(), |ui| {
+        app.handle_shortcuts(ui.ctx());
+    });
+    assert!(app.documents.is_empty());
 }
 
 #[test]
