@@ -1963,10 +1963,11 @@ impl PrototypeApp {
             context.memory_mut(|memory| {
                 memory.request_focus(search_query_id(document_id));
             });
-            if !self.documents[index].search.query.trim().is_empty()
-                && !self.documents[index].search.in_progress
-                && self.documents[index].search.pages.is_empty()
-            {
+            let page_count = self.documents[index]
+                .info
+                .as_ref()
+                .map_or(0, |info| info.page_bounds.len());
+            if self.documents[index].search.needs_restart(page_count) {
                 self.begin_search(index);
             }
         }
@@ -2263,9 +2264,11 @@ impl PrototypeApp {
         }
         let sequence = self.next_activity_sequence();
         self.documents[index].last_selected_sequence = sequence;
-        if !self.documents[index].search.query.trim().is_empty()
-            && !self.documents[index].search.in_progress
-        {
+        let page_count = self.documents[index]
+            .info
+            .as_ref()
+            .map_or(0, |info| info.page_bounds.len());
+        if self.documents[index].search.needs_restart(page_count) {
             self.begin_search(index);
         }
     }
@@ -2285,6 +2288,9 @@ impl PrototypeApp {
         let Some(tab_id) = self.tabs.visible_tab_ids().get(side.index()).copied() else {
             return;
         };
+        if self.tabs.active_tab_id() == Some(tab_id) {
+            return;
+        }
         if !self.tabs.select_tab(tab_id) {
             return;
         }
@@ -2580,8 +2586,13 @@ impl PrototypeApp {
         if let Some(active_index) = self.active_index() {
             let sequence = self.next_activity_sequence();
             self.documents[active_index].last_selected_sequence = sequence;
-            if !self.documents[active_index].search.query.trim().is_empty()
-                && !self.documents[active_index].search.in_progress
+            let page_count = self.documents[active_index]
+                .info
+                .as_ref()
+                .map_or(0, |info| info.page_bounds.len());
+            if self.documents[active_index]
+                .search
+                .needs_restart(page_count)
             {
                 self.begin_search(active_index);
             }
@@ -3953,6 +3964,7 @@ impl PrototypeApp {
 
     fn toolbar(&mut self, root_ui: &mut egui::Ui) {
         let mut search_changed = false;
+        let mut search_cleared = false;
         let mut search_navigation = None;
         let mut submitted_page = None;
         let mut page_delta_requested = None;
@@ -4139,12 +4151,68 @@ impl PrototypeApp {
                             toolbar_singleline_text_edit(&mut search.query)
                                 .id(search_query_id(document_id))
                                 .desired_width(180.0)
+                                // egui の単行入力は既定で Enter 時にフォーカスを手放す。
+                                .return_key(None)
+                                .margin(egui::Margin {
+                                    left: 4,
+                                    right: 24,
+                                    top: 2,
+                                    bottom: 2,
+                                })
                                 .hint_text("PDF内を検索"),
                         );
                         search_changed = response.changed();
+                        let ime_was_composing = search.ime_composing;
+                        // 合成外の空 Preedit/Commit は egui も無視するため、通常の Enter を妨げない。
+                        let ime_event = if response.has_focus() {
+                            ui.input(|input| {
+                                let mut ime_event = false;
+                                for event in &input.events {
+                                    match event {
+                                        Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                                            ime_event |= !text.is_empty() || search.ime_composing;
+                                            search.ime_composing = !text.is_empty();
+                                        }
+                                        Event::Ime(egui::ImeEvent::Commit(text)) => {
+                                            ime_event |= !text.is_empty() || search.ime_composing;
+                                            search.ime_composing = false;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                ime_event
+                            })
+                        } else {
+                            search.ime_composing = false;
+                            false
+                        };
                         let enter = ui.input(|input| input.key_pressed(Key::Enter));
-                        if response.has_focus() && enter && !search_changed {
+                        if response.has_focus()
+                            && enter
+                            && !search_changed
+                            && !ime_was_composing
+                            && !ime_event
+                        {
                             search_navigation = Some(!ui.input(|input| input.modifiers.shift));
+                        }
+                        if !search.query.is_empty() {
+                            let close_rect = Rect::from_center_size(
+                                Pos2::new(response.rect.right() - 13.0, response.rect.center().y),
+                                Vec2::splat(18.0),
+                            );
+                            let close_response = ui.interact(
+                                close_rect,
+                                Id::new(("search-clear", document_id)),
+                                Sense::click(),
+                            );
+                            if close_response.clicked() {
+                                search.query.clear();
+                                search_cleared = true;
+                            }
+                            let color = ui.visuals().widgets.inactive.fg_stroke.color;
+                            for segment in close_icon_segments(close_rect) {
+                                ui.painter().line_segment(segment, Stroke::new(1.5, color));
+                            }
                         }
                         let match_count = search.pages.values().map(Vec::len).sum::<usize>();
                         let selected = search
@@ -4199,7 +4267,9 @@ impl PrototypeApp {
             if let Some(delta) = page_delta_requested {
                 self.move_page(delta);
             }
-            if search_changed {
+            if search_cleared {
+                self.cancel_search(index);
+            } else if search_changed {
                 self.begin_search(index);
             } else if let Some(forward) = search_navigation {
                 self.navigate_search(index, forward);

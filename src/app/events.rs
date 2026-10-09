@@ -199,6 +199,10 @@ impl PrototypeApp {
                         }
                         if restart_search {
                             self.begin_search(index);
+                        } else if !external_reload
+                            && !self.documents[index].search.query.trim().is_empty()
+                        {
+                            self.cancel_search(index);
                         }
                         if external_reload {
                             let _ = self.documents[index].request_outline();

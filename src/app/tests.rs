@@ -4304,6 +4304,465 @@ fn stale_search_result_is_rejected_by_generation_and_revision() {
     assert!(!search_result_is_current(4, 4, 1, Some(2)));
 }
 
+fn search_interaction_app(page_count: usize) -> (tempfile::TempDir, PrototypeApp) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("search-interaction.pdf");
+    write_blank_pdf(&path);
+    let mut app = PrototypeApp::from_startup(
+        vec![path.clone()],
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let bounds = crate::domain::document::PageRect {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 100.0,
+        y1: 200.0,
+    };
+    app.documents[0].info = Some(DocumentInfo {
+        path,
+        page_bounds: vec![bounds; page_count],
+        highlight_count: 0,
+        can_save_incrementally: false,
+        highlight_capability: crate::domain::document::HighlightCapability::Allowed,
+        dirty: false,
+        revision: 0,
+        #[cfg(debug_assertions)]
+        open_time: Duration::ZERO,
+        #[cfg(debug_assertions)]
+        physical_memory_bytes: None,
+        version: crate::domain::document::DocumentVersion {
+            identity_primary: 0,
+            identity_secondary: 0,
+            length: 0,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+        },
+    });
+    (directory, app)
+}
+
+fn search_interaction_frame(context: &egui::Context, app: &mut PrototypeApp, events: Vec<Event>) {
+    let modifiers = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Key { modifiers, .. } => Some(*modifiers),
+            _ => None,
+        })
+        .unwrap_or(Modifiers::NONE);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0))),
+        events,
+        modifiers,
+        ..Default::default()
+    };
+    let _ = context.run_ui(input, |ui| app.toolbar(ui));
+}
+
+fn search_enter(shift: bool) -> Event {
+    Event::Key {
+        key: Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: if shift {
+            Modifiers::SHIFT
+        } else {
+            Modifiers::NONE
+        },
+    }
+}
+
+#[test]
+fn search_text_edit_enter_navigates_matches_without_restarting() {
+    let (_directory, mut app) = search_interaction_app(3);
+    let search = &mut app.documents[0].search;
+    search.query = "needle".to_owned();
+    search.generation = 7;
+    search.completed_pages = 3;
+    search
+        .pages
+        .insert(0, vec![SearchMatch { quads: Vec::new() }; 2]);
+    search
+        .pages
+        .insert(2, vec![SearchMatch { quads: Vec::new() }]);
+    let context = egui::Context::default();
+    search_interaction_frame(&context, &mut app, Vec::new());
+    context.memory_mut(|memory| memory.request_focus(search_query_id(1)));
+
+    for expected in [
+        SearchCursor {
+            page_index: 0,
+            match_index: 0,
+        },
+        SearchCursor {
+            page_index: 0,
+            match_index: 1,
+        },
+        SearchCursor {
+            page_index: 2,
+            match_index: 0,
+        },
+        SearchCursor {
+            page_index: 0,
+            match_index: 0,
+        },
+    ] {
+        search_interaction_frame(&context, &mut app, vec![search_enter(false)]);
+        assert_eq!(app.documents[0].search.selected, Some(expected));
+        assert_eq!(app.documents[0].search.generation, 7);
+        assert_eq!(app.documents[0].search.completed_pages, 3);
+        assert!(context.memory(|memory| memory.has_focus(search_query_id(1))));
+    }
+    search_interaction_frame(&context, &mut app, vec![search_enter(true)]);
+    assert_eq!(
+        app.documents[0].search.selected,
+        Some(SearchCursor {
+            page_index: 2,
+            match_index: 0
+        })
+    );
+    app.documents[0].search.in_progress = true;
+    app.documents[0].search.completed_pages = 1;
+    app.documents[0].search.selected = None;
+    search_interaction_frame(&context, &mut app, vec![search_enter(false)]);
+    assert_eq!(
+        app.documents[0].search.selected,
+        Some(SearchCursor {
+            page_index: 2,
+            match_index: 0
+        })
+    );
+    assert_eq!(app.documents[0].search.generation, 7);
+}
+
+#[test]
+fn search_text_edit_enter_ignores_zero_matches_and_ime_confirmation() {
+    let (_directory, mut app) = search_interaction_app(3);
+    app.documents[0].search.query = "needle".to_owned();
+    app.documents[0].search.completed_pages = 3;
+    let context = egui::Context::default();
+    search_interaction_frame(&context, &mut app, Vec::new());
+    context.memory_mut(|memory| memory.request_focus(search_query_id(1)));
+    search_interaction_frame(&context, &mut app, vec![search_enter(false)]);
+    assert_eq!(app.documents[0].search.selected, None);
+    assert_eq!(app.documents[0].search.completed_pages, 3);
+
+    app.documents[0]
+        .search
+        .pages
+        .insert(0, vec![SearchMatch { quads: Vec::new() }]);
+    search_interaction_frame(
+        &context,
+        &mut app,
+        vec![Event::Ime(egui::ImeEvent::Preedit {
+            text: "入力".to_owned(),
+            active_range_chars: None,
+        })],
+    );
+    app.documents[0]
+        .search
+        .pages
+        .insert(0, vec![SearchMatch { quads: Vec::new() }]);
+    let generation = app.documents[0].search.generation;
+    search_interaction_frame(&context, &mut app, vec![search_enter(false)]);
+    assert_eq!(app.documents[0].search.selected, None);
+    assert_eq!(app.documents[0].search.generation, generation);
+    assert!(context.memory(|memory| memory.has_focus(search_query_id(1))));
+    search_interaction_frame(
+        &context,
+        &mut app,
+        vec![Event::Ime(egui::ImeEvent::Commit("入力".to_owned()))],
+    );
+    assert_eq!(app.documents[0].search.selected, None);
+
+    let search = &mut app.documents[0].search;
+    search.completed_pages = 3;
+    search.in_progress = false;
+    search
+        .pages
+        .insert(0, vec![SearchMatch { quads: Vec::new() }; 2]);
+    search_interaction_frame(
+        &context,
+        &mut app,
+        vec![
+            Event::Ime(egui::ImeEvent::Preedit {
+                text: String::new(),
+                active_range_chars: None,
+            }),
+            search_enter(false),
+        ],
+    );
+    assert_eq!(
+        app.documents[0].search.selected,
+        Some(SearchCursor {
+            page_index: 0,
+            match_index: 0,
+        })
+    );
+    search_interaction_frame(
+        &context,
+        &mut app,
+        vec![
+            Event::Ime(egui::ImeEvent::Commit(String::new())),
+            search_enter(false),
+        ],
+    );
+    assert_eq!(
+        app.documents[0].search.selected,
+        Some(SearchCursor {
+            page_index: 0,
+            match_index: 1,
+        })
+    );
+}
+
+#[test]
+fn completed_search_survives_wheel_focus_and_repaint_but_partial_search_restarts() {
+    for has_match in [false, true] {
+        let (_directory, mut app) = search_interaction_app(3);
+        let search = &mut app.documents[0].search;
+        search.query = "needle".to_owned();
+        search.generation = 7;
+        search.completed_pages = 3;
+        if has_match {
+            search
+                .pages
+                .insert(1, vec![SearchMatch { quads: Vec::new() }]);
+            search.selected = Some(SearchCursor {
+                page_index: 1,
+                match_index: 0,
+            });
+        }
+        let selected = search.selected;
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0));
+        let mut pane = Rect::NOTHING;
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                pane = app.central_panel(ui, None);
+            },
+        );
+        let mut wheel = wheel_input(MouseWheelUnit::Line, Modifiers::NONE);
+        wheel.screen_rect = Some(screen);
+        wheel.events.insert(0, Event::PointerMoved(pane.center()));
+        let _ = context.run_ui(wheel, |ui| {
+            app.central_panel(ui, None);
+        });
+        search_interaction_frame(&context, &mut app, Vec::new());
+        app.focus_side(SplitSide::First);
+        assert_eq!(app.documents[0].search.generation, 7);
+        assert_eq!(app.documents[0].search.completed_pages, 3);
+        assert_eq!(app.documents[0].search.selected, selected);
+        assert_eq!(app.documents[0].search.pages.is_empty(), !has_match);
+
+        app.documents[0].search.completed_pages = 1;
+        app.documents[0].search.in_progress = false;
+        app.select_tab(0);
+        assert_ne!(app.documents[0].search.generation, 7);
+        assert_eq!(app.documents[0].search.completed_pages, 0);
+        assert!(app.documents[0].search.pages.is_empty());
+    }
+}
+
+#[test]
+fn hidden_partial_search_restarts_on_reveal_and_split_focus_preserves_completed_results() {
+    let (directory, mut app) = search_interaction_app(3);
+    let other_path = directory.path().join("other.pdf");
+    write_blank_pdf(&other_path);
+    app.open_document_with_intent(other_path, OpenIntent::User)
+        .unwrap();
+    app.select_tab(0);
+    let search = &mut app.documents[0].search;
+    search.query = "needle".to_owned();
+    search.generation = 7;
+    search.completed_pages = 1;
+    search.in_progress = true;
+    app.select_tab(1);
+    let canceled_generation = app.documents[0].search.generation;
+    assert_ne!(canceled_generation, 7);
+    assert!(!app.documents[0].search.in_progress);
+    app.select_tab(0);
+    assert_ne!(app.documents[0].search.generation, canceled_generation);
+    assert!(app.documents[0].search.in_progress);
+
+    let first_id = app.tabs.tabs()[0].id();
+    let second_id = app.tabs.tabs()[1].id();
+    assert!(app.tabs.create_split(
+        first_id,
+        second_id,
+        crate::domain::tabs::SplitPlacement::Right,
+    ));
+    let first_side = if app.tabs.active_split().unwrap().tab(SplitSide::First) == first_id {
+        SplitSide::First
+    } else {
+        SplitSide::Second
+    };
+    let other_side = if first_side == SplitSide::First {
+        SplitSide::Second
+    } else {
+        SplitSide::First
+    };
+    app.select_tab(0);
+    let search = &mut app.documents[0].search;
+    search.generation = 20;
+    search.completed_pages = 3;
+    search.in_progress = false;
+    search.pages.clear();
+    app.focus_side(first_side);
+    let sequence = app.documents[0].last_selected_sequence;
+    app.focus_side(first_side);
+    assert_eq!(app.documents[0].last_selected_sequence, sequence);
+    app.focus_side(other_side);
+    assert_eq!(app.active_index(), Some(1));
+    app.focus_side(first_side);
+    assert_eq!(app.active_index(), Some(0));
+    assert_eq!(app.documents[0].search.generation, 20);
+    assert_eq!(app.documents[0].search.completed_pages, 3);
+    assert!(app.documents[0].search.pages.is_empty());
+}
+
+#[test]
+fn nonactive_revision_change_invalidates_completed_search_before_reactivation() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = (0..2)
+        .map(|index| {
+            let path = directory
+                .path()
+                .join(format!("search-revision-{index}.pdf"));
+            write_blank_pdf(&path);
+            path
+        })
+        .collect::<Vec<_>>();
+    let mut app = PrototypeApp::from_startup(
+        paths,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    finish_async_document_opens(&mut app);
+    assert_eq!(app.active_index(), Some(1));
+    let old_revision = app.documents[0].info.as_ref().unwrap().revision;
+    let page_count = app.documents[0].info.as_ref().unwrap().page_bounds.len();
+    let search = &mut app.documents[0].search;
+    search.query = "needle".to_owned();
+    search.generation = 7;
+    search.completed_pages = page_count;
+    search
+        .pages
+        .insert(0, vec![SearchMatch { quads: Vec::new() }]);
+    search.selected = Some(SearchCursor {
+        page_index: 0,
+        match_index: 0,
+    });
+
+    assert!(app.documents[0].send(DocumentCommand::Save));
+    let context = egui::Context::default();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.documents[0].info.as_ref().unwrap().revision == old_revision
+        && Instant::now() < deadline
+    {
+        app.receive_document_events(&context);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(app.documents[0].info.as_ref().unwrap().revision > old_revision);
+    let search = &app.documents[0].search;
+    assert_ne!(search.generation, 7);
+    assert_eq!(search.completed_pages, 0);
+    assert!(search.pages.is_empty());
+    assert_eq!(search.selected, None);
+    assert!(!search.in_progress);
+    let canceled_generation = search.generation;
+
+    app.select_tab(0);
+    assert_ne!(app.documents[0].search.generation, canceled_generation);
+    assert!(app.documents[0].search.in_progress);
+    app.receive_search_page(
+        0,
+        SearchPageResult {
+            page_index: 0,
+            generation: 7,
+            revision: old_revision,
+            matches: vec![SearchMatch { quads: Vec::new() }],
+            truncated: false,
+        },
+    );
+    assert!(app.documents[0].search.pages.is_empty());
+}
+
+#[test]
+fn search_clear_control_is_inside_field_and_rejects_late_results() {
+    let (_directory, mut app) = search_interaction_app(3);
+    let search = &mut app.documents[0].search;
+    search.query = "needle".repeat(50);
+    search.generation = 7;
+    search.completed_pages = 3;
+    search
+        .pages
+        .insert(0, vec![SearchMatch { quads: Vec::new() }]);
+    search.selected = Some(SearchCursor {
+        page_index: 0,
+        match_index: 0,
+    });
+    let context = egui::Context::default();
+    search_interaction_frame(&context, &mut app, Vec::new());
+    let field = context.read_response(search_query_id(1)).unwrap().rect;
+    let clear = context
+        .read_response(Id::new(("search-clear", 1)))
+        .unwrap()
+        .rect;
+    assert_eq!(field.width(), 180.0);
+    assert_eq!(field.height(), TOOLBAR_CONTROL_HEIGHT);
+    assert!(field.contains_rect(clear));
+    assert!(clear.left() > field.left() + field.width() / 2.0);
+
+    let click = |app: &mut PrototypeApp, position| {
+        for pressed in [true, false] {
+            search_interaction_frame(
+                &context,
+                app,
+                vec![
+                    Event::PointerMoved(position),
+                    Event::PointerButton {
+                        pos: position,
+                        button: PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    };
+    click(&mut app, Pos2::new(field.left() + 20.0, field.center().y));
+    assert!(context.memory(|memory| memory.has_focus(search_query_id(1))));
+    click(&mut app, clear.center());
+    let search = &app.documents[0].search;
+    assert!(search.query.is_empty());
+    assert!(search.pages.is_empty());
+    assert_eq!(search.selected, None);
+    assert_eq!(search.completed_pages, 0);
+    assert!(!search.in_progress);
+    assert_ne!(search.generation, 7);
+    let generation = search.generation;
+    assert_eq!(
+        context.read_response(search_query_id(1)).unwrap().rect,
+        field
+    );
+
+    app.receive_search_page(
+        0,
+        SearchPageResult {
+            page_index: 0,
+            generation: 7,
+            revision: 0,
+            matches: vec![SearchMatch { quads: Vec::new() }],
+            truncated: false,
+        },
+    );
+    assert_eq!(app.documents[0].search.generation, generation);
+    assert!(app.documents[0].search.pages.is_empty());
+}
+
 #[test]
 fn thumbnail_failure_blocks_only_the_failed_request() {
     let failed_key = ThumbnailCacheKey::for_page(1, 2, 3);

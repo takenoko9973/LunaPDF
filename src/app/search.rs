@@ -9,6 +9,13 @@ pub(super) struct SearchState {
     pub(super) completed_pages: usize,
     pub(super) truncated: bool,
     pub(super) in_progress: bool,
+    pub(super) ime_composing: bool,
+}
+
+impl SearchState {
+    pub(super) fn needs_restart(&self, page_count: usize) -> bool {
+        !self.query.trim().is_empty() && !self.in_progress && self.completed_pages < page_count
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +75,7 @@ impl PrototypeApp {
         tab.search.completed_pages = 0;
         tab.search.truncated = false;
         tab.search.in_progress = false;
+        tab.search.ime_composing = false;
     }
 
     pub(super) fn navigate_search(&mut self, index: usize, forward: bool) {
