@@ -2,6 +2,11 @@
 
 実装段階と目的ごとに、設計書・指示書を次のフォルダへ分類する。
 
+現在の利用者向け動作は [LunaPDF 現行仕様](../current-spec.md) を参照する。
+この索引の作業指示書と報告書は、個別作業の目的、当時の判断、検証結果を調べる履歴資料であり、現行動作の根拠を置き換えない。
+検索UIの動作を変えるときは現行仕様の「文書内検索」、PDF保存を変えるときは「PDFの保存」を確認し、どちらも [検証マトリクス](development-environment/verification-matrix.md) から必要な検証を選ぶ。
+文書だけを変更する作業では変更対象の文書とマトリクスを確認し、環境操作が必要なときだけ [開発ワークフロー](../development-workflow.md) を読む。
+
 ## `initial-design/`
 
 初期実装の対象範囲、設計判断、受入条件をまとめた資料を置く。
@@ -55,6 +60,9 @@ Windows向け実行ファイル、インストーラー、ポータブル版、C
 
 Codexによる開発環境・検証手順の改善指示と報告を置く。
 
+- [LunaPDF：Codex 向け作業環境・Skill・ドキュメントの全体最適化 作業報告](development-environment/261021_lunapdf_instructions_docs_skills_optimization_report.md)
+
 - [LunaPDF：Codexによる検証とDocker／Cargoキャッシュの効率化 指示書](development-environment/261021_lunapdf_codex_test_cache_optimization.md)
+- [LunaPDF：Codex指示体系・Skill・ドキュメントの全体最適化 実装指示書](development-environment/261021_lunapdf_codex_instructions_docs_skills_optimization.md)
 - [LunaPDF 検証マトリクス](development-environment/verification-matrix.md)
 - [LunaPDF Docker/Cargo キャッシュ改善・実測報告](development-environment/261021_lunapdf_test_cache_optimization_report.md)

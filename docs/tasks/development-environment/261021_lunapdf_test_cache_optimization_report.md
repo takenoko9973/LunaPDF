@@ -1,5 +1,7 @@
 # LunaPDF Docker/Cargo キャッシュ改善・実測報告
 
+現在のDev Container操作は[開発環境の運用手順](../../development-workflow.md)を参照する。この報告は当日の実行結果と測定値を保持する履歴資料である。
+
 2026-10-21。[実施指示書](261021_lunapdf_codex_test_cache_optimization.md)に対する、検証方針・ヘッドレステスト・Docker/Cargo キャッシュの全体報告。
 
 ## 全体の変更とテスト判断

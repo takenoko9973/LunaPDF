@@ -11,9 +11,9 @@
 | Windows／OS統合 | 自動で確認できるロジック・設定・出力を検査 | 実機でしか確認できない範囲は理由・対象・代替不能な理由・方法を記録。ユーザーが明示的に依頼した場合だけ実施 |
 | 文書・コメント・指示のみ | `git diff --check`、参照先・相対リンクの確認 | 振る舞いの検査ができない変更ではテストを追加しない |
 
-Linux検証は既存のDev Container workspaceへの `exec` を優先する。Compose設定と現在のプロジェクトを確認し、プロジェクト名やコンテナ名を推測しない。`cargo check` は型・コンパイル検査であり、アプリの実行時動作を確認しない。既存のWindows／Linux検証経路とversion方針は維持する。
+Linux検証は既存のDev Container workspaceへの `exec` を優先する。[開発環境の運用手順](../../development-workflow.md)に沿ってCompose設定と実行中workspaceを照合し、名前やmount元を推測しない。`cargo check` は型・コンパイル検査であり、アプリの実行時動作を確認しない。既存のWindows／Linux検証経路とversion方針は維持する。
 
-Docker/Cargo の再利用・並列実行は[キャッシュ運用手順](261021_lunapdf_test_cache_optimization_report.md#運用手順)を参照する。
+Docker/Cargoの実行コマンドと再利用・並列実行の選択は[現行運用手順](../../development-workflow.md)を参照する。[2026-10-21の実行報告](261021_lunapdf_test_cache_optimization_report.md)は当日の結果と測定値を記録した履歴資料である。
 
 結果は、対象の検査ごとに次のいずれかで記録する。
 
