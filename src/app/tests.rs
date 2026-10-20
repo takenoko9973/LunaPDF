@@ -3521,6 +3521,71 @@ fn single_page_wheel_does_not_cross_document_boundaries() {
 }
 
 #[test]
+fn single_page_view_line_wheel_navigates_pages_and_respects_boundaries() {
+    let (_directory, mut app) = search_interaction_app(3);
+    let context = egui::Context::default();
+    let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0));
+    let pointer = screen.center();
+    app.documents[0].state = DocumentState::ReadyClean;
+    app.documents[0].view.display_mode = DisplayMode::SinglePage;
+    app.documents[0].view.zoom_mode = ZoomMode::FitPage;
+
+    let _ = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            app.central_panel(ui, None);
+        },
+    );
+
+    for (start_page, delta_y, control_held, expected_page) in [
+        (0, -1.0, false, 1),
+        (1, 1.0, false, 0),
+        (0, 1.0, false, 0),
+        (2, -1.0, false, 2),
+        (1, -1.0, true, 1),
+    ] {
+        app.documents[0].view.current_page = start_page;
+        let modifiers = if control_held {
+            Modifiers::CTRL
+        } else {
+            Modifiers::NONE
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                Event::PointerMoved(pointer),
+                wheel_event(
+                    MouseWheelUnit::Line,
+                    Vec2::new(0.0, delta_y),
+                    TouchPhase::Move,
+                    control_held,
+                ),
+            ],
+            modifiers,
+            ..Default::default()
+        };
+        let _ = context.run_ui(input, |ui| {
+            app.central_panel(ui, None);
+        });
+
+        assert_eq!(app.documents[0].view.current_page, expected_page);
+        if expected_page != start_page {
+            let expected_anchor_y = if delta_y < 0.0 { 0.0 } else { 1.0 };
+            assert_eq!(
+                app.documents[0]
+                    .view
+                    .restore_single_anchor
+                    .map(|anchor| anchor.y),
+                Some(expected_anchor_y)
+            );
+        }
+    }
+}
+
+#[test]
 fn autoscroll_velocity_has_dead_zone_and_speed_ceiling() {
     let anchor = Pos2::new(100.0, 100.0);
     assert_eq!(AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND, 4_800.0);
