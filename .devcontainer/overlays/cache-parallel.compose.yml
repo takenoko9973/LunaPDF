@@ -1,0 +1,12 @@
+services:
+  workspace:
+    environment:
+      RUSTC_WRAPPER: /usr/bin/sccache
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_DIR: /var/cache/sccache
+    volumes:
+      - sccache:/var/cache/sccache
+
+volumes:
+  sccache:
+    name: lunapdf_devcontainer_sccache

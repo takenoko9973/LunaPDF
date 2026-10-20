@@ -1,5 +1,6 @@
 services:
     workspace:
+        image: lunapdf_devcontainer-workspace:latest
         build:
             context: .
             dockerfile: Dockerfile
@@ -15,3 +16,5 @@ services:
 volumes:
     cargo-target:
     cargo-registry:
+        # 既存 volume の実名を使い、Compose project が違ってもダウンロードを再利用する。
+        name: lunapdf_devcontainer_cargo-registry

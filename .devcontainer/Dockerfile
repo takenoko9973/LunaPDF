@@ -38,3 +38,7 @@ RUN apt-get update; \
 RUN rustup target add x86_64-pc-windows-gnu; \
     rustup component add rustc rust-analysis rust-src rustfmt clippy llvm-tools-preview; \
     cargo install cargo-edit cargo-watch cargo-update;
+
+# wrapper と incremental の切替は並列検証用 overlay に限定する。
+RUN apt-get update && apt-get install -y --no-install-recommends sccache \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*

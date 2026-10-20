@@ -13,6 +13,8 @@
 
 Linux検証は既存のDev Container workspaceへの `exec` を優先する。Compose設定と現在のプロジェクトを確認し、プロジェクト名やコンテナ名を推測しない。`cargo check` は型・コンパイル検査であり、アプリの実行時動作を確認しない。既存のWindows／Linux検証経路とversion方針は維持する。
 
+Docker/Cargo の再利用・並列実行は[キャッシュ運用手順](261021_lunapdf_test_cache_optimization_report.md#運用手順)を参照する。
+
 結果は、対象の検査ごとに次のいずれかで記録する。
 
 - **実行して合格**：検査を実行し、対象範囲で期待した結果を確認した。
