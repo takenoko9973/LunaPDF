@@ -50,3 +50,10 @@ Windows向け実行ファイル、インストーラー、ポータブル版、C
 
 - [LunaPDF Windows配布対応 指示書](distribution/260802_lunapdf_windows_distribution_instructions.md)
 - [LunaPDF Windows配布対応 作業報告](distribution/260802_lunapdf_windows_distribution_report.md)
+
+## `development-environment/`
+
+Codexによる開発環境・検証手順の改善指示と報告を置く。
+
+- [LunaPDF：Codexによる検証とDocker／Cargoキャッシュの効率化 指示書](development-environment/261021_lunapdf_codex_test_cache_optimization.md)
+- [LunaPDF 検証マトリクス](development-environment/verification-matrix.md)

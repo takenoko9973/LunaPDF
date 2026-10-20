@@ -16,6 +16,14 @@
   `docker compose -f .devcontainer/compose.base.yml exec workspace sh -c "cargo build --release --target=x86_64-pc-windows-gnu && install -D target/x86_64-pc-windows-gnu/release/lunapdf.exe /workspace/dist/lunapdf-release.exe"`
 - Keep container and Windows build outputs separate.
 
+## Validation policy
+
+- 変更の観測可能な挙動・契約に対して、まず最小の関連自動検査を選び、必要性に応じて対象範囲を広げる。変更種別ごとの目安は [検証マトリクス](docs/tasks/development-environment/verification-matrix.md) を参照する。無関係な全テスト、全ターゲット、Windowsクロスビルド、releaseビルド、インストーラー生成を毎回実行しない。
+- `cargo check` は型・コンパイル検査であり、実行時の動作確認ではない。検証結果と未実施範囲を区別して報告する。
+- Linux検証では、Dev Container設定と実行中のComposeプロジェクト／workspaceを確認し、利用可能な既存workspaceへの `exec` を優先する。プロジェクト名やコンテナ名を推測せず、起動や再ビルドが必要な場合は変更内容に必要な範囲だけ行う。
+- 実GUI起動、Computer Use、OS入力、スクリーンショット、OCR、画素判定を通常の検証手段にしない。状態・イベント検査、ヘッドレスUI検査、PDF出力の構造・内容検査を優先する。OS実機でしか確認できない項目は、必要性・対象範囲・代替できない理由・実行方法を報告し、ユーザーが当該検証を明示的に依頼した場合だけ実行する。未実施項目は「実機未検証」とし、GUI確認が未了の場合は「GUI未検証」と明記する。
+- 結果は「実行して合格」「実行して失敗」「環境制約で未実施」「実機未検証」に分け、実行していない検査を成功扱いしない。
+
 ## Versioning
 
 - バージョンはリリースに合わせて更新し、唯一の管理元は `Cargo.toml` の `[package].version` とする。通常の機能追加・修正では、リリースまたは version 更新の明示的な指示がない限り、実装者は version を上げない。
