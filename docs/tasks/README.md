@@ -2,16 +2,16 @@
 
 実装段階と目的ごとに、設計書・指示書を次のフォルダへ分類する。
 
-現在の利用者向け動作は [LunaPDF 現行仕様](../current-spec.md) を参照する。
+現在の利用者向け動作は [現行仕様書](../specifications/README.md) を参照する。
 この索引の作業指示書と報告書は、個別作業の目的、当時の判断、検証結果を調べる履歴資料であり、現行動作の根拠を置き換えない。
-検索UIの動作を変えるときは現行仕様の「文書内検索」、PDF保存を変えるときは「PDFの保存」を確認し、どちらも [検証マトリクス](development-environment/verification-matrix.md) から必要な検証を選ぶ。
+検索UIの動作を変えるときは [アプリケーション仕様](../specifications/application.md) の検索の項目、PDF保存を変えるときは保存の項目を確認し、どちらも [検証マトリクス](development-environment/verification-matrix.md) から必要な検証を選ぶ。
 文書だけを変更する作業では変更対象の文書とマトリクスを確認し、環境操作が必要なときだけ [開発ワークフロー](../development-workflow.md) を読む。
 
-## `initial-design/`
+## 初期設計書アーカイブ
 
-初期実装の対象範囲、設計判断、受入条件をまとめた資料を置く。
+初期実装の対象範囲、設計判断、受入条件をまとめた歴史資料を置く。現行仕様とは区別して読む。
 
-- [軽量PDFビューワー 実装計画・基本設計書](initial-design/pdf-viewer-plan-design.md)
+- [軽量PDFビューワー 実装計画・基本設計書](../archive/initial-design/pdf-viewer-plan-design.md)
 
 ## `ui-improvement/`
 

@@ -13,7 +13,7 @@
 - 挙動・契約に関係する最小の自動検査から始め、必要性に応じて範囲を広げる。[検証マトリクス](docs/tasks/development-environment/verification-matrix.md)にある変更種別ごとの目安を使い、全テスト・全ターゲット・release build・installer生成を毎回要求しない。
 - `cargo check` は型・コンパイル検査であり、実行時の動作確認ではない。実行済み、失敗、環境制約で未実施、実機未検証を区別して報告する。
 - 実GUI起動・OS入力・Computer Use・screen capture・OCR・画素判定は通常の検証手段にしない。ユーザーが当該GUI受入確認を明示的に依頼した場合だけ行い、GUI未検証と実機未検証を成功扱いしない。
-- 振る舞いや仕様を変える作業では、[現行仕様](docs/current-spec.md)の該当箇所を確認する。Dev Containerやbuild環境を操作する場合は[開発環境の運用手順](docs/development-workflow.md)を参照する。GUI実機受入または性能受入が明示された場合だけ、[過去の検証事例](.codex/validation-lessons.md)の関連箇所を読む。
+- 機能追加・仕様変更・不具合修正では、[現行仕様の入口](docs/specifications/README.md)と関連仕様書を確認し、仕様変更時は同時に更新する。Dev Containerやbuild環境を操作する場合は[開発環境の運用手順](docs/development-workflow.md)を参照する。GUI実機受入または性能受入が明示された場合だけ、[過去の検証事例](.codex/validation-lessons.md)の関連箇所を読む。
 
 ## Versioning
 
