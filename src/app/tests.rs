@@ -3521,6 +3521,546 @@ fn single_page_wheel_does_not_cross_document_boundaries() {
 }
 
 #[test]
+fn arrow_navigation_horizontal_requires_independent_presses() {
+    let (_directory, mut app) = search_interaction_app(3);
+    app.documents[0].state = DocumentState::ReadyClean;
+    let context = egui::Context::default();
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowRight, true, false, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.current_page, 1);
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowRight, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.current_page, 1);
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![
+            arrow_key(Key::ArrowRight, false, false, Modifiers::NONE),
+            arrow_key(Key::ArrowRight, true, false, Modifiers::NONE),
+        ],
+    );
+    assert_eq!(app.documents[0].view.current_page, 2);
+}
+
+fn arrow_key(key: Key, pressed: bool, repeat: bool, modifiers: Modifiers) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat,
+        modifiers,
+    }
+}
+
+fn arrow_press(key: Key) -> Vec<Event> {
+    vec![
+        arrow_key(key, false, false, Modifiers::NONE),
+        arrow_key(key, true, false, Modifiers::NONE),
+    ]
+}
+
+fn arrow_click(context: &egui::Context, app: &mut PrototypeApp, position: Pos2) {
+    for pressed in [true, false] {
+        arrow_navigation_frame(
+            context,
+            app,
+            vec![
+                Event::PointerMoved(position),
+                Event::PointerButton {
+                    pos: position,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+    }
+}
+
+#[test]
+fn arrow_navigation_pdf_click_releases_text_focus_for_document_keys() {
+    let (_directory, mut app) = search_interaction_app(3);
+    prepare_arrow_view(&mut app, DisplayMode::SinglePage, 1.0);
+    let context = egui::Context::default();
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    context
+        .memory_mut(|memory| memory.request_focus(search_query_id(app.documents[0].document_id)));
+    arrow_click(&context, &mut app, Pos2::new(600.0, 350.0));
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
+    assert_eq!(app.documents[0].view.current_page, 1);
+}
+
+fn prepare_arrow_view(app: &mut PrototypeApp, mode: DisplayMode, zoom: f32) {
+    app.documents[0].state = DocumentState::ReadyClean;
+    app.documents[0].view.display_mode = mode;
+    app.documents[0].view.zoom_mode = ZoomMode::Fixed;
+    app.documents[0].view.zoom = zoom;
+}
+
+#[test]
+fn arrow_navigation_horizontal_boundaries_modifiers_and_page_keys() {
+    for mode in [DisplayMode::Continuous, DisplayMode::SinglePage] {
+        let (_directory, mut app) = search_interaction_app(3);
+        prepare_arrow_view(&mut app, mode, 4.0);
+        let context = egui::Context::default();
+        arrow_navigation_frame(&context, &mut app, Vec::new());
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowLeft));
+        assert_eq!(app.documents[0].view.current_page, 0);
+        for modifiers in [
+            Modifiers::CTRL,
+            Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers::COMMAND,
+        ] {
+            arrow_navigation_frame(
+                &context,
+                &mut app,
+                vec![arrow_key(Key::ArrowRight, true, false, modifiers)],
+            );
+            assert_eq!(app.documents[0].view.current_page, 0);
+        }
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
+        assert_eq!(app.documents[0].view.current_page, 2);
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowLeft));
+        assert_eq!(app.documents[0].view.current_page, 1);
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::PageUp));
+        assert_eq!(app.documents[0].view.current_page, 0);
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::PageDown));
+        assert_eq!(app.documents[0].view.current_page, 1);
+        let mut events = arrow_press(Key::PageDown);
+        events.extend(arrow_press(Key::ArrowRight));
+        arrow_navigation_frame(&context, &mut app, events);
+        assert_eq!(app.documents[0].view.current_page, 2);
+    }
+}
+
+#[test]
+fn arrow_navigation_continuous_scrolls_through_boundaries_and_persists_offset() {
+    let (_directory, mut app) = search_interaction_app(4);
+    prepare_arrow_view(&mut app, DisplayMode::Continuous, 4.0);
+    let context = egui::Context::default();
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    let before = app.documents[0].view.center_anchor.unwrap();
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    let after = app.documents[0].view.center_anchor.unwrap();
+    assert!((after.page_y_fraction - before.page_y_fraction - 40.0 / 800.0).abs() < 0.001);
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    assert_eq!(app.documents[0].view.center_anchor, Some(after));
+    for _ in 0..23 {
+        arrow_navigation_frame(
+            &context,
+            &mut app,
+            vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+        );
+    }
+    assert_eq!(app.documents[0].view.current_page, 1);
+    let after_crossing = app.documents[0].view.center_anchor.unwrap();
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowUp));
+    let after_up = app.documents[0].view.center_anchor.unwrap();
+    assert_eq!(after_crossing.page_index, after_up.page_index);
+    assert!(
+        (after_crossing.page_y_fraction - after_up.page_y_fraction - 40.0 / 800.0).abs() < 0.001
+    );
+    assert!(app.documents[0].view.scroll_to_page.is_none());
+}
+
+#[test]
+fn arrow_navigation_single_scrolls_then_requires_new_press_at_edges() {
+    let (_directory, mut app) = search_interaction_app(3);
+    prepare_arrow_view(&mut app, DisplayMode::SinglePage, 4.0);
+    for bounds in &mut app.documents[0].info.as_mut().unwrap().page_bounds {
+        bounds.x1 = 500.0;
+        bounds.y1 = 500.0;
+    }
+    let context = egui::Context::default();
+    app.documents[0].view.restore_single_anchor = Some(Vec2::new(0.6, 0.5));
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    let start = app.documents[0].view.single_center_anchor.unwrap();
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    let scrolled = app.documents[0].view.single_center_anchor.unwrap();
+    assert!((scrolled.y - start.y - 40.0 / 2000.0).abs() < 0.001);
+    assert!((scrolled.x - start.x).abs() < 0.001);
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    assert_eq!(app.documents[0].view.single_center_anchor, Some(scrolled));
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowUp));
+    let scrolled_up = app.documents[0].view.single_center_anchor.unwrap();
+    assert!((scrolled_up.y - start.y).abs() < 0.001);
+
+    // 復元直後の開始位置も判定に使い、端へ届く押下でページを跨がない。
+    app.documents[0].view.restore_single_anchor = Some(Vec2::new(0.6, 0.84));
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    assert_eq!(app.documents[0].view.current_page, 0);
+    for _ in 0..10 {
+        arrow_navigation_frame(
+            &context,
+            &mut app,
+            vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+        );
+    }
+    assert_eq!(app.documents[0].view.current_page, 0);
+    let bottom = app.documents[0].view.single_center_anchor.unwrap();
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    assert_eq!(app.documents[0].view.current_page, 1);
+    assert_eq!(
+        app.documents[0].view.restore_single_anchor,
+        Some(Vec2::new(bottom.x, 0.0))
+    );
+    // 前フレームの edge anchor の復元と新規押下が同じフレームでも入力を捨てない。
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowUp));
+    assert_eq!(app.documents[0].view.current_page, 0);
+    assert_eq!(
+        app.documents[0].view.restore_single_anchor,
+        Some(Vec2::new(bottom.x, 1.0))
+    );
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    let restored_bottom = app.documents[0].view.single_center_anchor.unwrap();
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    assert_eq!(
+        app.documents[0].view.single_center_anchor,
+        Some(restored_bottom)
+    );
+}
+
+#[test]
+fn arrow_navigation_single_fitted_pages_accept_consecutive_independent_presses() {
+    let (_directory, mut app) = search_interaction_app(3);
+    prepare_arrow_view(&mut app, DisplayMode::SinglePage, 1.0);
+    let context = egui::Context::default();
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    for (key, expected) in [
+        (Key::ArrowUp, 0),
+        (Key::ArrowDown, 1),
+        (Key::ArrowDown, 2),
+        (Key::ArrowDown, 2),
+        (Key::ArrowUp, 1),
+        (Key::ArrowUp, 0),
+        (Key::ArrowUp, 0),
+    ] {
+        arrow_navigation_frame(&context, &mut app, arrow_press(key));
+        assert_eq!(app.documents[0].view.current_page, expected);
+    }
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    for _ in 0..3 {
+        arrow_navigation_frame(
+            &context,
+            &mut app,
+            vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+        );
+        assert_eq!(app.documents[0].view.current_page, 1);
+    }
+}
+
+#[test]
+fn arrow_navigation_preserves_focused_inputs_ime_popups_and_modals() {
+    for focus in 0..4 {
+        let (_directory, mut app) = search_interaction_app(3);
+        prepare_arrow_view(&mut app, DisplayMode::SinglePage, 1.0);
+        let context = egui::Context::default();
+        let document_id = app.documents[0].document_id;
+        let input_id = match focus {
+            0 => search_query_id(document_id),
+            1 => page_number_id(document_id),
+            2 => annotation_comment_id(
+                document_id,
+                AnnotationId {
+                    page_index: 0,
+                    xref: 1,
+                },
+            ),
+            _ => Id::new("unknown-input"),
+        };
+        context.memory_mut(|memory| memory.request_focus(input_id));
+        let mut text = "text".to_owned();
+        let mut event_preserved = false;
+        let _ = context.run_ui(
+            egui::RawInput {
+                events: arrow_press(Key::ArrowRight),
+                ..Default::default()
+            },
+            |ui| {
+                app.handle_shortcuts(ui.ctx());
+                app.central_panel(ui, None);
+                event_preserved = ui.input(|input| input.key_pressed(Key::ArrowRight));
+                ui.add(egui::TextEdit::singleline(&mut text).id(input_id));
+            },
+        );
+        assert_eq!(app.documents[0].view.current_page, 0);
+        assert!(event_preserved);
+    }
+    for protection in 0..7 {
+        let (_directory, mut app) = search_interaction_app(3);
+        prepare_arrow_view(&mut app, DisplayMode::SinglePage, 1.0);
+        let context = egui::Context::default();
+        arrow_navigation_frame(&context, &mut app, Vec::new());
+        let mut events = arrow_press(Key::ArrowDown);
+        match protection {
+            0 => events.push(Event::Ime(egui::ImeEvent::Preedit {
+                text: "変換".to_owned(),
+                active_range_chars: None,
+            })),
+            1 => events.push(Event::Ime(egui::ImeEvent::Commit("確定".to_owned()))),
+            2 => egui::Popup::open_id(&context, Id::new("navigation-menu")),
+            3 => app.discard_reload_confirmation = Some(app.documents[0].document_id),
+            4 => app.session_close_failure = Some("保存失敗".to_owned()),
+            5 => install_annotation_editor_draft(&mut app, "draft"),
+            6 => app.documents[0].search.ime_composing = true,
+            _ => unreachable!(),
+        }
+        let mut event_preserved = false;
+        let _ = context.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.central_panel(ui, None);
+                event_preserved = ui.input(|input| input.key_pressed(Key::ArrowDown));
+            },
+        );
+        assert_eq!(app.documents[0].view.current_page, 0);
+        assert!(event_preserved);
+    }
+}
+
+#[test]
+fn arrow_navigation_prioritizes_wheel_pan_and_restores_offsets_once() {
+    let (_directory, mut app) = search_interaction_app(4);
+    prepare_arrow_view(&mut app, DisplayMode::SinglePage, 1.0);
+    let context = egui::Context::default();
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    let mut events = arrow_press(Key::ArrowDown);
+    events.extend([
+        Event::PointerMoved(Pos2::new(600.0, 350.0)),
+        wheel_event(
+            MouseWheelUnit::Line,
+            Vec2::new(0.0, -1.0),
+            TouchPhase::Move,
+            false,
+        ),
+    ]);
+    arrow_navigation_frame(&context, &mut app, events);
+    assert_eq!(app.documents[0].view.current_page, 1);
+    let context = egui::Context::default();
+    prepare_arrow_view(&mut app, DisplayMode::SinglePage, 4.0);
+    app.documents[0].view.restore_single_anchor = Some(Vec2::new(0.5, 0.5));
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    app.documents[0].view.pan_requested_offset = Some(Vec2::new(0.0, 50.0));
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    let panned = app.documents[0].view.single_center_anchor.unwrap();
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    assert_eq!(app.documents[0].view.single_center_anchor, Some(panned));
+    app.documents[0].view.restore_single_anchor = Some(Vec2::new(0.5, 0.5));
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    let restored_and_scrolled = app.documents[0].view.single_center_anchor.unwrap();
+    assert!((restored_and_scrolled.y - 0.55).abs() < 0.001);
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    assert_eq!(
+        app.documents[0].view.single_center_anchor,
+        Some(restored_and_scrolled)
+    );
+}
+
+#[test]
+fn arrow_navigation_repeats_do_not_follow_mode_or_window_focus_changes() {
+    let (_directory, mut app) = search_interaction_app(3);
+    prepare_arrow_view(&mut app, DisplayMode::Continuous, 4.0);
+    let context = egui::Context::default();
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    prepare_arrow_view(&mut app, DisplayMode::SinglePage, 4.0);
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    let start = app.documents[0].view.single_center_anchor;
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.single_center_anchor, start);
+    let _ = context.run_ui(
+        egui::RawInput {
+            focused: false,
+            ..Default::default()
+        },
+        |ui| {
+            // 非表示中の logic と同じく、PDF UI を構築しない経路で解放する。
+            app.handle_shortcuts(ui.ctx());
+        },
+    );
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.single_center_anchor, start);
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    assert!(app.documents[0].view.single_center_anchor.unwrap().y > start.unwrap().y);
+}
+
+#[test]
+fn arrow_navigation_single_does_not_jump_when_residual_scroll_reaches_edge() {
+    let (_directory, mut app) = search_interaction_app(3);
+    prepare_arrow_view(&mut app, DisplayMode::SinglePage, 4.0);
+    for bounds in &mut app.documents[0].info.as_mut().unwrap().page_bounds {
+        bounds.y1 = 500.0;
+    }
+    let context = egui::Context::default();
+    app.documents[0].view.restore_single_anchor = Some(Vec2::new(0.5, 0.82));
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    let mut events = arrow_press(Key::ArrowDown);
+    events.push(Event::PointerMoved(Pos2::new(600.0, 350.0)));
+    let _ = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0))),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            app.menu_bar(ui);
+            app.toolbar(ui);
+            // 生 wheel event が消えた後の ScrollArea の平滑化・慣性分を合成する。
+            ui.ctx()
+                .input_mut(|input| input.smooth_scroll_delta.y = -100.0);
+            app.central_panel(ui, None);
+        },
+    );
+    assert_eq!(app.documents[0].view.current_page, 0);
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.current_page, 0);
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    assert_eq!(app.documents[0].view.current_page, 1);
+}
+
+#[test]
+fn arrow_navigation_targets_focused_split_pane_and_resets_held_owner() {
+    for placement in [
+        crate::domain::tabs::SplitPlacement::Right,
+        crate::domain::tabs::SplitPlacement::Bottom,
+    ] {
+        let (directory, mut app) = search_interaction_app(4);
+        prepare_arrow_view(&mut app, DisplayMode::SinglePage, 4.0);
+        let second_path = directory.path().join("second.pdf");
+        write_blank_pdf(&second_path);
+        app.open_document(second_path.clone());
+        let source = app.documents[0].info.as_ref().unwrap();
+        let info = DocumentInfo {
+            path: second_path,
+            page_bounds: source.page_bounds.clone(),
+            highlight_count: source.highlight_count,
+            can_save_incrementally: source.can_save_incrementally,
+            highlight_capability: source.highlight_capability,
+            dirty: source.dirty,
+            revision: source.revision,
+            #[cfg(debug_assertions)]
+            open_time: source.open_time,
+            #[cfg(debug_assertions)]
+            physical_memory_bytes: source.physical_memory_bytes,
+            version: source.version,
+        };
+        app.documents[1].info = Some(info);
+        app.documents[1].state = DocumentState::ReadyClean;
+        app.documents[1].view.display_mode = DisplayMode::SinglePage;
+        app.documents[1].view.zoom_mode = ZoomMode::Fixed;
+        app.documents[1].view.zoom = 4.0;
+        let first_id = app.tabs.tabs()[0].id();
+        let second_id = app.tabs.tabs()[1].id();
+        assert!(app.tabs.create_split(first_id, second_id, placement));
+        app.sync_pane_viewports();
+        let context = egui::Context::default();
+        arrow_navigation_frame(&context, &mut app, Vec::new());
+        arrow_click(&context, &mut app, Pos2::new(300.0, 200.0));
+        assert_eq!(app.focused_side(), SplitSide::First);
+        let first = app.active_index().unwrap();
+        let other = 1 - first;
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
+        assert_eq!(app.documents[first].view.current_page, 1);
+        assert_eq!(app.documents[other].view.current_page, 0);
+        let first_anchor = app.documents[first].view.single_center_anchor.unwrap();
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+        assert!(app.documents[first].view.single_center_anchor.unwrap().y > first_anchor.y);
+        let other_anchor = app.documents[other].view.single_center_anchor;
+        let second_position = match placement {
+            crate::domain::tabs::SplitPlacement::Right => Pos2::new(900.0, 200.0),
+            _ => Pos2::new(300.0, 550.0),
+        };
+        arrow_click(&context, &mut app, second_position);
+        assert_eq!(app.focused_side(), SplitSide::Second);
+        arrow_navigation_frame(
+            &context,
+            &mut app,
+            vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+        );
+        assert_eq!(app.documents[other].view.single_center_anchor, other_anchor);
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+        assert!(
+            app.documents[other].view.single_center_anchor.unwrap().y > other_anchor.unwrap().y
+        );
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
+        assert_eq!(app.documents[other].view.current_page, 1);
+        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowLeft));
+        assert_eq!(app.documents[other].view.current_page, 0);
+        assert_eq!(app.documents[first].view.current_page, 1);
+    }
+}
+
+#[test]
+fn arrow_navigation_processes_one_press_once_per_frame() {
+    let (_directory, mut app) = search_interaction_app(4);
+    prepare_arrow_view(&mut app, DisplayMode::SinglePage, 1.0);
+    let context = egui::Context::default();
+    arrow_navigation_frame(&context, &mut app, Vec::new());
+    let _ = context.run_ui(
+        egui::RawInput {
+            events: arrow_press(Key::ArrowRight),
+            ..Default::default()
+        },
+        |ui| {
+            app.handle_arrow_navigation(ui.ctx());
+            app.handle_arrow_navigation(ui.ctx());
+            assert_eq!(app.documents[0].view.current_page, 1);
+        },
+    );
+}
+
+fn arrow_navigation_frame(context: &egui::Context, app: &mut PrototypeApp, events: Vec<Event>) {
+    let modifiers = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Key { modifiers, .. } => Some(*modifiers),
+            _ => None,
+        })
+        .unwrap_or(Modifiers::NONE);
+    let _ = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0))),
+            events,
+            modifiers,
+            ..Default::default()
+        },
+        |ui| {
+            app.handle_shortcuts(ui.ctx());
+            app.menu_bar(ui);
+            app.toolbar(ui);
+            app.central_panel(ui, None);
+        },
+    );
+}
+
+#[test]
 fn single_page_view_line_wheel_navigates_pages_and_respects_boundaries() {
     let (_directory, mut app) = search_interaction_app(3);
     let context = egui::Context::default();

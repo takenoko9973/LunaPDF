@@ -1,15 +1,15 @@
 # PDF キーボードナビゲーション仕様
 
-この文書は今回採用した矢印キーの正式仕様である。**全ての矢印キー操作は採用・未実装**であり、現行アプリで操作できることを意味しない。実装時には以下の条件を適合条件として使う。
+この文書は矢印キー操作の正式仕様である。**矢印キー操作は実装確認**であり、末尾に記載した合成イベントによるヘッドレステストを実行している。GUI／OS の実機入力は未検証である。
 
 ## キー割り当て
 
 | キー | 連続表示 | 単ページ表示 | 採用状況 | 実装状況 |
 | --- | --- | --- | --- | --- |
-| ← | 前ページへ移動 | 前ページへ移動 | 採用 | 未実装 |
-| → | 次ページへ移動 | 次ページへ移動 | 採用 | 未実装 |
-| ↑ | 文書内を上方向へ連続スクロール | 現在ページ内を上方向へスクロールし、上端での次の独立した押下で前ページへ移動 | 採用 | 未実装 |
-| ↓ | 文書内を下方向へ連続スクロール | 現在ページ内を下方向へスクロールし、下端での次の独立した押下で次ページへ移動 | 採用 | 未実装 |
+| ← | 前ページへ移動 | 前ページへ移動 | 採用 | 実装確認 |
+| → | 次ページへ移動 | 次ページへ移動 | 採用 | 実装確認 |
+| ↑ | 文書内を上方向へ連続スクロール | 現在ページ内を上方向へスクロールし、上端での次の独立した押下で前ページへ移動 | 採用 | 実装確認 |
+| ↓ | 文書内を下方向へ連続スクロール | 現在ページ内を下方向へスクロールし、下端での次の独立した押下で次ページへ移動 | 採用 | 実装確認 |
 | PageUp | 前ページへ移動 | 前ページへ移動 | 既存仕様を維持 | 実装確認 |
 | PageDown | 次ページへ移動 | 次ページへ移動 | 既存仕様を維持 | 実装確認 |
 
@@ -31,16 +31,19 @@
 - 検索欄、ページ番号欄、注釈コメント欄などでテキストを編集中は、文字編集側のキー操作を優先する。
 - IME の変換候補選択や文字列内のカーソル移動を PDF 操作として横取りしない。
 - モーダルダイアログまたはメニューの操作中は、背後の PDF ペインへ矢印キーを送らない。
+- 入力先が不明なフォーカスも入力側に譲り、注釈エディターや候補ピッカーの表示中も PDF を操作しない。
 - 分割表示では、左右分割・上下分割のどちらでもフォーカス中の PDF ペインだけを操作する。
 - 対象は修飾キーを伴わない矢印キーに限る。Ctrl、Shift、Alt との組み合わせを新しい割り当てにしない。
 
 ## 既存キーとの関係
 
-PageUp と PageDown の既存仕様は維持する。現行実装では、テキスト入力にフォーカスがない場合、PageUp／PageDown が前後ページへの移動処理を呼び出す。←／→ の将来実装は、この既存処理と同じページ選択および文書境界の扱いを適合条件とする。ホイールとツールバーのページ移動も維持する。
+PageUp と PageDown の既存仕様は維持する。現行実装では、テキスト入力にフォーカスがない場合、PageUp／PageDown が前後ページへの移動処理を呼び出す。←／→ は、この既存処理と同じページ選択および文書境界の扱いを使う。ホイールとツールバーのページ移動も維持する。
 
-現行コードの [src/app.rs](../../src/app.rs) には PageUp／PageDown の処理と move_page があるが、ArrowLeft、ArrowRight、ArrowUp、ArrowDown の明示的なページナビゲーション処理はない。[src/app/navigation.rs](../../src/app/navigation.rs) のスクロール処理はホイール・ポインター操作を扱う。従って矢印キーの動作は現在確認された実装ではない。
+[src/app.rs](../../src/app.rs) の handle_arrow_navigation は、メニューとツールバーの構築後に入力所有権を確認する。PageUp／PageDown、ホイール、ポインター操作、明示的なパン、自動スクロールと競合したフレームは、既存操作を優先する。連続表示のページ移動・アンカー復元も上下キーより優先する。単ページ表示では復元した位置を開始位置として扱い、前フレームのページ遷移アンカーが残っていても新しい独立押下を受け付ける。
 
-## 実装時の適合確認
+[src/app/navigation.rs](../../src/app/navigation.rs) の ArrowNavigationState は Event::Key.repeat と解放イベントを区別し、同じ文書・表示モードで受け付けた押下のリピートだけを上下スクロールに使う。タブ・ペイン・表示モード・入力所有者の変更とウィンドウフォーカス喪失で押下状態を破棄し、同一フレームの重複処理を防ぐ。ScrollArea の確定した offset と可視サイズからスクロール上限を求め、保存状態と表示アンカーを同じ座標に更新する。単ページの端判定は処理開始位置を基準とし、平滑化されたスクロールの残りで端へ到達しても、その押下でページを跨がない。
+
+## 適合確認の範囲
 
 - 連続表示と単ページ表示の双方で、←／→ が1回の独立した押下につき前後1ページを移動する。
 - 連続表示で ↑／↓ が連続スクロールし、ページ境界でジャンプしない。
@@ -51,6 +54,24 @@ PageUp と PageDown の既存仕様は維持する。現行実装では、テキ
 - 左右分割と上下分割のそれぞれで、フォーカス中のペインだけが操作される。
 - PageUp／PageDown、ホイール、ツールバーのページ移動を回帰確認する。
 
-現行実装の確認箇所：[src/app.rs](../../src/app.rs) の handle_shortcuts、active_text_input_id、move_page、[src/app/navigation.rs](../../src/app/navigation.rs) の DisplayMode、single_page_wheel_steps、[src/app/search.rs](../../src/app/search.rs) の検索状態、[src/ui/annotation_editor.rs](../../src/ui/annotation_editor.rs) のコメント入力。
+現行実装の確認箇所：[src/app.rs](../../src/app.rs) の handle_shortcuts、handle_arrow_navigation、central_panel、continuous_view、single_page_view、move_page、jump_to_single_page_edge、[src/app/navigation.rs](../../src/app/navigation.rs) の ArrowNavigationState、scroll_area_state_id、adjacent_page_index、[src/app/search.rs](../../src/app/search.rs) の検索状態、[src/ui/annotation_editor.rs](../../src/ui/annotation_editor.rs) のコメント入力。
 
-矢印キーを対象にする既存テストは確認できていない。この文書整備では矢印キーを実装せず、実装用テストも追加していない。既存の隣接動作のテスト宣言は [src/app/tests.rs](../../src/app/tests.rs) の single_page_view_line_wheel_navigates_pages_and_respects_boundaries、single_page_wheel_does_not_cross_document_boundaries、page_input_accepts_only_one_based_in_range_numbers である。これらは矢印キー仕様のテスト結果ではない。
+## 検証記録（2026-10-22）
+
+対象 checkout と `/workspace` の実 bind mount の一致を確認した Dev Container で、以下を実行して合格した。コマンドは `docker exec -w /workspace 7bba2cfbb19b` に続けて実行したものである。テスト件数にはフィルター間の重複を含む。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo test --locked --bin lunapdf arrow_navigation` | 新規12件成功。左右・上下、押下／解放／リピート、端到達と再押下、復元アンカー、平滑化スクロール残留、入力保護、左右／上下分割のクリックによるフォーカス、非表示時のフォーカス喪失、同フレーム競合を合成入力で検証 |
+| `cargo test --locked --bin lunapdf single_page` | 既存7件成功。ホイール、境界、ズーム、セッションアンカー |
+| `cargo test --locked --bin lunapdf search_` | 既存15件成功。検索 Enter／Shift+Enter、IME、検索完了状態など |
+| `cargo test --locked --bin lunapdf page_input` | 既存4件成功 |
+| `cargo test --locked --bin lunapdf display_mode_roundtrip` | 既存1件成功 |
+| `cargo test --locked --bin lunapdf annotation_editor` | 既存14件成功 |
+| `cargo test --locked --bin lunapdf autoscroll` | 既存7件成功 |
+| `cargo test --locked --bin lunapdf pan` | 15件成功（今回追加した2件を含む） |
+| `cargo check --locked` | 型・コンパイル検査成功 |
+| `cargo fmt --all -- --check` | 整形検査成功 |
+| `cargo clippy --locked --bin lunapdf --tests -- -D warnings` | 警告なしで成功 |
+
+ホスト側の `git diff --check` も成功した。最初の左右キー回帰テストは実装前に失敗し、実装後に成功した。GUI、実際の OS キーリピート／IME、Windows 実機、配布物のビルドは今回の検証対象外であり、GUI未検証・実機未検証である。合成入力テストの成功を実機確認済みとは扱わない。

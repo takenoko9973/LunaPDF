@@ -1,5 +1,74 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct VerticalArrow {
+    pub(super) direction: isize,
+    pub(super) fresh_press: bool,
+}
+
+#[derive(Default)]
+pub(super) struct ArrowNavigationState {
+    owner: Option<(u64, DisplayMode)>,
+    held: [bool; 4],
+    frame: Option<u64>,
+}
+
+impl ArrowNavigationState {
+    pub(super) fn read(
+        &mut self,
+        context: &egui::Context,
+        owner: Option<(u64, DisplayMode)>,
+    ) -> Option<(Key, bool)> {
+        let frame = context.cumulative_frame_nr();
+        if self.frame == Some(frame) {
+            return None;
+        }
+        self.frame = Some(frame);
+        if self.owner != owner || owner.is_none() {
+            self.owner = owner;
+            self.held = [false; 4];
+        }
+        owner?;
+
+        let mut command = None;
+        context.input_mut(|input| {
+            input.events.retain(|event| {
+                let Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    return true;
+                };
+                let index = match key {
+                    Key::ArrowLeft => 0,
+                    Key::ArrowRight => 1,
+                    Key::ArrowUp => 2,
+                    Key::ArrowDown => 3,
+                    _ => return true,
+                };
+                if !pressed || modifiers.any() {
+                    self.held[index] = false;
+                    return modifiers.any();
+                }
+                let fresh_press = !repeat && !self.held[index];
+                let owned_repeat = *repeat && self.held[index] && index >= 2;
+                if !repeat {
+                    self.held[index] = true;
+                }
+                if command.is_none() && (fresh_press || owned_repeat) {
+                    command = Some((*key, fresh_press));
+                }
+                false
+            });
+        });
+        command
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DisplayMode {
     Continuous,

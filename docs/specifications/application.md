@@ -28,7 +28,7 @@ Windows インストーラーは PDF の「プログラムから開く」候補�
 
 **状態：実装確認**
 
-複数の PDF をタブで管理し、タブをドラッグして順序を変更できる。タブを別のタブの端へドラッグすると、その二つを左右または上下に並べて表示する。左右分割では画面幅、上下分割では画面高さに沿ってペインを配置し、仕切りのドラッグで比率を変更する。分割した片方へフォーカスを移しても両方の文書を表示し続ける。分割ペアはタブ列上の一つの切り替え単位として扱う。
+複数の PDF をタブで管理し、タブをドラッグして順序を変更できる。タブを別の文書のPDF表示領域の端へドラッグすると、その二つを左右または上下に分割して表示する。左右分割では画面幅、上下分割では画面高さに沿ってペインを配置し、仕切りのドラッグで比率を変更する。分割した片方へフォーカスを移しても両方の文書を表示し続ける。分割ペアはタブ列上の一つの切り替え単位として扱う。
 
 タブの閉じる操作では必要に応じて未保存編集の確認を行う。利用者が閉じたタブは直近に閉じたものから復元でき、保存済みの表示位置も引き継ぐ。
 
@@ -46,9 +46,9 @@ Windows インストーラーは PDF の「プログラムから開く」候補�
 
 単ページ表示の縦ホイールは、ポインターが PDF ビュー上にあり、Ctrl キーなしの縦入力で、表示ページの端にすでにいる場合にページを移動する。ページ端へ到達させるホイール入力自体は隣のページへ移動させない。ページ全体が縦に収まる場合は端で止まらず、上下のホイール入力で前後ページへ移動する。Ctrl 付き、横向き、PDF ビュー外のホイール入力はこのページ移動に使わない。
 
-矢印キーによる新しいナビゲーションは [keyboard-navigation.md](keyboard-navigation.md) に記載する。現行コードでは採用・未実装であり、この項目の実装確認には含めない。
+修飾キーなしの ←／→ は、独立した押下ごとに前後1ページへ移動する。↑／↓ は連続表示では文書内をスクロールし、単ページ表示ではページ内をスクロールした後、端での新たな押下だけで隣のページへ移動する。ページ遷移の自動リピートは行わず、入力欄、IME、メニュー、モーダルなどの入力を優先し、分割表示ではフォーカス中の PDF だけを操作する。詳細と合成入力テストの実行記録は [keyboard-navigation.md](keyboard-navigation.md) を参照。実機の GUI／OS 入力は未検証である。
 
-確認箇所：[src/app/navigation.rs](../../src/app/navigation.rs) の DisplayMode、ZoomMode、ViewState、single_page_wheel_steps、[src/app.rs](../../src/app.rs) の handle_shortcuts、move_page、update_fit_zoom、single_page_view、active_text_input_id。
+確認箇所：[src/app/navigation.rs](../../src/app/navigation.rs) の DisplayMode、ZoomMode、ViewState、ArrowNavigationState、single_page_wheel_steps、[src/app.rs](../../src/app.rs) の handle_shortcuts、handle_arrow_navigation、move_page、update_fit_zoom、continuous_view、single_page_view、active_text_input_id。
 
 既存テスト宣言：[src/app/tests.rs](../../src/app/tests.rs) の page_input_accepts_only_one_based_in_range_numbers、display_mode_roundtrip_preserves_page_and_normalized_position、fit_page_zoom_recalculates_after_window_resize、single_page_view_line_wheel_navigates_pages_and_respects_boundaries、single_page_wheel_ignores_control_horizontal_and_outside_input、single_page_wheel_does_not_cross_document_boundaries。
 
