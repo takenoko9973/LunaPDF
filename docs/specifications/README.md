@@ -7,7 +7,7 @@
 | 文書 | 扱う内容 |
 | --- | --- |
 | [application.md](application.md) | コードで実装を確認した、現在の主要機能と操作 |
-| [keyboard-navigation.md](keyboard-navigation.md) | 今回採用した矢印キー操作の正式仕様。実装状況も併記する |
+| [keyboard-navigation.md](keyboard-navigation.md) | 今回採用した矢印キー操作とキーリピートの正式仕様。実装状況も併記する |
 
 旧設計書は [初期設計アーカイブ](../archive/initial-design/pdf-viewer-plan-design.md) に保管する。作業資料の所在は [docs/tasks の索引](../tasks/README.md) を参照する。
 
@@ -35,6 +35,6 @@
 
 - 作成日：2026-10-22
 - 最終確認日：2026-10-22
-- 確認対象：main の commit 370a049577e706cefd4f9603f94f6e4657a525ee を基点とする矢印キーナビゲーションの実装・関連テスト・仕様書更新。Cargo package version 0.2.1（変更なし）。
-- 確認方法：該当コードの読解、Dev Container での矢印キー合成入力・ヘッドレス UI テスト12件と関連する既存テスト、型・コンパイル検査、整形・Clippy 検査、ホスト側の差分検査。実行コマンドと各結果は [矢印キー仕様の検証記録](keyboard-navigation.md#検証記録2026-10-22) を参照。
+- 確認対象：main HEAD `0ff28ac2000390ad924445255128979150652aa5` を基点とする矢印キーリピート対応、関連テスト、仕様書更新。Cargo package version 0.2.1（変更なし）。
+- 確認方法：矢印キー合成入力テストを実装前に更新して RED を確認し、実装後に GREEN を確認した。関連する既存テスト、型・コンパイル検査、整形検査、ホスト側の差分検査も実施した。各コマンドと結果は [今回の矢印キーリピート対応の検証記録](keyboard-navigation.md#矢印キーリピート対応の検証記録2026-10-22) を参照。
 - 未確認：GUI、OS 実機入力、Windows 実機、実プリンター、配布物ビルド。今回のテスト範囲外の機能について、新たに動作確認済みとはしていない。

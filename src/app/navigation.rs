@@ -3,7 +3,6 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(super) struct VerticalArrow {
     pub(super) direction: isize,
-    pub(super) fresh_press: bool,
 }
 
 #[derive(Default)]
@@ -18,7 +17,7 @@ impl ArrowNavigationState {
         &mut self,
         context: &egui::Context,
         owner: Option<(u64, DisplayMode)>,
-    ) -> Option<(Key, bool)> {
+    ) -> Option<Key> {
         let frame = context.cumulative_frame_nr();
         if self.frame == Some(frame) {
             return None;
@@ -55,12 +54,12 @@ impl ArrowNavigationState {
                     return modifiers.any();
                 }
                 let fresh_press = !repeat && !self.held[index];
-                let owned_repeat = *repeat && self.held[index] && index >= 2;
+                let owned_repeat = *repeat && self.held[index];
                 if !repeat {
                     self.held[index] = true;
                 }
                 if command.is_none() && (fresh_press || owned_repeat) {
-                    command = Some((*key, fresh_press));
+                    command = Some(*key);
                 }
                 false
             });

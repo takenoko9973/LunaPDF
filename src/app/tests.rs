@@ -3521,7 +3521,7 @@ fn single_page_wheel_does_not_cross_document_boundaries() {
 }
 
 #[test]
-fn arrow_navigation_horizontal_requires_independent_presses() {
+fn arrow_navigation_horizontal_repeats_owned_presses() {
     let (_directory, mut app) = search_interaction_app(3);
     app.documents[0].state = DocumentState::ReadyClean;
     let context = egui::Context::default();
@@ -3538,16 +3538,29 @@ fn arrow_navigation_horizontal_requires_independent_presses() {
         &mut app,
         vec![arrow_key(Key::ArrowRight, true, true, Modifiers::NONE)],
     );
+    assert_eq!(app.documents[0].view.current_page, 2);
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowRight, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.current_page, 2);
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowLeft));
     assert_eq!(app.documents[0].view.current_page, 1);
     arrow_navigation_frame(
         &context,
         &mut app,
-        vec![
-            arrow_key(Key::ArrowRight, false, false, Modifiers::NONE),
-            arrow_key(Key::ArrowRight, true, false, Modifiers::NONE),
-        ],
+        vec![arrow_key(Key::ArrowLeft, true, true, Modifiers::NONE)],
     );
-    assert_eq!(app.documents[0].view.current_page, 2);
+    assert_eq!(app.documents[0].view.current_page, 0);
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowLeft, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.current_page, 0);
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
+    assert_eq!(app.documents[0].view.current_page, 1);
 }
 
 fn arrow_key(key: Key, pressed: bool, repeat: bool, modifiers: Modifiers) -> Event {
@@ -3628,11 +3641,32 @@ fn arrow_navigation_horizontal_boundaries_modifiers_and_page_keys() {
             assert_eq!(app.documents[0].view.current_page, 0);
         }
         arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
-        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
-        arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowRight));
+        assert_eq!(app.documents[0].view.current_page, 1);
+        arrow_navigation_frame(
+            &context,
+            &mut app,
+            vec![arrow_key(Key::ArrowRight, true, true, Modifiers::NONE)],
+        );
+        arrow_navigation_frame(
+            &context,
+            &mut app,
+            vec![arrow_key(Key::ArrowRight, true, true, Modifiers::NONE)],
+        );
         assert_eq!(app.documents[0].view.current_page, 2);
         arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowLeft));
         assert_eq!(app.documents[0].view.current_page, 1);
+        arrow_navigation_frame(
+            &context,
+            &mut app,
+            vec![arrow_key(Key::ArrowLeft, true, true, Modifiers::NONE)],
+        );
+        assert_eq!(app.documents[0].view.current_page, 0);
+        arrow_navigation_frame(
+            &context,
+            &mut app,
+            vec![arrow_key(Key::ArrowLeft, true, true, Modifiers::NONE)],
+        );
+        assert_eq!(app.documents[0].view.current_page, 0);
         arrow_navigation_frame(&context, &mut app, arrow_press(Key::PageUp));
         assert_eq!(app.documents[0].view.current_page, 0);
         arrow_navigation_frame(&context, &mut app, arrow_press(Key::PageDown));
@@ -3671,11 +3705,21 @@ fn arrow_navigation_continuous_scrolls_through_boundaries_and_persists_offset() 
     assert!(
         (after_crossing.page_y_fraction - after_up.page_y_fraction - 40.0 / 800.0).abs() < 0.001
     );
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowUp, true, true, Modifiers::NONE)],
+    );
+    let after_up_repeat = app.documents[0].view.center_anchor.unwrap();
+    assert_eq!(after_crossing.page_index, after_up_repeat.page_index);
+    assert!(
+        (after_up.page_y_fraction - after_up_repeat.page_y_fraction - 40.0 / 800.0).abs() < 0.001
+    );
     assert!(app.documents[0].view.scroll_to_page.is_none());
 }
 
 #[test]
-fn arrow_navigation_single_scrolls_then_requires_new_press_at_edges() {
+fn arrow_navigation_single_scrolls_then_repeats_across_edges() {
     let (_directory, mut app) = search_interaction_app(3);
     prepare_arrow_view(&mut app, DisplayMode::SinglePage, 4.0);
     for bounds in &mut app.documents[0].info.as_mut().unwrap().page_bounds {
@@ -3701,23 +3745,36 @@ fn arrow_navigation_single_scrolls_then_requires_new_press_at_edges() {
     arrow_navigation_frame(&context, &mut app, Vec::new());
     arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
     assert_eq!(app.documents[0].view.current_page, 0);
-    for _ in 0..10 {
-        arrow_navigation_frame(
-            &context,
-            &mut app,
-            vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
-        );
-    }
-    assert_eq!(app.documents[0].view.current_page, 0);
-    let bottom = app.documents[0].view.single_center_anchor.unwrap();
-    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+    );
     assert_eq!(app.documents[0].view.current_page, 1);
+    let bottom = app.documents[0].view.single_center_anchor.unwrap();
     assert_eq!(
         app.documents[0].view.restore_single_anchor,
         Some(Vec2::new(bottom.x, 0.0))
     );
-    // 前フレームの edge anchor の復元と新規押下が同じフレームでも入力を捨てない。
+    // 上端へ到達させる入力ではページを跨がず、端にいる次の repeat で前へ移動する。
+    app.documents[0].view.restore_single_anchor = Some(Vec2::new(bottom.x, 0.18));
+    arrow_navigation_frame(&context, &mut app, Vec::new());
     arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowUp));
+    assert_eq!(app.documents[0].view.current_page, 1);
+    let mut moved_to_previous_page = false;
+    for _ in 0..5 {
+        arrow_navigation_frame(
+            &context,
+            &mut app,
+            vec![arrow_key(Key::ArrowUp, true, true, Modifiers::NONE)],
+        );
+        if app.documents[0].view.current_page == 0 {
+            moved_to_previous_page = true;
+            break;
+        }
+        assert_eq!(app.documents[0].view.current_page, 1);
+    }
+    assert!(moved_to_previous_page);
     assert_eq!(app.documents[0].view.current_page, 0);
     assert_eq!(
         app.documents[0].view.restore_single_anchor,
@@ -3733,7 +3790,7 @@ fn arrow_navigation_single_scrolls_then_requires_new_press_at_edges() {
 }
 
 #[test]
-fn arrow_navigation_single_fitted_pages_accept_consecutive_independent_presses() {
+fn arrow_navigation_single_fitted_pages_accept_repeats_and_respect_boundaries() {
     let (_directory, mut app) = search_interaction_app(3);
     prepare_arrow_view(&mut app, DisplayMode::SinglePage, 1.0);
     let context = egui::Context::default();
@@ -3751,14 +3808,33 @@ fn arrow_navigation_single_fitted_pages_accept_consecutive_independent_presses()
         assert_eq!(app.documents[0].view.current_page, expected);
     }
     arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
-    for _ in 0..3 {
-        arrow_navigation_frame(
-            &context,
-            &mut app,
-            vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
-        );
-        assert_eq!(app.documents[0].view.current_page, 1);
-    }
+    assert_eq!(app.documents[0].view.current_page, 1);
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.current_page, 2);
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.current_page, 2);
+    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowUp));
+    assert_eq!(app.documents[0].view.current_page, 1);
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowUp, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.current_page, 0);
+    arrow_navigation_frame(
+        &context,
+        &mut app,
+        vec![arrow_key(Key::ArrowUp, true, true, Modifiers::NONE)],
+    );
+    assert_eq!(app.documents[0].view.current_page, 0);
 }
 
 #[test]
@@ -3940,8 +4016,6 @@ fn arrow_navigation_single_does_not_jump_when_residual_scroll_reaches_edge() {
         &mut app,
         vec![arrow_key(Key::ArrowDown, true, true, Modifiers::NONE)],
     );
-    assert_eq!(app.documents[0].view.current_page, 0);
-    arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
     assert_eq!(app.documents[0].view.current_page, 1);
 }
 

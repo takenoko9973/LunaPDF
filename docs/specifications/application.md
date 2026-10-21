@@ -46,7 +46,7 @@ Windows インストーラーは PDF の「プログラムから開く」候補�
 
 単ページ表示の縦ホイールは、ポインターが PDF ビュー上にあり、Ctrl キーなしの縦入力で、表示ページの端にすでにいる場合にページを移動する。ページ端へ到達させるホイール入力自体は隣のページへ移動させない。ページ全体が縦に収まる場合は端で止まらず、上下のホイール入力で前後ページへ移動する。Ctrl 付き、横向き、PDF ビュー外のホイール入力はこのページ移動に使わない。
 
-修飾キーなしの ←／→ は、独立した押下ごとに前後1ページへ移動する。↑／↓ は連続表示では文書内をスクロールし、単ページ表示ではページ内をスクロールした後、端での新たな押下だけで隣のページへ移動する。ページ遷移の自動リピートは行わず、入力欄、IME、メニュー、モーダルなどの入力を優先し、分割表示ではフォーカス中の PDF だけを操作する。詳細と合成入力テストの実行記録は [keyboard-navigation.md](keyboard-navigation.md) を参照。実機の GUI／OS 入力は未検証である。
+修飾キーなしの矢印キーは、同じ文書・表示モードで受け付けた押下の OS キーリピートも操作に使い、repeat イベント1回につき1ページ移動または1回分のスクロールを行う。←／→ は各イベントで前後1ページへ移動する。↑／↓ は連続表示では文書内をスクロールし、単ページ表示ではページ内スクロールを優先する。開始時に端でなかったイベントが端へ到達してもページを跨がず、端にいる状態で届いた次の押下または有効な repeat で隣のページへ移動する。ページ全体が縦に収まる場合は ↑／↓ の各イベントで1ページ移動する。入力欄、IME、メニュー、モーダルなどの入力を優先し、分割表示ではフォーカス中の PDF だけを操作する。所有状態が切れた後の repeat は操作に使わない。詳細と合成入力テストの実行記録は [keyboard-navigation.md](keyboard-navigation.md) を参照。実機の GUI／OS 入力は未検証である。
 
 確認箇所：[src/app/navigation.rs](../../src/app/navigation.rs) の DisplayMode、ZoomMode、ViewState、ArrowNavigationState、single_page_wheel_steps、[src/app.rs](../../src/app.rs) の handle_shortcuts、handle_arrow_navigation、move_page、update_fit_zoom、continuous_view、single_page_view、active_text_input_id。
 

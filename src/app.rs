@@ -2187,14 +2187,13 @@ impl PrototypeApp {
                 })
             })
             .flatten();
-        let (key, fresh_press) = self.arrow_navigation.read(context, owner)?;
+        let key = self.arrow_navigation.read(context, owner)?;
         match key {
             Key::ArrowLeft => self.move_page(-1),
             Key::ArrowRight => self.move_page(1),
             Key::ArrowUp | Key::ArrowDown => {
                 return Some(VerticalArrow {
                     direction: if key == Key::ArrowDown { 1 } else { -1 },
-                    fresh_press,
                 });
             }
             _ => unreachable!("arrow input was filtered"),
@@ -5852,7 +5851,7 @@ impl PrototypeApp {
             } else {
                 keyboard_start.y <= SINGLE_PAGE_EDGE_TOLERANCE_POINTS
             };
-            if at_edge && keyboard.fresh_press {
+            if at_edge {
                 keyboard_page_delta = keyboard.direction;
             } else {
                 output.state.offset.y = (output.state.offset.y + keyboard.direction as f32 * 40.0)
