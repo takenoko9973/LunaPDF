@@ -69,7 +69,7 @@ use crate::ui::viewport::{
 };
 
 use navigation::{
-    ArrowNavigationState, AutoscrollOffsets, DisplayMode, VerticalArrow, ViewState, ZoomMode,
+    ArrowNavigationState, AutoscrollOffsets, DisplayMode, NavigationArrow, ViewState, ZoomMode,
     adjacent_page_index, clamp_scroll_offset, normalized_page_point, paint_autoscroll_marker,
     pointer_over_any_rect, scroll_area_state_id, single_page_centered_offset, single_page_geometry,
     single_page_wheel_steps, update_autoscroll,
@@ -2141,7 +2141,7 @@ impl PrototypeApp {
         self.active_text_input_id(context).is_some()
     }
 
-    fn handle_arrow_navigation(&mut self, context: &egui::Context) -> Option<VerticalArrow> {
+    fn handle_arrow_navigation(&mut self, context: &egui::Context) -> Option<NavigationArrow> {
         // UI 構築前のショートカットとは分け、同フレームに開いたメニューや入力欄にも
         // 所有権を譲る。未知のフォーカス先も文書操作より優先する。
         let explicit_navigation = self.active_index().is_some_and(|index| {
@@ -2187,18 +2187,7 @@ impl PrototypeApp {
                 })
             })
             .flatten();
-        let key = self.arrow_navigation.read(context, owner)?;
-        match key {
-            Key::ArrowLeft => self.move_page(-1),
-            Key::ArrowRight => self.move_page(1),
-            Key::ArrowUp | Key::ArrowDown => {
-                return Some(VerticalArrow {
-                    direction: if key == Key::ArrowDown { 1 } else { -1 },
-                });
-            }
-            _ => unreachable!("arrow input was filtered"),
-        }
-        None
+        self.arrow_navigation.read(context, owner)
     }
 
     fn active_index(&self) -> Option<usize> {
@@ -4936,7 +4925,7 @@ impl PrototypeApp {
         ui: &mut egui::Ui,
         side: SplitSide,
         tab_id: TabId,
-        keyboard: Option<VerticalArrow>,
+        keyboard: Option<NavigationArrow>,
     ) {
         let index = self
             .tabs
@@ -5464,7 +5453,7 @@ impl PrototypeApp {
         ui: &mut egui::Ui,
         side: SplitSide,
         index: usize,
-        keyboard: Option<VerticalArrow>,
+        keyboard: Option<NavigationArrow>,
     ) {
         let document_id = self.documents[index].document_id;
         if self.documents[index].view.autoscroll.is_some() {
@@ -5522,6 +5511,10 @@ impl PrototypeApp {
             .autoscroll
             .and_then(|autoscroll| autoscroll.requested_offset);
         let pan_offset = tab.view.pan_requested_offset.take();
+        let scroll_id = scroll_area_state_id(ui, ("continuous-pdf", &path));
+        let starting_offset = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+            .map(|state| state.offset)
+            .unwrap_or(Vec2::ZERO);
         let mut scroll_area = egui::ScrollArea::both()
             .id_salt(("continuous-pdf", &path))
             .auto_shrink([false, false]);
@@ -5639,21 +5632,101 @@ impl PrototypeApp {
         });
 
         let maximum_offset = (output.content_size - output.inner_rect.size()).max(Vec2::ZERO);
-        if jump_offset.or(pan_offset).or(autoscroll_offset).is_none()
-            && let Some(keyboard) = keyboard
+        let other_position_owner = jump_offset.or(pan_offset).or(autoscroll_offset).is_some()
+            || ui.input(|input| {
+                input
+                    .raw
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::MouseWheel { .. } | Event::Zoom(_)))
+            });
+        if other_position_owner
+            || tab
+                .view
+                .continuous_arrow_position
+                .is_some_and(|(page, offset)| {
+                    page != tab.view.current_page || (offset - output.state.offset).length() > 0.01
+                })
         {
-            // ScrollArea が確定した実際の可視サイズを使う。保存した offset とアンカーを
-            // 同じ座標へ揃え、次フレームの描画へ引き継ぐ。
-            output.state.offset.y = (output.state.offset.y + keyboard.direction as f32 * 40.0)
-                .clamp(0.0, maximum_offset.y);
-            output.state.store(ui.ctx(), output.id);
-            ui.ctx().request_repaint();
+            tab.view.continuous_arrow_position = None;
         }
-        if let Some(page) = layout.page_at_y(output.state.offset.y + 1.0) {
+        if tab.view.continuous_arrow_position.is_none()
+            && keyboard.is_none()
+            && let Some(page) = layout.page_at_y(output.state.offset.y + 1.0)
+        {
             tab.view.current_page = page;
         }
+        if !other_position_owner && let Some(keyboard) = keyboard {
+            let page = tab.view.current_page;
+            let placement = layout.placement(page).expect("current page exists");
+            let rect = Rect::from_min_size(
+                Pos2::new(placement.x, placement.y),
+                Vec2::new(placement.width, placement.height),
+            );
+            let axis = keyboard.axis;
+            let viewport_size = output.inner_rect.size();
+            // 連続表示の文書offsetを、選択ページの余白を含む範囲へ限定する。
+            let minimum = (rect.min.to_vec2() - Vec2::splat(PAGE_GAP)).max(Vec2::ZERO);
+            let maximum = (rect.max.to_vec2() + Vec2::splat(PAGE_GAP) - viewport_size)
+                .max(minimum)
+                .min(maximum_offset);
+            let minimum = minimum.min(maximum_offset);
+            let at_edge = if keyboard.direction > 0 {
+                starting_offset[axis] >= maximum[axis] - SINGLE_PAGE_EDGE_TOLERANCE_POINTS
+            } else {
+                starting_offset[axis] <= minimum[axis] + SINGLE_PAGE_EDGE_TOLERANCE_POINTS
+            };
+            let fits = rect.size()[axis] <= viewport_size[axis];
+            if self.arrow_navigation.crosses_page(keyboard, fits, at_edge) {
+                if let Some(target) =
+                    adjacent_page_index(page, page_bounds.len(), keyboard.direction)
+                {
+                    let center = normalized_page_point(
+                        rect,
+                        (output.state.offset + viewport_size / 2.0).to_pos2(),
+                    );
+                    let anchor = keyboard.edge_anchor(center);
+                    let target_rect = layout.placement(target).expect("adjacent page exists");
+                    let target_min = Vec2::new(target_rect.x, target_rect.y);
+                    let target_size = Vec2::new(target_rect.width, target_rect.height);
+                    let mut offset = target_min + target_size * anchor - viewport_size / 2.0;
+                    offset[axis] = if keyboard.direction > 0 {
+                        target_min[axis] - PAGE_GAP
+                    } else {
+                        target_min[axis] + target_size[axis] + PAGE_GAP - viewport_size[axis]
+                    };
+                    output.state.offset = clamp_scroll_offset(offset, maximum_offset);
+                    tab.set_page_index(target);
+                }
+            } else if !fits {
+                output.state.offset[axis] = (output.state.offset[axis]
+                    + keyboard.direction as f32 * 40.0)
+                    .clamp(minimum[axis], maximum[axis]);
+            }
+            output.state.store(ui.ctx(), output.id);
+            tab.view.continuous_arrow_position = Some((tab.view.current_page, output.state.offset));
+            ui.ctx().request_repaint();
+        }
         let viewport_center = output.state.offset + output.inner_rect.size() / 2.0;
-        tab.view.center_anchor = layout.anchor_at(viewport_center.x, viewport_center.y);
+        tab.view.center_anchor = if tab.view.continuous_arrow_position.is_some() {
+            // 小ページが複数見える場合も、矢印が選択したページをidleで上書きしない。
+            layout.placement(tab.view.current_page).map(|placement| {
+                let center = normalized_page_point(
+                    Rect::from_min_size(
+                        Pos2::new(placement.x, placement.y),
+                        Vec2::new(placement.width, placement.height),
+                    ),
+                    viewport_center.to_pos2(),
+                );
+                PageAnchor {
+                    page_index: tab.view.current_page,
+                    page_x_fraction: center.x,
+                    page_y_fraction: center.y,
+                }
+            })
+        } else {
+            layout.anchor_at(viewport_center.x, viewport_center.y)
+        };
         let excluded_rects = editor_input_rect.into_iter().collect::<Vec<_>>();
         let background_interaction = viewport.interact_background(
             ui,
@@ -5714,7 +5787,7 @@ impl PrototypeApp {
         ui: &mut egui::Ui,
         side: SplitSide,
         index: usize,
-        keyboard: Option<VerticalArrow>,
+        keyboard: Option<NavigationArrow>,
     ) {
         let document_id = self.documents[index].document_id;
         let suppress_annotation_hover = self.documents[index].view.autoscroll.is_some()
@@ -5840,22 +5913,25 @@ impl PrototypeApp {
         if pan_offset.is_none()
             && let Some(keyboard) = keyboard
         {
-            // ScrollArea 内で進む慣性・平滑化による端到達も、今回の押下のページ遷移には
-            // 兼用しない。復元された開始位置を実際の最大 offset に収めて判定する。
+            // 平滑化スクロールの残留による端到達を、押し始めから端だったことにしない。
             let keyboard_start = clamp_scroll_offset(
                 restored_offset.unwrap_or(stored_offset),
                 maximum_output_offset,
             );
+            let axis = keyboard.axis;
             let at_edge = if keyboard.direction > 0 {
-                keyboard_start.y >= maximum_output_offset.y - SINGLE_PAGE_EDGE_TOLERANCE_POINTS
+                keyboard_start[axis]
+                    >= maximum_output_offset[axis] - SINGLE_PAGE_EDGE_TOLERANCE_POINTS
             } else {
-                keyboard_start.y <= SINGLE_PAGE_EDGE_TOLERANCE_POINTS
+                keyboard_start[axis] <= SINGLE_PAGE_EDGE_TOLERANCE_POINTS
             };
-            if at_edge {
+            let fits = page_content_rect.size()[axis] <= output.inner_rect.size()[axis];
+            if self.arrow_navigation.crosses_page(keyboard, fits, at_edge) {
                 keyboard_page_delta = keyboard.direction;
-            } else {
-                output.state.offset.y = (output.state.offset.y + keyboard.direction as f32 * 40.0)
-                    .clamp(0.0, maximum_output_offset.y);
+            } else if !fits {
+                output.state.offset[axis] = (output.state.offset[axis]
+                    + keyboard.direction as f32 * 40.0)
+                    .clamp(0.0, maximum_output_offset[axis]);
                 output.state.store(ui.ctx(), output.id);
                 ui.ctx().request_repaint();
             }
@@ -5913,10 +5989,16 @@ impl PrototypeApp {
         if page_delta != 0
             && let Some(target) = adjacent_page_index(page_index, page_count, page_delta)
         {
-            let x = tab.view.single_center_anchor.unwrap_or(Vec2::splat(0.5)).x;
-            // ホイールと上下キーのどちらでも、次ページは上端、前ページは下端から入る。
-            let y = if page_delta > 0 { 0.0 } else { 1.0 };
-            tab.jump_to_single_page_edge(target, Vec2::new(x, y));
+            let center = tab.view.single_center_anchor.unwrap_or(Vec2::splat(0.5));
+            let anchor = if wheel_page_delta == 0 {
+                keyboard
+                    .expect("keyboard page step has an arrow")
+                    .edge_anchor(center)
+            } else {
+                // ホイールの上下方向と既存の端アンカーは変更しない。
+                Vec2::new(center.x, if page_delta > 0 { 0.0 } else { 1.0 })
+            };
+            tab.jump_to_single_page_edge(target, anchor);
         }
 
         let blank_pan_active = viewport.blank_pan_in_progress();
@@ -6380,6 +6462,7 @@ impl DocumentTab {
                 .begin_page_transition(page_index, Instant::now());
         }
         self.page_input_error = None;
+        self.view.continuous_arrow_position = None;
         self.view.current_page = page_index;
         true
     }

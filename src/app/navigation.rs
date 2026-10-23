@@ -1,14 +1,25 @@
 use super::*;
 
 #[derive(Clone, Copy)]
-pub(super) struct VerticalArrow {
+pub(super) struct NavigationArrow {
     pub(super) direction: isize,
+    pub(super) axis: usize,
+    index: usize,
+    fresh_press: bool,
+}
+
+impl NavigationArrow {
+    pub(super) fn edge_anchor(self, mut center: Vec2) -> Vec2 {
+        center[self.axis] = if self.direction > 0 { 0.0 } else { 1.0 };
+        center
+    }
 }
 
 #[derive(Default)]
 pub(super) struct ArrowNavigationState {
     owner: Option<(u64, DisplayMode)>,
     held: [bool; 4],
+    overflow_hold: [bool; 4],
     frame: Option<u64>,
 }
 
@@ -17,7 +28,7 @@ impl ArrowNavigationState {
         &mut self,
         context: &egui::Context,
         owner: Option<(u64, DisplayMode)>,
-    ) -> Option<Key> {
+    ) -> Option<NavigationArrow> {
         let frame = context.cumulative_frame_nr();
         if self.frame == Some(frame) {
             return None;
@@ -26,6 +37,7 @@ impl ArrowNavigationState {
         if self.owner != owner || owner.is_none() {
             self.owner = owner;
             self.held = [false; 4];
+            self.overflow_hold = [false; 4];
         }
         owner?;
 
@@ -51,6 +63,7 @@ impl ArrowNavigationState {
                 };
                 if !pressed || modifiers.any() {
                     self.held[index] = false;
+                    self.overflow_hold[index] = false;
                     return modifiers.any();
                 }
                 let fresh_press = !repeat && !self.held[index];
@@ -58,13 +71,35 @@ impl ArrowNavigationState {
                 if !repeat {
                     self.held[index] = true;
                 }
+                if fresh_press {
+                    self.overflow_hold[index] = false;
+                }
                 if command.is_none() && (fresh_press || owned_repeat) {
-                    command = Some(*key);
+                    command = Some(NavigationArrow {
+                        direction: if index % 2 == 1 { 1 } else { -1 },
+                        axis: if index < 2 { 0 } else { 1 },
+                        index,
+                        fresh_press,
+                    });
                 }
                 false
             });
         });
         command
+    }
+
+    pub(super) fn crosses_page(
+        &mut self,
+        arrow: NavigationArrow,
+        page_fits: bool,
+        at_edge: bool,
+    ) -> bool {
+        if !page_fits {
+            // overflow を扱った hold は、移動先が小さくてもページを再度跨がない。
+            self.overflow_hold[arrow.index] = true;
+            return arrow.fresh_press && at_edge;
+        }
+        !self.overflow_hold[arrow.index]
     }
 }
 
@@ -91,6 +126,7 @@ pub(super) struct ViewState {
     pub(super) restore_anchor: Option<PageAnchor>,
     pub(super) single_center_anchor: Option<Vec2>,
     pub(super) restore_single_anchor: Option<Vec2>,
+    pub(super) continuous_arrow_position: Option<(usize, Vec2)>,
     pub(super) single_wheel: SinglePageWheelState,
     pub(super) autoscroll: Option<AutoscrollState>,
     pub(super) pan_requested_offset: Option<Vec2>,
@@ -427,6 +463,7 @@ impl ViewState {
             restore_anchor: None,
             single_center_anchor: None,
             restore_single_anchor: None,
+            continuous_arrow_position: None,
             single_wheel: SinglePageWheelState::default(),
             autoscroll: None,
             pan_requested_offset: None,
@@ -464,6 +501,7 @@ impl ViewState {
                 .then_some(single_anchor),
             restore_single_anchor: (display_mode == DisplayMode::SinglePage)
                 .then_some(single_anchor),
+            continuous_arrow_position: None,
             single_wheel: SinglePageWheelState::default(),
             autoscroll: None,
             pan_requested_offset: None,
@@ -570,6 +608,7 @@ impl ViewState {
             _ => unreachable!("LunaPDF has exactly two display modes"),
         }
         self.display_mode = mode;
+        self.continuous_arrow_position = None;
         // どちらのポインタースクロールモードも現在の ScrollArea の座標系でオフセットを
         // 保存する。モード切り替え時は別レイアウトを表示する前にアンカーと保留中の
         // 2 軸移動を破棄しなければならない。
