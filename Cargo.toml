@@ -1,6 +1,6 @@
 [package]
 name = "lunapdf"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A lightweight desktop PDF viewer"
@@ -9,10 +9,18 @@ license = "AGPL-3.0-only"
 [dependencies]
 anyhow = "1.0.103"
 crossbeam-channel = "0.5.16"
-eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.35.0", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui_extras = { version = "0.35.0", features = ["svg"] }
 memory-stats = "1.2.0"
-mupdf = { version = "0.8.0", default-features = false, features = ["base14-fonts", "system-fonts"] }
+mupdf = { version = "0.8.0", default-features = false, features = [
+    "base14-fonts",
+    "system-fonts",
+] }
 rfd = "0.17.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -37,6 +45,11 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+font-kit = { version = "0.14.3", default-features = false, features = [
+    "source",
+] }
+
 [build-dependencies]
 winresource = "0.1.31"
 
@@ -46,8 +59,6 @@ ProductName = "LunaPDF"
 FileDescription = "LunaPDF PDF viewer"
 LegalCopyright = "Copyright © 2026 LunaPDF contributors"
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-font-kit = { version = "0.14.3", default-features = false, features = ["source"] }
 
 [profile.release]
 strip = "symbols"
