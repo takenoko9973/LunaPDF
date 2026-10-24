@@ -239,11 +239,13 @@ fn replace_with_blank_pdf(path: &Path, replacement: &Path) {
     std::fs::rename(replacement, path).unwrap();
 }
 
-fn overwrite_with_blank_pdf(path: &Path, replacement: &Path) {
-    write_blank_pdf(replacement);
-    let mut bytes = std::fs::read(replacement).unwrap();
-    bytes.extend_from_slice(b"\n% external replacement\n");
-    std::fs::write(path, bytes).unwrap();
+fn overwrite_with_blank_pdf(path: &Path, replacement: &Path, page_count: usize) {
+    let mut document = PdfDocument::new();
+    for _ in 0..page_count {
+        let _page = document.new_page(Size::new(300.0, 400.0)).unwrap();
+    }
+    document.save(replacement.to_str().unwrap()).unwrap();
+    std::fs::write(path, std::fs::read(replacement).unwrap()).unwrap();
 }
 
 fn saved_tab(path: PathBuf, page_index: usize) -> SessionTab {
@@ -555,7 +557,7 @@ fn create_dirty_external_conflict(app: &mut PrototypeApp, path: &Path) -> Docume
 
     let expected = app.documents[0].info.as_ref().unwrap().version;
     let replacement = path.with_file_name("external-conflict-replacement.pdf");
-    overwrite_with_blank_pdf(path, &replacement);
+    overwrite_with_blank_pdf(path, &replacement, 2);
     let current = read_document_version(path).unwrap();
     assert!(same_file_identity(current, expected));
     assert_ne!(current, expected);
@@ -659,8 +661,17 @@ fn conflicted_reload_holds_edits_until_latest_external_version_loads() {
 
     app.request_conflicted_document_reload_confirmation(document_id);
     let newest_replacement = path.with_file_name("conflicted-reload-newest.pdf");
-    overwrite_with_blank_pdf(&path, &newest_replacement);
+    overwrite_with_blank_pdf(&path, &newest_replacement, 3);
+    // 更新時刻の分解能に依存せず、外部版を区別できる fixture にする。
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(conflict_version.modified)
+        .unwrap();
     let newest_version = read_document_version(&path).unwrap();
+    assert_eq!(newest_version.modified, conflict_version.modified);
+    assert_ne!(newest_version.length, conflict_version.length);
     assert_ne!(newest_version, conflict_version);
     app.confirm_conflicted_document_reload();
 
@@ -699,6 +710,7 @@ fn conflicted_reload_holds_edits_until_latest_external_version_loads() {
         app.documents[0].info.as_ref().unwrap().version,
         newest_version
     );
+    assert_eq!(app.documents[0].info.as_ref().unwrap().page_bounds.len(), 3);
     assert!(app.documents[0].edit_history.is_empty());
     assert!(app.documents[0].external_conflict.is_none());
     assert!(app.annotation_editor.is_none());
@@ -1273,7 +1285,11 @@ fn reload_in_flight_close_does_not_mix_delayed_event_into_remaining_tab() {
     finish_async_document_opens(&mut app);
     let remaining_id = app.documents[1].document_id;
     let remaining_version = app.documents[1].info.as_ref().unwrap().version;
-    overwrite_with_blank_pdf(&first, &directory_path.join("reload-close-replacement.pdf"));
+    overwrite_with_blank_pdf(
+        &first,
+        &directory_path.join("reload-close-replacement.pdf"),
+        2,
+    );
 
     for _ in 0..2 {
         app.last_external_check = Instant::now() - Duration::from_secs(1);
@@ -1367,6 +1383,7 @@ fn reload_send_disables_annotation_editor_in_the_production_overlay_path() {
     overwrite_with_blank_pdf(
         &path,
         &directory.path().join("reload-editor-replacement.pdf"),
+        2,
     );
 
     for _ in 0..2 {
