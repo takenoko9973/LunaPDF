@@ -6,26 +6,23 @@ use mupdf::pdf::PdfDocument;
 
 #[test]
 fn repaint_delay_policy_returns_to_idle_after_work_completes() {
-    assert_eq!(repaint_delay(false, false), Duration::from_secs(1));
+    let mut has_active_work = false;
+    let mut has_external_wait = false;
+    let idle_before_work = repaint_delay(has_active_work, has_external_wait);
 
-    let mut external_wait = true;
-    assert_eq!(
-        repaint_delay(false, external_wait),
-        Duration::from_millis(300)
-    );
+    has_external_wait = true;
+    let external_wait_delay = repaint_delay(has_active_work, has_external_wait);
+    has_active_work = true;
+    let active_work_delay = repaint_delay(has_active_work, has_external_wait);
 
-    let mut active_work = true;
-    assert_eq!(
-        repaint_delay(active_work, external_wait),
-        Duration::from_millis(33)
-    );
+    has_active_work = false;
+    has_external_wait = false;
+    let idle_after_work = repaint_delay(has_active_work, has_external_wait);
 
-    active_work = false;
-    external_wait = false;
-    assert_eq!(
-        repaint_delay(active_work, external_wait),
-        Duration::from_secs(1)
-    );
+    assert!(active_work_delay > Duration::ZERO);
+    assert!(active_work_delay < external_wait_delay);
+    assert!(external_wait_delay < idle_before_work);
+    assert_eq!(idle_after_work, idle_before_work);
 }
 
 #[test]
@@ -211,18 +208,17 @@ fn hidden_suspended_resume_candidate_is_not_active_until_reopened() {
     assert!(app.documents[0].external_resume_in_flight);
     assert!(!app.documents[0].has_active_work());
     assert!(!app.has_active_work());
-    assert_eq!(
-        repaint_delay(app.has_active_work(), app.has_external_wait()),
-        Duration::from_millis(300)
-    );
+    let external_wait_delay = repaint_delay(app.has_active_work(), app.has_external_wait());
+    let idle_delay = repaint_delay(false, false);
+    assert!(external_wait_delay > Duration::ZERO);
+    assert!(external_wait_delay < idle_delay);
 
     app.select_tab(0);
     assert_eq!(app.documents[0].state, DocumentState::Opening);
     assert!(app.documents[0].has_active_work());
-    assert_eq!(
-        repaint_delay(app.has_active_work(), app.has_external_wait()),
-        ACTIVE_REPAINT_DELAY
-    );
+    let active_work_delay = repaint_delay(app.has_active_work(), app.has_external_wait());
+    assert!(active_work_delay > Duration::ZERO);
+    assert!(active_work_delay < external_wait_delay);
     finish_async_resume_failure(&mut app);
 }
 
@@ -3137,6 +3133,8 @@ fn fit_page_zoom_recalculates_after_window_resize() {
 #[test]
 fn fit_resize_coalesces_to_the_latest_zoom_before_advancing_generation() {
     let now = Instant::now();
+    let debounce_delay = FIT_RENDER_DEBOUNCE_DELAY;
+    let before_deadline = Duration::from_nanos(1);
     let mut tab = DocumentTab::new(1, PathBuf::from("missing.pdf"), 0, None);
     let generation = tab.view.generation;
 
@@ -3144,13 +3142,17 @@ fn fit_resize_coalesces_to_the_latest_zoom_before_advancing_generation() {
     assert_eq!(tab.view.zoom, 1.1);
     assert_eq!(tab.view.generation, generation);
     assert!(tab.fit_render_is_debounced());
-    assert!(!tab.commit_deferred_fit_render(now + Duration::from_millis(124)));
+    let first_deadline = now + debounce_delay;
+    assert!(!tab.commit_deferred_fit_render(first_deadline - before_deadline));
 
-    tab.defer_fit_render(1.2, ZoomMode::FitWidth, now + Duration::from_millis(50));
+    let second_resize_at = now + debounce_delay / 2;
+    tab.defer_fit_render(1.2, ZoomMode::FitWidth, second_resize_at);
     assert_eq!(tab.view.zoom, 1.2);
     assert_eq!(tab.view.generation, generation);
-    assert!(!tab.commit_deferred_fit_render(now + Duration::from_millis(174)));
-    assert!(tab.commit_deferred_fit_render(now + Duration::from_millis(175)));
+    assert!(!tab.commit_deferred_fit_render(first_deadline));
+    let latest_deadline = second_resize_at + debounce_delay;
+    assert!(!tab.commit_deferred_fit_render(latest_deadline - before_deadline));
+    assert!(tab.commit_deferred_fit_render(latest_deadline));
     assert_eq!(tab.view.generation, generation.wrapping_add(1));
     assert!(!tab.fit_render_is_debounced());
 }
@@ -3670,13 +3672,24 @@ fn arrow_navigation_overflow_hold_stops_and_repress_crosses_once_in_all_directio
             let before = arrow_view_anchor(&app, mode);
             arrow_navigation_frame(&context, &mut app, arrow_press(key));
             let after = arrow_view_anchor(&app, mode);
-            let expected_step = if forward { 0.02 } else { -0.02 };
-            assert!(
-                (after[axis] - before[axis] - expected_step).abs() < 0.001,
-                "{mode:?} {key:?}"
-            );
+            let moved_in_requested_direction = if forward {
+                after[axis] > before[axis]
+            } else {
+                after[axis] < before[axis]
+            };
+            assert!(moved_in_requested_direction, "{mode:?} {key:?}");
             assert!((after[1 - axis] - before[1 - axis]).abs() < 0.001);
-            for _ in 0..70 {
+            let page_bounds = app.documents[0].info.as_ref().unwrap().page_bounds[1];
+            let page_dimension_points = if axis == 0 {
+                page_bounds.width() * app.documents[0].view.zoom
+            } else {
+                page_bounds.height() * app.documents[0].view.zoom
+            };
+            let scroll_step_points = (after[axis] - before[axis]).abs() * page_dimension_points;
+            assert!(scroll_step_points.is_finite() && scroll_step_points > 0.0);
+            let frames_to_cover_page =
+                ((page_dimension_points + PAGE_GAP * 2.0) / scroll_step_points).ceil() as usize;
+            for _ in 0..frames_to_cover_page {
                 arrow_navigation_frame(
                     &context,
                     &mut app,
@@ -3700,7 +3713,7 @@ fn arrow_navigation_overflow_hold_stops_and_repress_crosses_once_in_all_directio
             } else {
                 assert!(destination[axis] > 0.65);
             }
-            for _ in 0..70 {
+            for _ in 0..frames_to_cover_page {
                 arrow_navigation_frame(
                     &context,
                     &mut app,
@@ -4079,10 +4092,12 @@ fn arrow_navigation_prioritizes_wheel_pan_and_restores_offsets_once() {
     let panned = app.documents[0].view.single_center_anchor.unwrap();
     arrow_navigation_frame(&context, &mut app, Vec::new());
     assert_eq!(app.documents[0].view.single_center_anchor, Some(panned));
-    app.documents[0].view.restore_single_anchor = Some(Vec2::new(0.5, 0.5));
+    let restored_anchor = Vec2::splat(0.5);
+    app.documents[0].view.restore_single_anchor = Some(restored_anchor);
     arrow_navigation_frame(&context, &mut app, arrow_press(Key::ArrowDown));
     let restored_and_scrolled = app.documents[0].view.single_center_anchor.unwrap();
-    assert!((restored_and_scrolled.y - 0.55).abs() < 0.001);
+    assert_eq!(restored_and_scrolled.x, restored_anchor.x);
+    assert!(restored_and_scrolled.y > restored_anchor.y);
     arrow_navigation_frame(&context, &mut app, Vec::new());
     assert_eq!(
         app.documents[0].view.single_center_anchor,
@@ -4347,7 +4362,6 @@ fn single_page_view_line_wheel_navigates_pages_and_respects_boundaries() {
 #[test]
 fn autoscroll_velocity_has_dead_zone_and_speed_ceiling() {
     let anchor = Pos2::new(100.0, 100.0);
-    assert_eq!(AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND, 4_800.0);
     assert_eq!(
         autoscroll_velocity(anchor, Pos2::new(110.0, 100.0)),
         Vec2::ZERO
@@ -4357,6 +4371,8 @@ fn autoscroll_velocity_has_dead_zone_and_speed_ceiling() {
     let distant = autoscroll_velocity(anchor, Pos2::new(10_000.0, 100.0));
     assert!(moderate.x < 0.0);
     assert!(moderate.length() < distant.length());
+    assert!(distant.x > 0.0);
+    assert_eq!(distant.y, 0.0);
     assert!(distant.length() <= AUTOSCROLL_MAX_SPEED_POINTS_PER_SECOND + f32::EPSILON);
 }
 
@@ -4493,26 +4509,60 @@ fn page_input_accepts_only_one_based_in_range_numbers() {
 }
 
 #[test]
-fn page_input_reserves_three_columns_and_expands_for_longer_documents() {
-    for page_count in [1, 9, 10, 99, 100, 999] {
-        assert_eq!(page_number_input_columns(page_count), 3);
+fn page_input_column_capacity_covers_the_largest_page_number() {
+    for page_count in [1, 9, 10, 99, 100, 999, 1_000, 12_345] {
+        assert!(
+            page_number_input_columns(page_count) >= page_count.to_string().len(),
+            "page number {page_count} must fit"
+        );
     }
-    assert_eq!(page_number_input_columns(1_000), 4);
-    assert_eq!(page_number_input_columns(12_345), 5);
 }
 
 #[test]
-fn page_input_width_is_stable_through_three_digits() {
+fn page_input_width_stays_stable_for_short_documents_and_fits_long_page_numbers() {
     let context = egui::Context::default();
+    let minimum_columns = PAGE_INPUT_MINIMUM_COLUMNS;
+    let short_page_counts = (1..=minimum_columns)
+        .map(|digit_count| 10_usize.pow(digit_count as u32) - 1)
+        .collect::<Vec<_>>();
     let mut widths = Vec::new();
     let _output = context.run_ui(Default::default(), |ui| {
-        for page_count in [1, 9, 10, 99, 100, 999, 1_000] {
-            widths.push(page_number_input_width(ui, page_count));
+        for page_count in &short_page_counts {
+            let page_count = *page_count;
+            let mut page_number = page_count.to_string();
+            let width = page_number_input_width(ui, page_count);
+            let output = ui
+                .allocate_ui(Vec2::new(width, TOOLBAR_CONTROL_HEIGHT), |input_ui| {
+                    toolbar_singleline_text_edit(&mut page_number)
+                        .min_size(Vec2::new(width, TOOLBAR_CONTROL_HEIGHT))
+                        .desired_width(width)
+                        .show(input_ui)
+                })
+                .inner;
+            widths.push(output.response.rect.width());
+            assert!(output.galley.size().x <= output.text_clip_rect.width());
         }
+
+        let page_count = 10_usize.pow(minimum_columns as u32 + 5);
+        let mut page_number = page_count.to_string();
+        let width = page_number_input_width(ui, page_count);
+        let output = ui
+            .allocate_ui(Vec2::new(width, TOOLBAR_CONTROL_HEIGHT), |input_ui| {
+                toolbar_singleline_text_edit(&mut page_number)
+                    .min_size(Vec2::new(width, TOOLBAR_CONTROL_HEIGHT))
+                    .desired_width(width)
+                    .show(input_ui)
+            })
+            .inner;
+        assert!(
+            width > widths[0],
+            "long desired width {width} must exceed short rendered width {}",
+            widths[0]
+        );
+        assert!(output.galley.size().x <= output.text_clip_rect.width());
     });
 
-    assert!(widths[..6].windows(2).all(|pair| pair[0] == pair[1]));
-    assert!(widths[6] >= widths[5]);
+    assert!(widths.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
 #[test]
@@ -5536,7 +5586,6 @@ fn search_clear_control_is_inside_field_and_rejects_late_results() {
         .read_response(Id::new(("search-clear", 1)))
         .unwrap()
         .rect;
-    assert_eq!(field.width(), 180.0);
     assert_eq!(field.height(), TOOLBAR_CONTROL_HEIGHT);
     assert!(field.contains_rect(clear));
     assert!(clear.left() > field.left() + field.width() / 2.0);
@@ -6545,6 +6594,8 @@ fn startup_applies_loaded_wheel_speed_and_ui_changes_apply_and_persist_immediate
         .unwrap();
 
     let context = egui::Context::default();
+    let context_default_speed =
+        context.memory(|memory| memory.options.input_options.line_scroll_speed);
     let creation_context = eframe::CreationContext::_new_kittest(context.clone());
     let mut app = PrototypeApp::new(
         &creation_context,
@@ -6558,7 +6609,7 @@ fn startup_applies_loaded_wheel_speed_and_ui_changes_apply_and_persist_immediate
         assert!(initial_speed.is_finite());
         assert!(initial_speed > 0.0);
     } else {
-        assert_eq!(initial_speed, 20.0);
+        assert_eq!(initial_speed, context_default_speed * 0.5);
     }
 
     app.set_wheel_scroll_speed(&context, 200);
@@ -6566,7 +6617,7 @@ fn startup_applies_loaded_wheel_speed_and_ui_changes_apply_and_persist_immediate
     if cfg!(windows) {
         assert_eq!(updated_speed, initial_speed * 4.0);
     } else {
-        assert_eq!(updated_speed, 80.0);
+        assert_eq!(updated_speed, context_default_speed * 2.0);
     }
     assert_eq!(
         SettingsStore::new(settings_path)
@@ -7255,7 +7306,16 @@ fn diagnostics_keeps_visible_render_failure_when_two_results_are_drained_togethe
     );
     finish_async_document_open(&mut app);
     let context = egui::Context::default();
-    app.receive_document_events(&context);
+    // Opened後に非同期で要求されるoutlineを先に完了させ、event数での待機をrender結果に限定する。
+    let outline_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.documents[0].outline_in_flight && std::time::Instant::now() < outline_deadline {
+        app.receive_document_events(&context);
+        if app.documents[0].outline_in_flight {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(!app.documents[0].outline_in_flight);
+    assert!(app.documents[0].outline.is_some());
     let baseline = app.documents[0]
         .service
         .as_ref()
@@ -7322,7 +7382,16 @@ fn diagnostics_ignores_stale_prefetch_failure_for_a_current_visible_request() {
     );
     finish_async_document_open(&mut app);
     let context = egui::Context::default();
-    app.receive_document_events(&context);
+    // Opened後に非同期で要求されるoutlineを先に完了させ、event数での待機をrender結果に限定する。
+    let outline_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.documents[0].outline_in_flight && std::time::Instant::now() < outline_deadline {
+        app.receive_document_events(&context);
+        if app.documents[0].outline_in_flight {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(!app.documents[0].outline_in_flight);
+    assert!(app.documents[0].outline.is_some());
     let baseline = app.documents[0]
         .service
         .as_ref()

@@ -66,3 +66,4 @@ Codexによる開発環境・検証手順の改善指示と報告を置く。
 - [LunaPDF：Codex指示体系・Skill・ドキュメントの全体最適化 実装指示書](development-environment/261021_lunapdf_codex_instructions_docs_skills_optimization.md)
 - [LunaPDF 検証マトリクス](development-environment/verification-matrix.md)
 - [LunaPDF Docker/Cargo キャッシュ改善・実測報告](development-environment/261021_lunapdf_test_cache_optimization_report.md)
+- [LunaPDF CI失敗原因とテスト品質の監査・整理報告](development-environment/261024_lunapdf_test_quality_audit_report.md)

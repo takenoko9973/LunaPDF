@@ -140,31 +140,60 @@ mod tests {
 
     #[test]
     fn placement_accumulates_variable_page_heights_and_centers_width() {
-        let layout = ContinuousLayout::new(&[page(100.0, 200.0), page(200.0, 100.0)], 2.0, 600.0);
+        let first_page = page(100.0, 200.0);
+        let second_page = page(200.0, 100.0);
+        let zoom = 2.0;
+        let viewport_width = 600.0;
+        let first_height = first_page.height() * zoom;
+        let second_height = second_page.height() * zoom;
+        let second_page_y = PAGE_GAP + first_height + PAGE_GAP;
+        let expected_total_height = second_page_y + second_height + PAGE_GAP;
+        let layout = ContinuousLayout::new(&[first_page, second_page], zoom, viewport_width);
 
-        assert_eq!(layout.placement(0).unwrap().x, 200.0);
+        assert_eq!(
+            layout.placement(0).unwrap().x,
+            (viewport_width - first_page.width() * zoom) / 2.0
+        );
         assert_eq!(layout.placement(0).unwrap().y, PAGE_GAP);
-        assert_eq!(layout.placement(1).unwrap().x, 100.0);
-        assert_eq!(layout.placement(1).unwrap().y, 432.0);
-        assert_eq!(layout.total_height(), 648.0);
+        assert_eq!(
+            layout.placement(1).unwrap().x,
+            (viewport_width - second_page.width() * zoom) / 2.0
+        );
+        assert_eq!(layout.placement(1).unwrap().y, second_page_y);
+        assert_eq!(layout.total_height(), expected_total_height);
     }
 
     #[test]
     fn visible_range_excludes_distant_pages_and_includes_prefetch() {
-        let pages = vec![page(100.0, 100.0); 10];
+        let page_height = 100.0;
+        let pages = vec![page(100.0, page_height); 10];
         let layout = ContinuousLayout::new(&pages, 1.0, 200.0);
+        let page_stride = page_height + PAGE_GAP;
+        let third_page_y = PAGE_GAP + 2.0 * page_stride;
+        let viewport = (third_page_y + page_height * 0.25)..(third_page_y + page_height * 0.75);
 
-        assert_eq!(layout.visible_pages(250.0..350.0, 0.0), 2..3);
-        assert_eq!(layout.visible_pages(250.0..350.0, 120.0), 1..4);
+        assert_eq!(layout.visible_pages(viewport.clone(), 0.0), 2..3);
+        assert_eq!(layout.visible_pages(viewport, page_stride), 1..4);
     }
 
     #[test]
     fn page_lookup_maps_page_gap_to_the_following_page() {
-        let layout = ContinuousLayout::new(&[page(100.0, 100.0); 2], 1.0, 200.0);
+        let page_height = 100.0;
+        let layout = ContinuousLayout::new(&[page(100.0, page_height); 2], 1.0, 200.0);
+        let first_page_top = PAGE_GAP;
+        let first_page_bottom = first_page_top + page_height;
+        let second_page_top = first_page_bottom + PAGE_GAP;
+        let gap_middle = first_page_bottom + PAGE_GAP / 2.0;
 
-        assert_eq!(layout.page_at_y(50.0), Some(0));
-        assert_eq!(layout.page_at_y(120.0), Some(1));
-        assert_eq!(layout.page_at_y(150.0), Some(1));
+        assert_eq!(
+            layout.page_at_y(first_page_top + page_height / 2.0),
+            Some(0)
+        );
+        assert_eq!(layout.page_at_y(gap_middle), Some(1));
+        assert_eq!(
+            layout.page_at_y(second_page_top + page_height / 2.0),
+            Some(1)
+        );
     }
 
     #[test]

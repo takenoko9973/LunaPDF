@@ -732,6 +732,8 @@ mod tests {
     use crate::domain::document::TileSpec;
     use crate::domain::selection::{GlyphSnapshot, NonTextTarget};
 
+    const TEST_POINTER_CLICK_THRESHOLD: f32 = 6.0;
+
     fn bounds() -> PageRect {
         PageRect {
             x0: 10.0,
@@ -1493,9 +1495,12 @@ mod tests {
     #[test]
     fn subthreshold_pointer_jitter_does_not_complete_a_text_selection() {
         let context = egui::Context::default();
+        context.options_mut(|options| {
+            options.input_options.max_click_dist = TEST_POINTER_CLICK_THRESHOLD;
+        });
         let mut viewport = PageViewport::default();
         let pressed = Pos2::new(25.0, 25.0);
-        let jittered = Pos2::new(27.0, 26.0);
+        let jittered = pressed + Vec2::splat(TEST_POINTER_CLICK_THRESHOLD / 3.0);
 
         assert!(
             selection_frame(
@@ -1510,10 +1515,7 @@ mod tests {
         );
         assert_eq!(viewport.drag_page, Some(0));
         assert_eq!(viewport.drag_origin_screen, Some(pressed));
-        assert_eq!(
-            context.options(|options| options.input_options.max_click_dist),
-            6.0
-        );
+        assert!(jittered.distance(pressed) < TEST_POINTER_CLICK_THRESHOLD);
         assert!(
             selection_frame(
                 &context,
@@ -1565,9 +1567,12 @@ mod tests {
     #[test]
     fn intentional_short_drag_can_select_one_glyph() {
         let context = egui::Context::default();
+        context.options_mut(|options| {
+            options.input_options.max_click_dist = TEST_POINTER_CLICK_THRESHOLD;
+        });
         let mut viewport = PageViewport::default();
         let pressed = Pos2::new(25.0, 25.0);
-        let dragged = Pos2::new(33.0, 25.0);
+        let dragged = pressed + Vec2::X * (TEST_POINTER_CLICK_THRESHOLD + 2.0);
 
         assert!(
             selection_frame(
@@ -1582,6 +1587,7 @@ mod tests {
         );
         assert_eq!(viewport.drag_page, Some(0));
         assert_eq!(viewport.drag_origin_screen, Some(pressed));
+        assert!(dragged.distance(pressed) > TEST_POINTER_CLICK_THRESHOLD);
         assert!(
             selection_frame(
                 &context,
